@@ -9,7 +9,7 @@ const { app, BrowserWindow, dialog, ipcMain } = require('electron');
 const CONFIG_FILE_NAME = 'claude-desktop-config.json';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const EMPTY_ASSISTANT_TEXT = '（本轮没有收到可展示的文本输出）';
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const SAVE_DEBOUNCE_MS = 160;
 const CLAUDE_CHECK_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
@@ -46,6 +46,7 @@ class ClaudeDesktopRuntime {
     this.claudeInfo = {
       available: null,
       checkedAt: 0,
+      models: [],
       version: '',
     };
 
@@ -65,11 +66,26 @@ class ClaudeDesktopRuntime {
       return this.pickWorkspaceDirectory(browserWindow);
     });
     ipcMain.handle('desktop:add-workspace', (_event, workspacePath) => this.addWorkspace(workspacePath));
+    ipcMain.handle('desktop:archive-session', (_event, payload) => this.archiveSession(payload?.workspaceId, payload?.sessionId));
     ipcMain.handle('desktop:create-session', (_event, workspaceId) => this.createSession(workspaceId));
+    ipcMain.handle('desktop:install-skill', (_event, payload) => (
+      this.installSkill(payload?.workspaceId, payload?.sessionId, payload?.args)
+    ));
+    ipcMain.handle('desktop:list-skills', (_event, payload) => (
+      this.listSkills(payload?.workspaceId, payload?.sessionId)
+    ));
+    ipcMain.handle('desktop:remove-workspace', (_event, workspaceId) => this.removeWorkspace(workspaceId));
+    ipcMain.handle('desktop:run-mcp-command', (_event, payload) => (
+      this.runMcpCommand(payload?.workspaceId, payload?.sessionId, payload?.args)
+    ));
     ipcMain.handle('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId));
     ipcMain.handle('desktop:select-session', (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId));
+    ipcMain.handle('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
     ipcMain.handle('desktop:send-message', (event, payload) => this.sendMessage(event.sender, payload));
     ipcMain.handle('desktop:stop-run', (event) => this.stopRun(event.sender));
+    ipcMain.handle('desktop:update-session-model', (_event, payload) => (
+      this.updateSessionModel(payload?.workspaceId, payload?.sessionId, payload?.model)
+    ));
 
     this.handlersRegistered = true;
   }
@@ -85,15 +101,15 @@ class ClaudeDesktopRuntime {
       claude: {
         available: Boolean(this.claudeInfo.available),
         busy: Boolean(activeRun),
+        models: this.claudeInfo.models,
+        skills: collectInstalledSkills(selectedWorkspace?.path || ''),
         version: this.claudeInfo.version,
       },
+      expandedWorkspaceIds: this.store.expandedWorkspaceIds,
       platform: process.platform,
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
-      workspaces: this.store.workspaces
-        .slice()
-        .sort((left, right) => toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt))
-        .map((workspace) => serializeWorkspace(workspace, activeRun)),
+      workspaces: this.store.workspaces.map((workspace) => serializeWorkspace(workspace, activeRun)),
       activeSession: selectedWorkspace && selectedSession
         ? serializeSession(selectedWorkspace, selectedSession, activeRun)
         : null,
@@ -122,7 +138,7 @@ class ClaudeDesktopRuntime {
     const existingWorkspace = this.store.workspaces.find((workspace) => workspace.path === workspacePath);
     if (existingWorkspace) {
       this.store.selectedWorkspaceId = existingWorkspace.id;
-      this.store.selectedSessionId = getLatestSession(existingWorkspace)?.id || null;
+      this.store.selectedSessionId = getLatestVisibleSession(existingWorkspace)?.id || null;
       this.touchWorkspace(existingWorkspace);
       this.scheduleSave();
       return this.getAppState();
@@ -155,7 +171,9 @@ class ClaudeDesktopRuntime {
     const now = new Date().toISOString();
     const session = {
       claudeSessionId: null,
+      currentModel: '',
       createdAt: now,
+      archived: false,
       id: randomUUID(),
       messages: [],
       model: '',
@@ -173,6 +191,31 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  removeWorkspace(workspaceId) {
+    const workspaceIndex = this.store.workspaces.findIndex((workspace) => workspace.id === workspaceId);
+    if (workspaceIndex === -1) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const activeRun = Array.from(this.windowRuns.values()).find((run) => run.process);
+    if (activeRun && activeRun.workspaceId === workspaceId) {
+      throw new Error('正在执行中的工作目录暂时不能移除。');
+    }
+
+    this.store.workspaces.splice(workspaceIndex, 1);
+    this.store.expandedWorkspaceIds = this.store.expandedWorkspaceIds.filter((id) => id !== workspaceId);
+
+    const selectedWorkspaceStillExists = this.store.workspaces.some((workspace) => workspace.id === this.store.selectedWorkspaceId);
+    if (!selectedWorkspaceStillExists) {
+      const nextWorkspace = this.store.workspaces[Math.min(workspaceIndex, this.store.workspaces.length - 1)] || null;
+      this.store.selectedWorkspaceId = nextWorkspace?.id || null;
+      this.store.selectedSessionId = nextWorkspace ? getLatestVisibleSession(nextWorkspace)?.id || null : null;
+    }
+
+    this.scheduleSave();
+    return this.getAppState();
+  }
+
   selectWorkspace(workspaceId) {
     const workspace = this.findWorkspace(workspaceId);
     if (!workspace) {
@@ -180,7 +223,7 @@ class ClaudeDesktopRuntime {
     }
 
     this.store.selectedWorkspaceId = workspace.id;
-    this.store.selectedSessionId = getLatestSession(workspace)?.id || null;
+    this.store.selectedSessionId = getLatestVisibleSession(workspace)?.id || null;
     this.scheduleSave();
 
     return this.getAppState();
@@ -204,6 +247,167 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  archiveSession(workspaceId, sessionId) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const session = workspace.sessions.find((item) => item.id === sessionId);
+    if (!session || session.archived) {
+      throw new Error('找不到对应的话题。');
+    }
+
+    const activeRun = Array.from(this.windowRuns.values()).find((run) => run.process);
+    if (activeRun && activeRun.workspaceId === workspace.id && activeRun.sessionId === session.id) {
+      throw new Error('正在执行中的话题暂时不能归档。');
+    }
+
+    session.archived = true;
+
+    if (this.store.selectedWorkspaceId === workspace.id && this.store.selectedSessionId === session.id) {
+      this.store.selectedSessionId = getLatestVisibleSession(workspace)?.id || null;
+    }
+
+    this.scheduleSave();
+    return this.getAppState();
+  }
+
+  setExpandedWorkspaces(workspaceIds) {
+    const validWorkspaceIds = new Set(this.store.workspaces.map((workspace) => workspace.id));
+    this.store.expandedWorkspaceIds = Array.isArray(workspaceIds)
+      ? workspaceIds.filter((workspaceId, index, items) => (
+        typeof workspaceId === 'string'
+        && validWorkspaceIds.has(workspaceId)
+        && items.indexOf(workspaceId) === index
+      ))
+      : [];
+
+    this.scheduleSave();
+    return this.getAppState();
+  }
+
+  updateSessionModel(workspaceId, sessionId, model) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const session = workspace.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+      throw new Error('找不到对应的历史对话。');
+    }
+
+    const nextModel = typeof model === 'string' ? model.trim() : '';
+    const now = new Date().toISOString();
+
+    session.model = nextModel;
+    session.currentModel = nextModel;
+    session.updatedAt = now;
+    this.touchWorkspace(workspace, now);
+    this.store.selectedWorkspaceId = workspace.id;
+    this.store.selectedSessionId = session.id;
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
+  runMcpCommand(workspaceId, sessionId, rawArgs) {
+    const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
+    const args = tokenizeCliArgs(rawArgs);
+    if (args.length === 0) {
+      throw new Error('请使用 /mcp list、/mcp get <name>、/mcp add ... 或 /mcp remove <name>。');
+    }
+
+    const result = spawnSync(CLAUDE_BIN, ['mcp', ...args], {
+      cwd: workspace.path,
+      encoding: 'utf8',
+    });
+
+    const content = [result.stdout, result.stderr].filter(Boolean).join('\n').trim() || '命令已执行，但没有返回内容。';
+    this.appendEventMessage(workspace, session, {
+      kind: 'command',
+      status: result.status === 0 ? 'info' : 'error',
+      title: `/mcp ${args.join(' ')}`,
+      content: truncateText(content, STDERR_BUFFER_LIMIT),
+    });
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
+  listSkills(workspaceId, sessionId) {
+    const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
+    const entries = collectInstalledSkills(workspace.path);
+    const content = entries.length > 0
+      ? entries.map((entry, index) => (
+        `${index + 1}. [${entry.scope}] ${entry.name}`
+        + `${entry.description ? `\n${entry.description}` : ''}`
+        + `\n${entry.path}`
+      )).join('\n\n')
+      : '当前没有发现可用的本地 skills。';
+
+    this.appendEventMessage(workspace, session, {
+      kind: 'command',
+      status: 'info',
+      title: '/skills list',
+      content,
+    });
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
+  installSkill(workspaceId, sessionId, rawArgs) {
+    const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
+    const args = tokenizeCliArgs(rawArgs);
+    if (args.length === 0) {
+      throw new Error('请使用 /skills install <本地路径> [--scope user|project]。');
+    }
+
+    const { scope, sourceArg } = parseSkillInstallArgs(args);
+    if (!sourceArg) {
+      throw new Error('请提供要安装的技能目录路径。');
+    }
+
+    const sourcePath = path.resolve(workspace.path, sourceArg);
+    if (!fs.existsSync(sourcePath)) {
+      throw new Error(`技能目录不存在: ${sourcePath}`);
+    }
+
+    const sourceStats = fs.statSync(sourcePath);
+    if (!sourceStats.isDirectory()) {
+      throw new Error('当前 /skills install 只支持安装包含 SKILL.md 的本地目录。');
+    }
+
+    const manifestPath = path.join(sourcePath, 'SKILL.md');
+    if (!fs.existsSync(manifestPath)) {
+      throw new Error('技能目录中缺少 SKILL.md，无法按 skill 安装。');
+    }
+
+    const targetRoot = scope === 'project'
+      ? path.join(workspace.path, '.claude', 'skills')
+      : path.join(getClaudeHome(), 'skills');
+    const targetPath = path.join(targetRoot, path.basename(sourcePath));
+
+    fs.mkdirSync(targetRoot, { recursive: true });
+    if (fs.existsSync(targetPath)) {
+      throw new Error(`目标位置已存在同名 skill: ${targetPath}`);
+    }
+
+    fs.cpSync(sourcePath, targetPath, { recursive: true, errorOnExist: true, force: false });
+
+    this.appendEventMessage(workspace, session, {
+      kind: 'command',
+      status: 'completed',
+      title: '/skills install',
+      content: `已安装 skill：${path.basename(sourcePath)}\n作用域：${scope}\n目标路径：${targetPath}`,
+    });
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
   async sendMessage(webContents, payload) {
     const workspace = this.findWorkspace(payload?.workspaceId || this.store.selectedWorkspaceId);
     if (!workspace) {
@@ -219,6 +423,13 @@ class ClaudeDesktopRuntime {
     if (!prompt) {
       throw new Error('消息内容不能为空。');
     }
+    const displayPrompt = typeof payload?.displayPrompt === 'string' && payload.displayPrompt.trim()
+      ? payload.displayPrompt.trim()
+      : prompt;
+    const displayKind = typeof payload?.displayKind === 'string' ? payload.displayKind.trim() : '';
+    const displayTitle = typeof payload?.displayTitle === 'string' && payload.displayTitle.trim()
+      ? payload.displayTitle.trim()
+      : displayPrompt;
 
     this.refreshClaudeInfo(true);
     if (!this.claudeInfo.available) {
@@ -236,11 +447,20 @@ class ClaudeDesktopRuntime {
     this.store.selectedSessionId = session.id;
 
     const now = new Date().toISOString();
-    const userMessage = createStoredMessage({
-      content: prompt,
-      createdAt: now,
-      role: 'user',
-    });
+    const userMessage = displayKind === 'command'
+      ? createEventMessage({
+        content: '',
+        createdAt: now,
+        kind: 'command',
+        role: 'event',
+        status: 'info',
+        title: displayTitle,
+      })
+      : createStoredMessage({
+        content: displayPrompt,
+        createdAt: now,
+        role: 'user',
+      });
     runState.assistantMessageId = null;
     runState.currentAssistantText = '';
     runState.stderrBuffer = '';
@@ -250,6 +470,10 @@ class ClaudeDesktopRuntime {
     runState.workspaceId = workspace.id;
 
     const args = ['-p', '--output-format', 'stream-json', '--include-partial-messages', '--verbose'];
+    if (session.model) {
+      args.push('--model', session.model);
+    }
+
     if (session.claudeSessionId) {
       args.push('--resume', session.claudeSessionId);
     }
@@ -264,8 +488,8 @@ class ClaudeDesktopRuntime {
     session.updatedAt = now;
     session.model = session.model || '';
 
-    if (isDefaultSessionTitle(session.title) && countRoleMessages(session.messages, 'user') === 1) {
-      session.title = createSessionTitleFromPrompt(prompt);
+    if (isDefaultSessionTitle(session.title) && countInputMessages(session.messages) === 1) {
+      session.title = createSessionTitleFromPrompt(displayPrompt);
     }
 
     runState.process = proc;
@@ -526,19 +750,13 @@ class ClaudeDesktopRuntime {
     const now = new Date().toISOString();
 
     if (event.subtype === 'init') {
-      session.model = event.model || session.model;
+      session.currentModel = event.model || session.currentModel || session.model;
       session.updatedAt = now;
       this.touchWorkspace(workspace, now);
       return;
     }
 
     if (event.subtype === 'task_started') {
-      this.appendEventMessage(workspace, session, {
-        kind: 'agent',
-        status: 'running',
-        title: '子代理任务已启动',
-        content: event.description || event.prompt || 'Claude 启动了一个本地 Agent 来处理当前步骤。',
-      });
       return;
     }
 
@@ -598,18 +816,6 @@ class ClaudeDesktopRuntime {
   handleUserEvent(workspace, session, runState, event) {
     const content = Array.isArray(event.message?.content) ? event.message.content : [];
 
-    if (event.parent_tool_use_id) {
-      const forwardedText = extractTextBlocks(content);
-      if (forwardedText) {
-        this.appendEventMessage(workspace, session, {
-          kind: 'agent',
-          status: 'info',
-          title: '已向子代理下发任务',
-          content: truncateText(forwardedText, 220),
-        });
-      }
-    }
-
     for (const block of content) {
       if (block.type !== 'tool_result') {
         continue;
@@ -638,6 +844,10 @@ class ClaudeDesktopRuntime {
     runState.seenToolUseIds.add(block.id);
 
     const toolClassification = classifyTool(block.name);
+    if (toolClassification.kind === 'agent') {
+      return;
+    }
+
     this.appendEventMessage(workspace, session, {
       kind: toolClassification.kind,
       status: 'running',
@@ -745,7 +955,7 @@ class ClaudeDesktopRuntime {
       return null;
     }
 
-    return workspace.sessions.find((session) => session.id === this.store.selectedSessionId) || null;
+    return workspace.sessions.find((session) => session.id === this.store.selectedSessionId && !session.archived) || null;
   }
 
   findWorkspace(workspaceId) {
@@ -764,6 +974,15 @@ class ClaudeDesktopRuntime {
     }
 
     return { session, workspace };
+  }
+
+  requireCommandSession(workspaceId, sessionId) {
+    const sessionRef = this.findSessionByIds(workspaceId, sessionId);
+    if (!sessionRef) {
+      throw new Error('请先创建或选择一个对话。');
+    }
+
+    return sessionRef;
   }
 
   touchWorkspace(workspace, timestamp = new Date().toISOString()) {
@@ -785,12 +1004,14 @@ class ClaudeDesktopRuntime {
       this.claudeInfo = {
         available: result.status === 0,
         checkedAt: now,
+        models: result.status === 0 ? extractClaudeModelCatalog(CLAUDE_BIN) : [],
         version: output || 'unknown',
       };
     } catch {
       this.claudeInfo = {
         available: false,
         checkedAt: now,
+        models: [],
         version: '',
       };
     }
@@ -800,6 +1021,7 @@ class ClaudeDesktopRuntime {
 
   loadStore() {
     const emptyStore = {
+      expandedWorkspaceIds: [],
       schemaVersion: SCHEMA_VERSION,
       selectedSessionId: null,
       selectedWorkspaceId: null,
@@ -826,6 +1048,7 @@ class ClaudeDesktopRuntime {
         };
 
         return {
+          expandedWorkspaceIds: [migratedWorkspace.id],
           schemaVersion: SCHEMA_VERSION,
           selectedSessionId: null,
           selectedWorkspaceId: migratedWorkspace.id,
@@ -849,8 +1072,16 @@ class ClaudeDesktopRuntime {
       const selectedSessionId = selectedWorkspace?.sessions.some((session) => session.id === parsed.selectedSessionId)
         ? parsed.selectedSessionId
         : selectedWorkspace?.sessions[0]?.id || null;
+      const expandedWorkspaceIds = Array.isArray(parsed.expandedWorkspaceIds)
+        ? parsed.expandedWorkspaceIds.filter((workspaceId, index, items) => (
+          typeof workspaceId === 'string'
+          && workspaces.some((workspace) => workspace.id === workspaceId)
+          && items.indexOf(workspaceId) === index
+        ))
+        : [];
 
       return {
+        expandedWorkspaceIds,
         schemaVersion: SCHEMA_VERSION,
         selectedSessionId,
         selectedWorkspaceId,
@@ -874,6 +1105,7 @@ class ClaudeDesktopRuntime {
     this.saveTimer = null;
 
     const payload = {
+      expandedWorkspaceIds: this.store.expandedWorkspaceIds,
       schemaVersion: SCHEMA_VERSION,
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
@@ -937,7 +1169,9 @@ function normalizeSession(session) {
   const updatedAt = session.updatedAt || createdAt;
 
   return {
+    archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId || null,
+    currentModel: session.currentModel || session.model || '',
     createdAt,
     id: session.id || randomUUID(),
     messages: Array.isArray(session.messages)
@@ -970,6 +1204,7 @@ function normalizeMessage(message) {
 
 function serializeWorkspace(workspace, activeRun) {
   const sessionMetas = workspace.sessions
+    .filter((session) => !session.archived)
     .slice()
     .sort((left, right) => toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt))
     .map((session) => serializeSessionMeta(workspace, session, activeRun));
@@ -987,7 +1222,9 @@ function serializeWorkspace(workspace, activeRun) {
 
 function serializeSession(workspace, session, activeRun) {
   return {
+    archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId,
+    currentModel: session.currentModel || session.model || '',
     createdAt: session.createdAt,
     id: session.id,
     isRunning: Boolean(
@@ -1011,7 +1248,9 @@ function serializeSessionMeta(workspace, session, activeRun) {
   const previewSource = getLatestPreviewMessage(session.messages);
 
   return {
+    archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId,
+    currentModel: session.currentModel || session.model || '',
     id: session.id,
     isRunning: Boolean(
       activeRun &&
@@ -1063,6 +1302,13 @@ function isDefaultSessionTitle(title) {
 
 function countRoleMessages(messages, role) {
   return messages.filter((message) => message.role === role).length;
+}
+
+function countInputMessages(messages) {
+  return messages.filter((message) => (
+    message.role === 'user'
+    || (message.role === 'event' && message.kind === 'command')
+  )).length;
 }
 
 function classifyTool(name) {
@@ -1195,8 +1441,9 @@ function getLatestPreviewMessage(messages) {
   return null;
 }
 
-function getLatestSession(workspace) {
+function getLatestVisibleSession(workspace) {
   return workspace.sessions
+    .filter((session) => !session.archived)
     .slice()
     .sort((left, right) => toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt))[0] || null;
 }
@@ -1242,6 +1489,321 @@ function truncateText(value, maxLength) {
 
 function stripAnsi(value) {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function extractClaudeModelCatalog(claudeBin) {
+  const executablePath = resolveClaudeExecutablePath(claudeBin);
+  if (!executablePath) {
+    return [];
+  }
+
+  try {
+    const result = spawnSync('strings', [executablePath], {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const output = typeof result.stdout === 'string' ? result.stdout : '';
+
+    if (result.status !== 0 || !output) {
+      return [];
+    }
+
+    return parseClaudeModelCatalog(output);
+  } catch {
+    return [];
+  }
+}
+
+function resolveClaudeExecutablePath(claudeBin) {
+  if (!claudeBin || typeof claudeBin !== 'string') {
+    return '';
+  }
+
+  const trimmed = claudeBin.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  if (trimmed.includes(path.sep)) {
+    try {
+      return fs.realpathSync(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+
+  try {
+    const whichResult = spawnSync('which', [trimmed], {
+      encoding: 'utf8',
+    });
+    const resolvedPath = (whichResult.stdout || '').split('\n').find(Boolean)?.trim();
+
+    if (!resolvedPath) {
+      return '';
+    }
+
+    try {
+      return fs.realpathSync(resolvedPath);
+    } catch {
+      return resolvedPath;
+    }
+  } catch {
+    return '';
+  }
+}
+
+function parseClaudeModelCatalog(source) {
+  if (!source) {
+    return [];
+  }
+
+  const modelsByValue = new Map();
+  const staticEntryPattern = /(KyD|er9|To9|NyD|MBA)=\{value:"([^"]+)",label:"([^"]+)",description:"([^"]+)"\}/g;
+
+  for (const match of source.matchAll(staticEntryPattern)) {
+    const [, , value, label, description] = match;
+    modelsByValue.set(value, {
+      description: normalizeClaudeModelText(description),
+      label: normalizeClaudeModelText(label),
+      value,
+    });
+  }
+
+  const detailedEntries = [
+    ['sonnet', /function jBA\(\)\{return\{value:"sonnet",label:"([^"]+)",description:[^,]+,descriptionForModel:"([^"]+)"/],
+    ['sonnet[1m]', /function qo9\(\)\{return\{value:"sonnet\[1m\]",label:"([^"]+)",description:[^,]+,descriptionForModel:"([^"]+)"/],
+    ['opus[1m]', /function Oo9\(T=!1\)\{[^}]*label:"([^"]+)",description:[^,]+,descriptionForModel:"([^"]+)"/],
+    ['haiku', /function Go9\(\)\{return\{value:"haiku",label:"([^"]+)",description:[^,]+,descriptionForModel:"([^"]+)"/],
+    ['opus', /Ho9=\(T=!1\)=>\{[^}]*value:"opus",label:R\?"[^"]+":"([^"]+)",description:[^,]+,descriptionForModel:R\?"[^"]+":"([^"]+)"/],
+  ];
+
+  for (const [value, pattern] of detailedEntries) {
+    const match = source.match(pattern);
+    if (!match) {
+      continue;
+    }
+
+    const [, label, description] = match;
+    const existing = modelsByValue.get(value);
+    modelsByValue.set(value, {
+      description: normalizeClaudeModelText(description),
+      label: normalizeClaudeModelText(label),
+      value,
+      ...(existing ? { summary: existing.description } : {}),
+    });
+  }
+
+  const orderedValues = ['opus', 'opus[1m]', 'haiku', 'sonnet', 'sonnet[1m]'];
+  return orderedValues
+    .map((value) => modelsByValue.get(value))
+    .filter(Boolean);
+}
+
+function normalizeClaudeModelText(value) {
+  return String(value || '')
+    .replace(/\\xB7/g, '·')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenizeCliArgs(rawArgs) {
+  if (typeof rawArgs !== 'string') {
+    return [];
+  }
+
+  const tokens = [];
+  let current = '';
+  let quote = '';
+  let escaping = false;
+
+  for (const character of rawArgs.trim()) {
+    if (escaping) {
+      current += character;
+      escaping = false;
+      continue;
+    }
+
+    if (character === '\\') {
+      escaping = true;
+      continue;
+    }
+
+    if (quote) {
+      if (character === quote) {
+        quote = '';
+      } else {
+        current += character;
+      }
+      continue;
+    }
+
+    if (character === '"' || character === '\'') {
+      quote = character;
+      continue;
+    }
+
+    if (/\s/.test(character)) {
+      if (current) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+
+    current += character;
+  }
+
+  if (current) {
+    tokens.push(current);
+  }
+
+  return tokens;
+}
+
+function parseSkillInstallArgs(args) {
+  let scope = 'user';
+  let sourceArg = '';
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (token === '--scope') {
+      const nextValue = args[index + 1];
+      if (nextValue === 'user' || nextValue === 'project') {
+        scope = nextValue;
+        index += 1;
+        continue;
+      }
+
+      throw new Error('请使用 --scope user 或 --scope project。');
+    }
+
+    if (!sourceArg) {
+      sourceArg = token;
+    }
+  }
+
+  return { scope, sourceArg };
+}
+
+function collectInstalledSkills(workspacePath) {
+  const roots = [
+    { path: path.join(getClaudeHome(), 'skills'), scope: 'user' },
+  ];
+  if (workspacePath) {
+    roots.push({ path: path.join(workspacePath, '.claude', 'skills'), scope: 'project' });
+  }
+  const entries = [];
+  const seen = new Set();
+
+  for (const root of roots) {
+    if (!fs.existsSync(root.path)) {
+      continue;
+    }
+
+    let directoryEntries = [];
+    try {
+      directoryEntries = fs.readdirSync(root.path, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of directoryEntries) {
+      const skillPath = path.join(root.path, entry.name);
+      let skillStats;
+      try {
+        skillStats = fs.statSync(skillPath);
+      } catch {
+        continue;
+      }
+      if (!skillStats.isDirectory()) {
+        continue;
+      }
+      if (!fs.existsSync(path.join(skillPath, 'SKILL.md'))) {
+        continue;
+      }
+      const metadata = readSkillMetadata(skillPath, entry.name);
+      let resolvedPath = skillPath;
+      try {
+        resolvedPath = fs.realpathSync(skillPath);
+      } catch {
+        // Fall back to the visible path when realpath resolution fails.
+      }
+      const dedupeKey = `${root.scope}:${resolvedPath}`;
+      if (seen.has(dedupeKey)) {
+        continue;
+      }
+      seen.add(dedupeKey);
+
+      entries.push({
+        commandName: metadata.commandName,
+        description: metadata.description,
+        name: metadata.name,
+        path: skillPath,
+        scope: root.scope,
+      });
+    }
+  }
+
+  return entries.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function getClaudeHome() {
+  const configured = typeof process.env.CLAUDE_CONFIG_DIR === 'string' ? process.env.CLAUDE_CONFIG_DIR.trim() : '';
+  return configured || path.join(os.homedir(), '.claude');
+}
+
+function readSkillMetadata(skillPath, fallbackName) {
+  const normalizedFallback = sanitizeSkillCommandName(fallbackName) || fallbackName || 'skill';
+  const manifestPath = path.join(skillPath, 'SKILL.md');
+  let manifestText = '';
+
+  try {
+    manifestText = fs.readFileSync(manifestPath, 'utf8');
+  } catch {
+    return {
+      commandName: normalizedFallback,
+      description: '',
+      name: normalizedFallback,
+    };
+  }
+
+  const frontmatterMatch = manifestText.match(/^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/);
+  if (!frontmatterMatch) {
+    return {
+      commandName: normalizedFallback,
+      description: '',
+      name: normalizedFallback,
+    };
+  }
+
+  const frontmatter = frontmatterMatch[1];
+  const metadata = {};
+  for (const line of frontmatter.split('\n')) {
+    const match = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
+    if (!match) {
+      continue;
+    }
+
+    const [, key, rawValue] = match;
+    metadata[key.trim().toLowerCase()] = rawValue.trim().replace(/^['"]|['"]$/g, '');
+  }
+
+  const metadataName = typeof metadata.name === 'string' ? metadata.name.trim() : '';
+  const commandName = sanitizeSkillCommandName(metadataName) || normalizedFallback;
+
+  return {
+    commandName,
+    description: typeof metadata.description === 'string' ? metadata.description.trim() : '',
+    name: metadataName || commandName,
+  };
+}
+
+function sanitizeSkillCommandName(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+
+  return value.trim().replace(/^\/+/, '').replace(/\s+/g, '-').toLowerCase();
 }
 
 module.exports = {

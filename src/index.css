@@ -23,7 +23,33 @@
     --border: 220 14% 86%;
     --input: 220 14% 86%;
     --ring: 222 18% 12%;
+    --app-gradient-start: 210 20% 98%;
+    --app-gradient-end: 220 24% 96%;
     --radius: 0.95rem;
+  }
+
+  .dark {
+    --background: 222 30% 10%;
+    --foreground: 210 33% 96%;
+    --card: 223 28% 13%;
+    --card-foreground: 210 33% 96%;
+    --popover: 223 28% 13%;
+    --popover-foreground: 210 33% 96%;
+    --primary: 210 40% 96%;
+    --primary-foreground: 222 30% 12%;
+    --secondary: 222 24% 18%;
+    --secondary-foreground: 210 24% 92%;
+    --muted: 222 22% 16%;
+    --muted-foreground: 218 14% 72%;
+    --accent: 216 22% 20%;
+    --accent-foreground: 210 33% 96%;
+    --destructive: 0 70% 58%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 19% 24%;
+    --input: 217 19% 24%;
+    --ring: 210 40% 96%;
+    --app-gradient-start: 224 31% 12%;
+    --app-gradient-end: 222 32% 8%;
   }
 
   * {
@@ -42,8 +68,9 @@
   body {
     @apply h-full bg-background text-foreground antialiased;
     font-family: SF Pro Display, Geist, Avenir Next, Segoe UI Variable, ui-sans-serif, system-ui, sans-serif;
-    background-image: linear-gradient(180deg, hsl(210 20% 98%) 0%, hsl(220 24% 96%) 100%);
+    background-image: linear-gradient(180deg, hsl(var(--app-gradient-start)) 0%, hsl(var(--app-gradient-end)) 100%);
     overflow: hidden;
+    transition: background-color 180ms ease, color 180ms ease;
   }
 
   ::selection {

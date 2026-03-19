@@ -1,5 +1,38 @@
 # Changelog
 
+## 2026-03-20 (最新)
+
+### electron/preload.cjs
+
+- 新增 IPC 通道：`getGitDiffViewData`（获取 Git 变更视图数据）、`getSession`（按 ID 获取会话）、`openGitDiffWindow`（打开 Git 变更独立窗口）
+- `stopRun` 改为接受 `payload` 参数，支持按 workspaceId / sessionId 精确停止指定会话的运行
+
+### electron/runtime.cjs
+
+- **多会话并发运行**：`windowRuns` 从单一 runState 重构为 `Map<contentsId, Map<runKey, runState>>`，支持同一窗口内多个会话同时运行；新增 `createRunKey`、`createRunState` 工厂函数及一系列查找辅助方法（`getWindowRunStates`、`findRunStateForSession`、`findRunStateByApprovalRequest`、`getActiveRunStates`、`getActiveRunLookup`、`findActiveRunState`）
+- **runToken 防竞态**：每次启动新进程时生成 `runToken`，stdout / stderr / close / error 回调均校验 token，防止旧进程事件污染新会话
+- **Git 变更窗口**：新增 `openGitDiffWindow` 方法，为每个工作区维护独立的 `BrowserWindow`（存入 `gitDiffWindows` Map），支持复用已有窗口；`disposeAll` 时统一销毁
+- **Git 变更数据**：新增 `getGitDiffViewData` / `serializeWorkspaceGitDiffView`，完整解析工作区 Git 变更（tracked + untracked），包含逐文件 diff patch、增删行数、状态（added / modified / deleted / renamed / copied / untracked 等）；新增大量 Git 解析工具函数（`collectWorkspaceGitDiffEntries`、`parseGitNameStatusEntries`、`parseGitNumstatMap`、`parseGitPatchMap`、`getGitUntrackedDiff`、`parseUnifiedDiffStats` 等）
+- **工作区序列化增强**：`serializeWorkspace` 新增 `gitAddedLines`、`gitDeletedLines`、`gitDirty` 字段；`getWorkspaceGitInfo` 增加 `dirty` 状态检测及增删行统计（staged + unstaged + untracked）；Git 信息缓存 TTL 从 3s 延长至 10s
+- **`addWorkspace` 行为变更**：工作目录已存在时改为抛出错误，不再静默切换选中状态
+- **runState 重置提取**：将分散在 close / error / stop 中的重置逻辑统一提取为 `resetRunState` / `deleteRunState` 方法，消除重复代码
+- `getSession` 新增 IPC 处理，支持前端按 workspaceId + sessionId 拉取完整会话数据
+
+### src/App.jsx
+
+- **多分屏布局**：新增 `paneLayout` 状态，支持 `single / columns / rows / grid` 四种布局模式，布局偏好持久化到 `localStorage`；新增 `Columns2`、`Rows2`、`Grid2x2` 图标及对应文案（中英双语）
+- **分屏会话管理**：引入 `focusedPane` / `focusedSession` / `focusedWorkspace` 概念，composer 区域的模型、权限模式、消息历史均跟随当前聚焦分屏；新增 `sessionViewCache` 缓存非选中分屏的会话数据
+- **`isSending` → `sendingPaneIds`**：发送状态从单一布尔值改为分屏 ID 数组，支持多分屏独立发送状态
+- **Git 变更入口**：顶部栏新增"查看 Git 变更"按钮，调用 `openGitDiffWindow` IPC；新增 `viewGitChanges` 文案
+- **视图路由**：`App` 组件新增 `getWindowView()` 判断，`view=git-diff` 时渲染 `GitDiffWindow` 组件，主界面提取为 `MainApp`
+- 新增 `formatShortcutLabel` / `formatShortcutTooltip` 工具函数，统一处理跨平台快捷键标签显示
+
+### src/components/git-diff-window.jsx（新文件）
+
+- 新增独立的 Git 变更查看窗口组件，展示工作区所有文件变更（增删行数、状态标签、diff patch 内容）
+
+---
+
 ## 2026-03-19 (最新)
 
 ### electron/preload.cjs

@@ -5,9 +5,12 @@ contextBridge.exposeInMainWorld('claudeDesktop', {
   archiveSession: (payload) => ipcRenderer.invoke('desktop:archive-session', payload),
   createSession: (workspaceId) => ipcRenderer.invoke('desktop:create-session', workspaceId),
   getAppState: () => ipcRenderer.invoke('desktop:get-app-state'),
+  getGitDiffViewData: (payload) => ipcRenderer.invoke('desktop:get-git-diff-view-data', payload),
+  getSession: (payload) => ipcRenderer.invoke('desktop:get-session', payload),
   installSkill: (payload) => ipcRenderer.invoke('desktop:install-skill', payload),
   listSkills: (payload) => ipcRenderer.invoke('desktop:list-skills', payload),
   openLink: (href) => ipcRenderer.invoke('desktop:open-link', href),
+  openGitDiffWindow: (payload) => ipcRenderer.invoke('desktop:open-git-diff-window', payload),
   onStateChange: (callback) => {
     if (typeof callback !== 'function') {
       return () => {};
@@ -32,7 +35,7 @@ contextBridge.exposeInMainWorld('claudeDesktop', {
   selectSession: (payload) => ipcRenderer.invoke('desktop:select-session', payload),
   selectWorkspace: (workspaceId) => ipcRenderer.invoke('desktop:select-workspace', workspaceId),
   sendMessage: (payload) => ipcRenderer.invoke('desktop:send-message', payload),
-  stopRun: () => ipcRenderer.invoke('desktop:stop-run'),
+  stopRun: (payload) => ipcRenderer.invoke('desktop:stop-run', payload),
   runMcpCommand: (payload) => ipcRenderer.invoke('desktop:run-mcp-command', payload),
   updateSessionModel: (payload) => ipcRenderer.invoke('desktop:update-session-model', payload),
   updateSessionPermissionMode: (payload) => ipcRenderer.invoke('desktop:update-session-permission-mode', payload),

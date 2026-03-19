@@ -10,11 +10,12 @@ const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const CONFIG_FILE_NAME = 'claude-desktop-config.json';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const EMPTY_ASSISTANT_TEXT = '（本轮没有收到可展示的文本输出）';
+const EMPTY_TREE_HASH = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const SCHEMA_VERSION = 5;
 const SAVE_DEBOUNCE_MS = 160;
 const CLAUDE_CHECK_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
-const WORKSPACE_GIT_INFO_TTL_MS = 3_000;
+const WORKSPACE_GIT_INFO_TTL_MS = 10_000;
 const PASTED_ATTACHMENT_DIR_NAME = 'pasted-attachments';
 const SESSION_PERMISSION_MODES = new Set([
   'acceptEdits',
@@ -100,6 +101,7 @@ class ClaudeDesktopRuntime {
     };
 
     this.store = this.loadStore();
+    this.gitDiffWindows = new Map();
     this.windowRuns = new Map();
     this.refreshClaudeInfo(true);
   }
@@ -110,7 +112,13 @@ class ClaudeDesktopRuntime {
     }
 
     ipcMain.handle('desktop:get-app-state', () => this.getAppState());
+    ipcMain.handle('desktop:get-git-diff-view-data', (_event, payload) => this.getGitDiffViewData(payload?.workspaceId));
+    ipcMain.handle('desktop:get-session', (_event, payload) => this.getSession(payload?.workspaceId, payload?.sessionId));
     ipcMain.handle('desktop:open-link', (_event, href) => this.openLink(href));
+    ipcMain.handle('desktop:open-git-diff-window', (event, payload) => {
+      const browserWindow = BrowserWindow.fromWebContents(event.sender);
+      return this.openGitDiffWindow(browserWindow, payload?.workspaceId);
+    });
     ipcMain.handle('desktop:prepare-pasted-attachments', (_event, payload) => this.preparePastedAttachments(payload));
     ipcMain.handle('desktop:pick-attachments', (event) => {
       const browserWindow = BrowserWindow.fromWebContents(event.sender);
@@ -138,7 +146,7 @@ class ClaudeDesktopRuntime {
     ipcMain.handle('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
     ipcMain.handle('desktop:respond-to-approval', (event, payload) => this.respondToApproval(event.sender, payload));
     ipcMain.handle('desktop:send-message', (event, payload) => this.sendMessage(event.sender, payload));
-    ipcMain.handle('desktop:stop-run', (event) => this.stopRun(event.sender));
+    ipcMain.handle('desktop:stop-run', (event, payload) => this.stopRun(event.sender, payload));
     ipcMain.handle('desktop:update-session-model', (_event, payload) => (
       this.updateSessionModel(payload?.workspaceId, payload?.sessionId, payload?.model)
     ));
@@ -154,12 +162,13 @@ class ClaudeDesktopRuntime {
 
     const selectedWorkspace = this.getSelectedWorkspace();
     const selectedSession = this.getSelectedSession();
-    const activeRun = Array.from(this.windowRuns.values()).find((run) => run.process);
+    const activeRunLookup = this.getActiveRunLookup();
+    const hasActiveRun = activeRunLookup.size > 0;
 
     return {
       claude: {
         available: Boolean(this.claudeInfo.available),
-        busy: Boolean(activeRun),
+        busy: hasActiveRun,
         models: this.claudeInfo.models,
         skills: collectInstalledSkills(selectedWorkspace?.path || ''),
         version: this.claudeInfo.version,
@@ -168,9 +177,11 @@ class ClaudeDesktopRuntime {
       platform: process.platform,
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
-      workspaces: this.store.workspaces.map((workspace) => serializeWorkspace(workspace, activeRun)),
+      workspaces: this.store.workspaces.map((workspace) => (
+        serializeWorkspace(workspace, activeRunLookup, true)
+      )),
       activeSession: selectedWorkspace && selectedSession
-        ? serializeSession(selectedWorkspace, selectedSession, activeRun)
+        ? serializeSession(selectedWorkspace, selectedSession, activeRunLookup)
         : null,
     };
   }
@@ -270,18 +281,96 @@ class ClaudeDesktopRuntime {
     return { ok: true, target: 'external' };
   }
 
+  getGitDiffViewData(workspaceId) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    this.assertDirectory(workspace.path);
+    return serializeWorkspaceGitDiffView(workspace);
+  }
+
+  getSession(workspaceId, sessionId) {
+    const sessionRef = this.findSessionByIds(workspaceId, sessionId);
+    if (!sessionRef || sessionRef.session.archived) {
+      throw new Error('找不到对应的历史对话。');
+    }
+
+    return serializeSession(sessionRef.workspace, sessionRef.session, this.getActiveRunLookup());
+  }
+
+  async openGitDiffWindow(parentWindow, workspaceId) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const gitInfo = getWorkspaceGitInfo(workspace.path);
+    if (!gitInfo?.dirty) {
+      throw new Error('当前工作目录没有可查看的 Git 文件变动。');
+    }
+
+    const existingWindow = this.gitDiffWindows.get(workspace.id);
+    if (existingWindow && !existingWindow.isDestroyed()) {
+      existingWindow.focus();
+      return { ok: true, reused: true };
+    }
+
+    const browserWindow = new BrowserWindow({
+      width: 1260,
+      height: 860,
+      minWidth: 960,
+      minHeight: 620,
+      title: `${workspace.name} · Git 变更`,
+      titleBarStyle: 'hiddenInset',
+      backgroundColor: '#f7f1e7',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        preload: path.join(__dirname, 'preload.cjs'),
+        sandbox: false,
+      },
+    });
+
+    const query = new URLSearchParams({
+      view: 'git-diff',
+      workspaceId: workspace.id,
+    });
+
+    if (process.env.ELECTRON_RENDERER_URL) {
+      await browserWindow.loadURL(`${process.env.ELECTRON_RENDERER_URL}?${query.toString()}`);
+    } else {
+      await browserWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), {
+        query: {
+          view: 'git-diff',
+          workspaceId: workspace.id,
+        },
+      });
+    }
+
+    browserWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    const contentsId = browserWindow.webContents.id;
+
+    this.gitDiffWindows.set(workspace.id, browserWindow);
+
+    browserWindow.on('closed', () => {
+      if (this.gitDiffWindows.get(workspace.id) === browserWindow) {
+        this.gitDiffWindows.delete(workspace.id);
+      }
+      this.disposeWindow(contentsId);
+    });
+
+    return { ok: true, reused: false };
+  }
+
   addWorkspace(rawWorkspacePath) {
     const workspacePath = this.resolveWorkspacePath(rawWorkspacePath);
     this.assertDirectory(workspacePath);
 
     const existingWorkspace = this.store.workspaces.find((workspace) => workspace.path === workspacePath);
     if (existingWorkspace) {
-      const ensuredSession = ensureWorkspaceHasVisibleSession(existingWorkspace);
-      this.store.selectedWorkspaceId = existingWorkspace.id;
-      this.store.selectedSessionId = ensuredSession?.id || getLatestVisibleSession(existingWorkspace)?.id || null;
-      this.touchWorkspace(existingWorkspace);
-      this.scheduleSave();
-      return this.getAppState();
+      throw new Error(`工作目录已存在，已取消添加: ${workspacePath}`);
     }
 
     const now = new Date().toISOString();
@@ -330,8 +419,8 @@ class ClaudeDesktopRuntime {
       throw new Error('找不到对应的工作目录。');
     }
 
-    const activeRun = Array.from(this.windowRuns.values()).find((run) => run.process);
-    if (activeRun && activeRun.workspaceId === workspaceId) {
+    const activeRun = this.getActiveRunStates().find((run) => run.workspaceId === workspaceId);
+    if (activeRun) {
       throw new Error('正在执行中的工作目录暂时不能移除。');
     }
 
@@ -391,8 +480,8 @@ class ClaudeDesktopRuntime {
       throw new Error('找不到对应的话题。');
     }
 
-    const activeRun = Array.from(this.windowRuns.values()).find((run) => run.process);
-    if (activeRun && activeRun.workspaceId === workspace.id && activeRun.sessionId === session.id) {
+    const activeRun = this.findActiveRunState(workspace.id, session.id);
+    if (activeRun) {
       throw new Error('正在执行中的话题暂时不能归档。');
     }
 
@@ -595,10 +684,11 @@ class ClaudeDesktopRuntime {
       throw new Error('未检测到可用的 Claude Code CLI。');
     }
 
-    const runState = this.getRunState(webContents.id);
-    if (runState.process) {
+    const existingRun = this.findActiveRunState(workspace.id, session.id);
+    if (existingRun) {
       throw new Error('当前已有正在运行的 Claude 任务，请等待完成或先停止。');
     }
+    const runState = this.getRunState(webContents.id, workspace.id, session.id);
 
     this.assertDirectory(workspace.path);
 
@@ -632,6 +722,8 @@ class ClaudeDesktopRuntime {
     runState.resultReceived = false;
     runState.sessionId = session.id;
     runState.workspaceId = workspace.id;
+    runState.runToken = randomUUID();
+    const runToken = runState.runToken;
 
     const args = [
       '-p',
@@ -680,16 +772,24 @@ class ClaudeDesktopRuntime {
     let buffer = '';
 
     proc.stdout.on('data', (chunk) => {
+      if (runState.runToken !== runToken) {
+        return;
+      }
+
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        this.processLine(webContents, line);
+        this.processLine(webContents, runState, line);
       }
     });
 
     proc.stderr.on('data', (chunk) => {
+      if (runState.runToken !== runToken) {
+        return;
+      }
+
       const text = stripAnsi(chunk.toString());
       if (!text.trim()) {
         return;
@@ -701,8 +801,12 @@ class ClaudeDesktopRuntime {
     proc.stdin.on('error', () => {});
 
     proc.on('close', (code) => {
+      if (runState.runToken !== runToken) {
+        return;
+      }
+
       if (buffer.trim()) {
-        this.processLine(webContents, buffer);
+        this.processLine(webContents, runState, buffer);
       }
 
       const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
@@ -737,25 +841,18 @@ class ClaudeDesktopRuntime {
         this.touchWorkspace(sessionRef.workspace, sessionRef.session.updatedAt);
       }
 
-      runState.assistantMessageId = null;
-      runState.currentAssistantText = '';
-      runState.hasStreamedAssistantText = false;
-      runState.process = null;
-      runState.sessionId = null;
-      runState.workspaceId = null;
-      runState.stderrBuffer = '';
-      runState.seenToolResultIds.clear();
-      runState.seenToolUseIds.clear();
-      runState.toolUses.clear();
-      runState.pendingApprovalRequests.clear();
-      runState.resultIsError = false;
-      runState.resultReceived = false;
+      this.resetRunState(runState);
+      this.deleteRunState(webContents.id, workspace.id, session.id);
 
       this.scheduleSave();
       this.emitState(webContents);
     });
 
     proc.on('error', (error) => {
+      if (runState.runToken !== runToken) {
+        return;
+      }
+
       const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
       if (sessionRef) {
         finalizeRunningToolMessages(sessionRef.session, 'error');
@@ -778,19 +875,8 @@ class ClaudeDesktopRuntime {
         this.touchWorkspace(sessionRef.workspace, sessionRef.session.updatedAt);
       }
 
-      runState.assistantMessageId = null;
-      runState.currentAssistantText = '';
-      runState.hasStreamedAssistantText = false;
-      runState.process = null;
-      runState.sessionId = null;
-      runState.workspaceId = null;
-      runState.stderrBuffer = '';
-      runState.seenToolResultIds.clear();
-      runState.seenToolUseIds.clear();
-      runState.toolUses.clear();
-      runState.pendingApprovalRequests.clear();
-      runState.resultIsError = false;
-      runState.resultReceived = false;
+      this.resetRunState(runState);
+      this.deleteRunState(webContents.id, workspace.id, session.id);
 
       this.scheduleSave();
       this.emitState(webContents);
@@ -802,11 +888,16 @@ class ClaudeDesktopRuntime {
   }
 
   respondToApproval(webContents, payload) {
-    const runState = this.getRunState(webContents.id);
     const requestId = typeof payload?.requestId === 'string' ? payload.requestId.trim() : '';
     const decision = typeof payload?.decision === 'string' ? payload.decision.trim().toLowerCase() : '';
+    const runState = this.findRunStateByApprovalRequest(
+      webContents.id,
+      requestId,
+      payload?.workspaceId,
+      payload?.sessionId,
+    );
 
-    if (!runState.process) {
+    if (!runState?.process) {
       throw new Error('当前没有正在运行的 Claude 任务。');
     }
 
@@ -842,9 +933,9 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
-  stopRun(webContents) {
-    const runState = this.getRunState(webContents.id);
-    if (!runState.process) {
+  stopRun(webContents, payload) {
+    const runState = this.findRunStateForSession(webContents.id, payload?.workspaceId, payload?.sessionId);
+    if (!runState?.process) {
       return this.getAppState();
     }
 
@@ -864,19 +955,8 @@ class ClaudeDesktopRuntime {
     }
 
     runState.process.kill('SIGTERM');
-    runState.process = null;
-    runState.workspaceId = null;
-    runState.sessionId = null;
-    runState.assistantMessageId = null;
-    runState.currentAssistantText = '';
-    runState.hasStreamedAssistantText = false;
-    runState.stderrBuffer = '';
-    runState.seenToolUseIds.clear();
-    runState.seenToolResultIds.clear();
-    runState.toolUses.clear();
-    runState.pendingApprovalRequests.clear();
-    runState.resultIsError = false;
-    runState.resultReceived = false;
+    this.resetRunState(runState);
+    this.deleteRunState(webContents.id, sessionRef?.workspace.id, sessionRef?.session.id);
 
     this.scheduleSave();
     this.emitState(webContents);
@@ -885,29 +965,42 @@ class ClaudeDesktopRuntime {
   }
 
   disposeWindow(contentsId) {
-    const runState = this.windowRuns.get(contentsId);
-    if (runState?.process) {
-      const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
-      if (sessionRef) {
-        const assistant = this.getAssistantMessage(sessionRef.session, runState)
-          || this.ensureAssistantMessage(sessionRef.session, runState, new Date().toISOString());
-        if (assistant) {
-          assistant.streaming = false;
-          assistant.content = assistant.content || '（应用关闭时本轮运行被终止）';
+    const windowRuns = this.windowRuns.get(contentsId);
+    if (!windowRuns) {
+      return;
+    }
+
+    for (const runState of windowRuns.values()) {
+      if (runState?.process) {
+        const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
+        if (sessionRef) {
+          const assistant = this.getAssistantMessage(sessionRef.session, runState)
+            || this.ensureAssistantMessage(sessionRef.session, runState, new Date().toISOString());
+          if (assistant) {
+            assistant.streaming = false;
+            assistant.content = assistant.content || '（应用关闭时本轮运行被终止）';
+          }
+          finalizeRunningToolMessages(sessionRef.session, 'stopped');
+          sessionRef.session.status = 'idle';
         }
-        finalizeRunningToolMessages(sessionRef.session, 'stopped');
-        sessionRef.session.status = 'idle';
+
+        runState.process.kill('SIGTERM');
       }
 
-      runState.process.kill('SIGTERM');
+      this.resetRunState(runState);
     }
-    if (runState) {
-      runState.pendingApprovalRequests.clear();
-    }
+
     this.windowRuns.delete(contentsId);
   }
 
   disposeAll() {
+    for (const browserWindow of this.gitDiffWindows.values()) {
+      if (!browserWindow.isDestroyed()) {
+        browserWindow.destroy();
+      }
+    }
+    this.gitDiffWindows.clear();
+
     for (const contentsId of Array.from(this.windowRuns.keys())) {
       this.disposeWindow(contentsId);
     }
@@ -915,7 +1008,7 @@ class ClaudeDesktopRuntime {
     this.flushSave();
   }
 
-  processLine(webContents, line) {
+  processLine(webContents, runState, line) {
     if (!line.trim()) {
       return;
     }
@@ -927,7 +1020,6 @@ class ClaudeDesktopRuntime {
       return;
     }
 
-    const runState = this.getRunState(webContents.id);
     const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
     if (!sessionRef) {
       return;
@@ -1304,26 +1396,129 @@ class ClaudeDesktopRuntime {
     this.touchWorkspace(workspace, now);
   }
 
-  getRunState(contentsId) {
+  getWindowRunStates(contentsId) {
     if (!this.windowRuns.has(contentsId)) {
-      this.windowRuns.set(contentsId, {
-        assistantMessageId: null,
-        currentAssistantText: '',
-        hasStreamedAssistantText: false,
-        process: null,
-        seenToolResultIds: new Set(),
-        seenToolUseIds: new Set(),
-        sessionId: null,
-        stderrBuffer: '',
-        toolUses: new Map(),
-        pendingApprovalRequests: new Map(),
-        resultIsError: false,
-        resultReceived: false,
-        workspaceId: null,
-      });
+      this.windowRuns.set(contentsId, new Map());
     }
 
     return this.windowRuns.get(contentsId);
+  }
+
+  getRunState(contentsId, workspaceId, sessionId) {
+    const windowRuns = this.getWindowRunStates(contentsId);
+    const runKey = createRunKey(workspaceId, sessionId);
+
+    if (!windowRuns.has(runKey)) {
+      windowRuns.set(runKey, createRunState(workspaceId, sessionId));
+    }
+
+    return windowRuns.get(runKey);
+  }
+
+  findRunStateForSession(contentsId, workspaceId, sessionId) {
+    if (!workspaceId || !sessionId) {
+      return null;
+    }
+
+    const windowRuns = this.windowRuns.get(contentsId);
+    if (!windowRuns) {
+      return null;
+    }
+
+    return windowRuns.get(createRunKey(workspaceId, sessionId)) || null;
+  }
+
+  findRunStateByApprovalRequest(contentsId, requestId, workspaceId, sessionId) {
+    if (!requestId) {
+      return null;
+    }
+
+    const windowRuns = this.windowRuns.get(contentsId);
+    if (!windowRuns) {
+      return null;
+    }
+
+    if (workspaceId && sessionId) {
+      const scopedRunState = windowRuns.get(createRunKey(workspaceId, sessionId));
+      if (scopedRunState?.pendingApprovalRequests.has(requestId)) {
+        return scopedRunState;
+      }
+    }
+
+    for (const runState of windowRuns.values()) {
+      if (runState.pendingApprovalRequests.has(requestId)) {
+        return runState;
+      }
+    }
+
+    return null;
+  }
+
+  getActiveRunStates() {
+    const activeRuns = [];
+
+    for (const windowRuns of this.windowRuns.values()) {
+      for (const runState of windowRuns.values()) {
+        if (runState.process) {
+          activeRuns.push(runState);
+        }
+      }
+    }
+
+    return activeRuns;
+  }
+
+  getActiveRunLookup() {
+    return new Map(
+      this.getActiveRunStates()
+        .filter((runState) => runState.workspaceId && runState.sessionId)
+        .map((runState) => [createRunKey(runState.workspaceId, runState.sessionId), runState]),
+    );
+  }
+
+  findActiveRunState(workspaceId, sessionId) {
+    if (!workspaceId || !sessionId) {
+      return null;
+    }
+
+    return this.getActiveRunLookup().get(createRunKey(workspaceId, sessionId)) || null;
+  }
+
+  resetRunState(runState) {
+    if (!runState) {
+      return;
+    }
+
+    runState.assistantMessageId = null;
+    runState.currentAssistantText = '';
+    runState.hasStreamedAssistantText = false;
+    runState.process = null;
+    runState.runToken = null;
+    runState.sessionId = null;
+    runState.workspaceId = null;
+    runState.stderrBuffer = '';
+    runState.seenToolResultIds.clear();
+    runState.seenToolUseIds.clear();
+    runState.toolUses.clear();
+    runState.pendingApprovalRequests.clear();
+    runState.resultIsError = false;
+    runState.resultReceived = false;
+  }
+
+  deleteRunState(contentsId, workspaceId, sessionId) {
+    if (!workspaceId || !sessionId) {
+      return;
+    }
+
+    const windowRuns = this.windowRuns.get(contentsId);
+    if (!windowRuns) {
+      return;
+    }
+
+    windowRuns.delete(createRunKey(workspaceId, sessionId));
+    if (windowRuns.size === 0) {
+      this.windowRuns.delete(contentsId);
+    }
   }
 
   emitState(webContents) {
@@ -1800,18 +1995,44 @@ function sanitizeAttachmentBaseName(value) {
     .slice(0, 48);
 }
 
-function serializeWorkspace(workspace, activeRun) {
-  const gitInfo = getWorkspaceGitInfo(workspace.path);
+function createRunKey(workspaceId, sessionId) {
+  return `${workspaceId || ''}::${sessionId || ''}`;
+}
+
+function createRunState(workspaceId = null, sessionId = null) {
+  return {
+    assistantMessageId: null,
+    currentAssistantText: '',
+    hasStreamedAssistantText: false,
+    pendingApprovalRequests: new Map(),
+    process: null,
+    resultIsError: false,
+    resultReceived: false,
+    runToken: null,
+    seenToolResultIds: new Set(),
+    seenToolUseIds: new Set(),
+    sessionId,
+    stderrBuffer: '',
+    toolUses: new Map(),
+    workspaceId,
+  };
+}
+
+function serializeWorkspace(workspace, activeRunLookup, includeGitInfo = false) {
+  const gitInfo = includeGitInfo ? getWorkspaceGitInfo(workspace.path) : null;
   const sessionMetas = workspace.sessions
     .filter((session) => !session.archived)
     .slice()
     .sort((left, right) => toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt))
-    .map((session) => serializeSessionMeta(workspace, session, activeRun));
+    .map((session) => serializeSessionMeta(workspace, session, activeRunLookup));
 
   return {
     createdAt: workspace.createdAt,
     exists: directoryExists(workspace.path),
+    gitAddedLines: Number.isFinite(gitInfo?.addedLines) ? gitInfo.addedLines : 0,
     gitBranch: gitInfo?.branch || '',
+    gitDeletedLines: Number.isFinite(gitInfo?.deletedLines) ? gitInfo.deletedLines : 0,
+    gitDirty: Boolean(gitInfo?.dirty),
     gitRoot: gitInfo?.root || '',
     id: workspace.id,
     name: workspace.name,
@@ -1821,10 +2042,9 @@ function serializeWorkspace(workspace, activeRun) {
   };
 }
 
-function serializeSession(workspace, session, activeRun) {
+function serializeSession(workspace, session, activeRunLookup) {
+  const activeRun = activeRunLookup.get(createRunKey(workspace.id, session.id)) || null;
   const pendingApprovals = activeRun
-    && activeRun.workspaceId === workspace.id
-    && activeRun.sessionId === session.id
       ? Array.from(activeRun.pendingApprovalRequests.values())
         .map((approval) => serializePendingApproval(approval))
         .filter(Boolean)
@@ -1836,12 +2056,7 @@ function serializeSession(workspace, session, activeRun) {
     currentModel: session.currentModel || session.model || '',
     createdAt: session.createdAt,
     id: session.id,
-    isRunning: Boolean(
-      activeRun &&
-      activeRun.workspaceId === workspace.id &&
-      activeRun.sessionId === session.id &&
-      activeRun.process,
-    ),
+    isRunning: Boolean(activeRun?.process),
     messages: session.messages,
     model: session.model,
     pendingApprovals,
@@ -1855,26 +2070,51 @@ function serializeSession(workspace, session, activeRun) {
   };
 }
 
-function serializeSessionMeta(workspace, session, activeRun) {
+function serializeSessionMeta(workspace, session, activeRunLookup) {
   const previewSource = getLatestPreviewMessage(session.messages);
+  const activeRun = activeRunLookup.get(createRunKey(workspace.id, session.id)) || null;
 
   return {
     archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId,
     currentModel: session.currentModel || session.model || '',
     id: session.id,
-    isRunning: Boolean(
-      activeRun &&
-      activeRun.workspaceId === workspace.id &&
-      activeRun.sessionId === session.id &&
-      activeRun.process,
-    ),
+    isRunning: Boolean(activeRun?.process),
     messageCount: session.messages.filter((message) => message.role !== 'event').length,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
     preview: previewSource ? (truncateText(getMessagePreviewText(previewSource), 80) || '还没有消息') : '还没有消息',
     status: session.status,
     title: session.title,
     updatedAt: session.updatedAt,
+  };
+}
+
+function serializeWorkspaceGitDiffView(workspace) {
+  const gitInfo = getWorkspaceGitInfo(workspace.path);
+  if (!gitInfo) {
+    throw new Error('当前工作目录不是 Git 仓库。');
+  }
+
+  const files = collectWorkspaceGitDiffEntries(gitInfo.root);
+  const summary = files.reduce((stats, file) => ({
+    addedLines: stats.addedLines + (Number.isFinite(file.addedLines) ? file.addedLines : 0),
+    deletedLines: stats.deletedLines + (Number.isFinite(file.deletedLines) ? file.deletedLines : 0),
+    filesChanged: stats.filesChanged + 1,
+  }), {
+    addedLines: 0,
+    deletedLines: 0,
+    filesChanged: 0,
+  });
+
+  return {
+    dirty: summary.filesChanged > 0,
+    files,
+    gitBranch: gitInfo.branch,
+    gitRoot: gitInfo.root,
+    summary,
+    workspaceId: workspace.id,
+    workspaceName: workspace.name,
+    workspacePath: workspace.path,
   };
 }
 
@@ -2791,6 +3031,300 @@ function getWorkspaceGitInfo(workspacePath) {
   return value;
 }
 
+function collectWorkspaceGitDiffEntries(repoPath) {
+  const baseRef = resolveGitDiffBaseRef(repoPath);
+  const trackedEntries = getTrackedGitDiffEntries(repoPath, baseRef);
+  const untrackedEntries = getUntrackedGitDiffEntries(repoPath);
+  const entries = [...trackedEntries, ...untrackedEntries];
+
+  return entries.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function resolveGitDiffBaseRef(repoPath) {
+  const result = spawnSync('git', ['rev-parse', '--verify', 'HEAD'], {
+    cwd: repoPath,
+    encoding: 'utf8',
+    timeout: 1500,
+  });
+
+  return result.status === 0 ? 'HEAD' : EMPTY_TREE_HASH;
+}
+
+function getTrackedGitDiffEntries(repoPath, baseRef) {
+  const nameStatusBuffer = runGitCommand(repoPath, ['diff', '--name-status', '-z', '--find-renames=1%', baseRef], 'buffer');
+  const numstatBuffer = runGitCommand(repoPath, ['diff', '--numstat', '-z', '--find-renames=1%', baseRef], 'buffer');
+  const patchText = runGitCommand(repoPath, ['diff', '--patch', '--no-ext-diff', '--find-renames=1%', baseRef], 'text');
+
+  const patchMap = parseGitPatchMap(patchText);
+  const numstatMap = parseGitNumstatMap(numstatBuffer);
+
+  return parseGitNameStatusEntries(nameStatusBuffer).map((entry) => {
+    const stats = numstatMap.get(entry.key) || { addedLines: 0, deletedLines: 0 };
+
+    return {
+      addedLines: stats.addedLines,
+      deletedLines: stats.deletedLines,
+      diff: patchMap.get(entry.key) || '',
+      oldPath: entry.oldPath || '',
+      path: entry.path,
+      status: entry.status,
+    };
+  });
+}
+
+function getUntrackedGitDiffEntries(repoPath) {
+  const output = runGitCommand(repoPath, ['ls-files', '--others', '--exclude-standard', '-z'], 'buffer');
+  if (!output) {
+    return [];
+  }
+
+  return output.toString('utf8')
+    .split('\0')
+    .filter(Boolean)
+    .map((relativePath) => {
+      const diff = getGitUntrackedDiff(repoPath, relativePath);
+      const stats = parseUnifiedDiffStats(diff);
+
+      return {
+        addedLines: stats.addedLines,
+        deletedLines: stats.deletedLines,
+        diff,
+        oldPath: '',
+        path: relativePath,
+        status: 'untracked',
+      };
+    });
+}
+
+function runGitCommand(repoPath, args, outputType = 'text') {
+  try {
+    const result = spawnSync('git', args, {
+      cwd: repoPath,
+      encoding: outputType === 'buffer' ? 'buffer' : 'utf8',
+      timeout: 1500,
+    });
+
+    if (result.error) {
+      return outputType === 'buffer' ? Buffer.alloc(0) : '';
+    }
+
+    if (outputType === 'buffer') {
+      return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout || '', 'utf8');
+    }
+
+    return typeof result.stdout === 'string' ? result.stdout : String(result.stdout || '');
+  } catch {
+    return outputType === 'buffer' ? Buffer.alloc(0) : '';
+  }
+}
+
+function parseGitNameStatusEntries(buffer) {
+  if (!buffer || !buffer.length) {
+    return [];
+  }
+
+  const tokens = buffer.toString('utf8').split('\0').filter(Boolean);
+  const entries = [];
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token) {
+      continue;
+    }
+
+    const statusCode = token[0];
+    if (statusCode === 'R' || statusCode === 'C') {
+      const oldPath = tokens[index + 1] || '';
+      const nextPath = tokens[index + 2] || '';
+      entries.push({
+        key: nextPath,
+        oldPath,
+        path: nextPath,
+        status: normalizeGitDiffStatus(statusCode),
+      });
+      index += 2;
+      continue;
+    }
+
+    const nextPath = tokens[index + 1] || '';
+    entries.push({
+      key: nextPath,
+      oldPath: '',
+      path: nextPath,
+      status: normalizeGitDiffStatus(statusCode),
+    });
+    index += 1;
+  }
+
+  return entries;
+}
+
+function parseGitNumstatMap(buffer) {
+  const entries = new Map();
+  if (!buffer || !buffer.length) {
+    return entries;
+  }
+
+  const tokens = buffer.toString('utf8').split('\0').filter((token, index, items) => (
+    token !== '' || index !== items.length - 1
+  ));
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token) {
+      continue;
+    }
+
+    const [addedRaw, deletedRaw, filePath] = token.split('\t');
+    if (filePath) {
+      entries.set(filePath, {
+        addedLines: parseGitNumstatCount(addedRaw),
+        deletedLines: parseGitNumstatCount(deletedRaw),
+      });
+      continue;
+    }
+
+    const oldPath = tokens[index + 1] || '';
+    const nextPath = tokens[index + 2] || '';
+    if (oldPath || nextPath) {
+      entries.set(nextPath, {
+        addedLines: parseGitNumstatCount(addedRaw),
+        deletedLines: parseGitNumstatCount(deletedRaw),
+      });
+      index += 2;
+    }
+  }
+
+  return entries;
+}
+
+function parseGitNumstatCount(value) {
+  const count = Number.parseInt(value, 10);
+  return Number.isFinite(count) ? count : 0;
+}
+
+function parseGitPatchMap(diffText) {
+  const patches = new Map();
+  if (!diffText) {
+    return patches;
+  }
+
+  const chunks = diffText
+    .split(/(?=^diff --git )/m)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean);
+
+  for (const chunk of chunks) {
+    const key = resolveGitPatchKey(chunk);
+    if (key) {
+      patches.set(key, chunk);
+    }
+  }
+
+  return patches;
+}
+
+function resolveGitPatchKey(patchText) {
+  const lines = patchText.split(/\r?\n/);
+  const renameTo = matchGitPatchPath(lines, 'rename to ');
+  if (renameTo) {
+    return renameTo;
+  }
+
+  const copyTo = matchGitPatchPath(lines, 'copy to ');
+  if (copyTo) {
+    return copyTo;
+  }
+
+  const plusPath = normalizeGitPatchPath(matchGitPatchPath(lines, '+++ '));
+  if (plusPath && plusPath !== '/dev/null') {
+    return plusPath;
+  }
+
+  const minusPath = normalizeGitPatchPath(matchGitPatchPath(lines, '--- '));
+  if (minusPath && minusPath !== '/dev/null') {
+    return minusPath;
+  }
+
+  const diffHeader = lines[0]?.match(/^diff --git a\/(.+?) b\/(.+)$/);
+  if (diffHeader?.[2]) {
+    return diffHeader[2];
+  }
+
+  return '';
+}
+
+function matchGitPatchPath(lines, prefix) {
+  const line = lines.find((entry) => entry.startsWith(prefix));
+  return line ? line.slice(prefix.length).trim() : '';
+}
+
+function normalizeGitPatchPath(value) {
+  if (!value) {
+    return '';
+  }
+
+  if (value === '/dev/null') {
+    return value;
+  }
+
+  return value.replace(/^[ab]\//, '');
+}
+
+function getGitUntrackedDiff(repoPath, relativePath) {
+  try {
+    const result = spawnSync('git', ['diff', '--no-index', '--no-ext-diff', '--', '/dev/null', relativePath], {
+      cwd: repoPath,
+      encoding: 'utf8',
+      timeout: 1500,
+    });
+
+    return typeof result.stdout === 'string' ? result.stdout.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+function parseUnifiedDiffStats(diffText) {
+  return diffText.split(/\r?\n/).reduce((stats, line) => {
+    if (line.startsWith('+++ ') || line.startsWith('--- ')) {
+      return stats;
+    }
+
+    if (line.startsWith('+')) {
+      stats.addedLines += 1;
+      return stats;
+    }
+
+    if (line.startsWith('-')) {
+      stats.deletedLines += 1;
+    }
+
+    return stats;
+  }, { addedLines: 0, deletedLines: 0 });
+}
+
+function normalizeGitDiffStatus(statusCode) {
+  switch (statusCode) {
+    case 'A':
+      return 'added';
+    case 'C':
+      return 'copied';
+    case 'D':
+      return 'deleted';
+    case 'M':
+      return 'modified';
+    case 'R':
+      return 'renamed';
+    case 'T':
+      return 'type-changed';
+    case 'U':
+      return 'unmerged';
+    default:
+      return 'modified';
+  }
+}
+
 function resolveWorkspaceGitInfo(workspacePath) {
   try {
     const options = {
@@ -2804,11 +3338,17 @@ function resolveWorkspaceGitInfo(workspacePath) {
     }
 
     const rootResult = spawnSync('git', ['rev-parse', '--show-toplevel'], options);
-    const branchResult = spawnSync('git', ['branch', '--show-current'], options);
+    const repoPath = rootResult.status === 0 ? rootResult.stdout.trim() : workspacePath;
+    const repoOptions = {
+      ...options,
+      cwd: repoPath,
+    };
+    const branchResult = spawnSync('git', ['branch', '--show-current'], repoOptions);
+    const statusResult = spawnSync('git', ['status', '--porcelain'], repoOptions);
     let branch = branchResult.status === 0 ? branchResult.stdout.trim() : '';
 
     if (!branch) {
-      const detachedHeadResult = spawnSync('git', ['rev-parse', '--short', 'HEAD'], options);
+      const detachedHeadResult = spawnSync('git', ['rev-parse', '--short', 'HEAD'], repoOptions);
       const commitSha = detachedHeadResult.status === 0 ? detachedHeadResult.stdout.trim() : '';
       branch = commitSha ? `detached@${commitSha}` : '';
     }
@@ -2817,12 +3357,114 @@ function resolveWorkspaceGitInfo(workspacePath) {
       return null;
     }
 
+    const stagedStats = getGitDiffLineStats(repoPath, ['diff', '--numstat', '--cached', '--find-renames', '--find-copies', '--no-ext-diff']);
+    const unstagedStats = getGitDiffLineStats(repoPath, ['diff', '--numstat', '--find-renames', '--find-copies', '--no-ext-diff']);
+    const untrackedStats = getGitUntrackedLineStats(repoPath);
+    const diffStats = mergeGitLineStats(stagedStats, unstagedStats, untrackedStats);
+
     return {
+      addedLines: diffStats.addedLines,
       branch,
-      root: rootResult.status === 0 ? rootResult.stdout.trim() : workspacePath,
+      deletedLines: diffStats.deletedLines,
+      dirty: statusResult.status === 0 && statusResult.stdout.trim().length > 0,
+      root: repoPath,
     };
   } catch {
     return null;
+  }
+}
+
+function getGitDiffLineStats(repoPath, args) {
+  try {
+    const result = spawnSync('git', args, {
+      cwd: repoPath,
+      encoding: 'utf8',
+      timeout: 1500,
+    });
+
+    if (result.status !== 0) {
+      return { addedLines: 0, deletedLines: 0 };
+    }
+
+    return parseGitNumstatOutput(result.stdout);
+  } catch {
+    return { addedLines: 0, deletedLines: 0 };
+  }
+}
+
+function getGitUntrackedLineStats(repoPath) {
+  try {
+    const result = spawnSync('git', ['ls-files', '--others', '--exclude-standard', '-z'], {
+      cwd: repoPath,
+      encoding: 'utf8',
+      timeout: 1500,
+    });
+
+    if (result.status !== 0 || !result.stdout) {
+      return { addedLines: 0, deletedLines: 0 };
+    }
+
+    let addedLines = 0;
+    for (const relativePath of result.stdout.split('\0').filter(Boolean)) {
+      addedLines += countTextFileLines(path.join(repoPath, relativePath));
+    }
+
+    return { addedLines, deletedLines: 0 };
+  } catch {
+    return { addedLines: 0, deletedLines: 0 };
+  }
+}
+
+function parseGitNumstatOutput(output) {
+  return output
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .reduce((stats, line) => {
+      const [addedRaw, deletedRaw] = line.split('\t');
+      const addedLines = Number.parseInt(addedRaw, 10);
+      const deletedLines = Number.parseInt(deletedRaw, 10);
+
+      if (Number.isFinite(addedLines)) {
+        stats.addedLines += addedLines;
+      }
+
+      if (Number.isFinite(deletedLines)) {
+        stats.deletedLines += deletedLines;
+      }
+
+      return stats;
+    }, { addedLines: 0, deletedLines: 0 });
+}
+
+function mergeGitLineStats(...entries) {
+  return entries.reduce((stats, entry) => ({
+    addedLines: stats.addedLines + (Number.isFinite(entry?.addedLines) ? entry.addedLines : 0),
+    deletedLines: stats.deletedLines + (Number.isFinite(entry?.deletedLines) ? entry.deletedLines : 0),
+  }), { addedLines: 0, deletedLines: 0 });
+}
+
+function countTextFileLines(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile()) {
+      return 0;
+    }
+
+    const content = fs.readFileSync(filePath);
+    if (content.length === 0 || content.includes(0)) {
+      return 0;
+    }
+
+    let lineCount = 0;
+    for (let index = 0; index < content.length; index += 1) {
+      if (content[index] === 10) {
+        lineCount += 1;
+      }
+    }
+
+    return content[content.length - 1] === 10 ? lineCount : lineCount + 1;
+  } catch {
+    return 0;
   }
 }
 

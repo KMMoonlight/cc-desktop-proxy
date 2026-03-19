@@ -9,11 +9,13 @@ import {
   ChevronDown,
   ChevronRight,
   CheckCircle2,
+  Columns2,
   FileText,
   Folder,
   FolderOpen,
   FolderPlus,
   GitBranch,
+  Grid2x2,
   Hand,
   Image as ImageIcon,
   LoaderCircle,
@@ -25,6 +27,7 @@ import {
   Settings,
   Sparkles,
   Square,
+  Rows2,
   TerminalSquare,
   Trash2,
   Workflow,
@@ -32,6 +35,7 @@ import {
   X,
 } from 'lucide-react';
 
+import GitDiffWindow from '@/components/git-diff-window';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -57,7 +61,20 @@ const EMPTY_APP_STATE = {
 };
 
 const LANGUAGE_STORAGE_KEY = 'cc-desktop-proxy-language';
+const PANE_LAYOUT_STORAGE_KEY = 'cc-desktop-proxy-pane-layout';
 const THEME_STORAGE_KEY = 'cc-desktop-proxy-theme';
+const PANE_LAYOUT_MODES = ['single', 'columns', 'rows', 'grid'];
+const DEFAULT_PANE_LAYOUT = {
+  focusedPaneId: 'pane-1',
+  mode: 'single',
+  panes: [
+    {
+      id: 'pane-1',
+      sessionId: null,
+      workspaceId: null,
+    },
+  ],
+};
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
   'apng',
   'avif',
@@ -74,7 +91,28 @@ const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
   'webp',
 ]);
 const SIDEBAR_ACTION_BUTTON_CLASS = 'h-8 w-8 shrink-0 rounded-md bg-transparent p-0 text-muted-foreground shadow-none hover:bg-background/80 hover:text-foreground';
-const SIDEBAR_ACTION_SLOT_CLASS = 'absolute right-3 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center';
+const SIDEBAR_ACTION_SLOT_CLASS = 'absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1';
+
+function formatShortcutLabel(platform, key) {
+  const normalizedKey = String(key || '').trim().toUpperCase();
+  if (!normalizedKey) {
+    return '';
+  }
+
+  return platform === 'darwin'
+    ? `⌘${normalizedKey}`
+    : `Meta+${normalizedKey}`;
+}
+
+function formatShortcutTooltip(label, key, platform) {
+  const shortcutLabel = formatShortcutLabel(platform, key);
+  if (!label || !shortcutLabel) {
+    return label || '';
+  }
+
+  return `${label} (${shortcutLabel})`;
+}
+
 const COPY = {
   zh: {
     addWorkspace: '添加工作目录',
@@ -137,6 +175,19 @@ const COPY = {
     modelSummaryOpusLong: 'Opus 4.6 长上下文版 · 适合超长会话 · $10/$37.50 per Mtok',
     modelSummarySonnet: 'Sonnet 4.5 · 适合日常编码任务 · $3/$15 per Mtok',
     noConversationOpen: '还没有打开对话',
+    paneClear: '清空当前分屏',
+    paneClickToFocus: '点击切换到这个分屏',
+    paneClose: '关闭分屏',
+    paneEmptyDescription: '先点亮这个分屏，再从左侧选择一个历史会话或新建会话。',
+    paneEmptyTitle: '这个分屏还没有会话',
+    paneGrid: '四宫格',
+    paneLayoutColumns: '左右分屏',
+    paneLayoutRows: '上下分屏',
+    paneLayoutSingle: '单对话',
+    paneLayoutTitle: '布局',
+    paneSplitAdd: '新增分屏',
+    paneSplitLimitReached: '当前窗口尺寸下已达到最大分屏数',
+    paneLoading: '正在载入对话...',
     noSessionCommandHint: '输入 /clear 新建对话，或先在左侧选择一个历史会话',
     noConversationsInWorkspace: '还没有对话',
     noSessionsYet: '先在左侧创建或选择一个历史会话',
@@ -169,6 +220,7 @@ const COPY = {
     toolGroupRunning: (count) => `${count} 条进行中`,
     toolGroupSummary: (count) => `${count} 条工具消息`,
     toolGroupTitle: '工具调用汇总',
+    viewGitChanges: '查看 Git 变更',
     workspaceSection: '工作目录',
     workspaceSelectedDescription: '这个工作目录已经选中，但还没有打开任何会话。点击左侧目录项右侧的“新对话”，就会在该目录下创建新的历史会话。',
   },
@@ -233,6 +285,19 @@ const COPY = {
     modelSummaryOpusLong: 'Opus 4.6 for long sessions · $10/$37.50 per Mtok',
     modelSummarySonnet: 'Sonnet 4.5 · Best for everyday tasks · $3/$15 per Mtok',
     noConversationOpen: 'No conversation open',
+    paneClear: 'Clear pane',
+    paneClickToFocus: 'Click to focus this pane',
+    paneClose: 'Close pane',
+    paneEmptyDescription: 'Focus this pane, then pick or create a conversation from the sidebar.',
+    paneEmptyTitle: 'No conversation in this pane',
+    paneGrid: 'Grid',
+    paneLayoutColumns: 'Split columns',
+    paneLayoutRows: 'Split rows',
+    paneLayoutSingle: 'Single',
+    paneLayoutTitle: 'Layout',
+    paneSplitAdd: 'Add split',
+    paneSplitLimitReached: 'Maximum split count reached for this window size',
+    paneLoading: 'Loading conversation...',
     noSessionCommandHint: 'Type /clear to start a conversation, or pick one from the sidebar',
     noConversationsInWorkspace: 'No conversations yet',
     noSessionsYet: 'Create or select a conversation from the sidebar first',
@@ -265,6 +330,7 @@ const COPY = {
     toolGroupRunning: (count) => `${count} running`,
     toolGroupSummary: (count) => `${count} tool messages`,
     toolGroupTitle: 'Tool activity summary',
+    viewGitChanges: 'View Git changes',
     workspaceSection: 'Workspaces',
     workspaceSelectedDescription: 'This workspace is selected, but no conversation is open yet. Click "New conversation" on the right side of the workspace row to create one.',
   },
@@ -272,7 +338,16 @@ const COPY = {
 
 export default function App() {
   const desktopClient = typeof window !== 'undefined' ? window.claudeDesktop : null;
+  const windowView = getWindowView();
 
+  if (windowView === 'git-diff') {
+    return <GitDiffWindow desktopClient={desktopClient} />;
+  }
+
+  return <MainApp desktopClient={desktopClient} />;
+}
+
+function MainApp({ desktopClient }) {
   const [appState, setAppState] = useState(EMPTY_APP_STATE);
   const [language, setLanguage] = useState(() => getInitialLanguage());
   const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
@@ -288,7 +363,7 @@ export default function App() {
   const [isArchivingSession, setIsArchivingSession] = useState(false);
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
   const [isRemovingWorkspace, setIsRemovingWorkspace] = useState(false);
-  const [isSending, setIsSending] = useState(false);
+  const [sendingPaneIds, setSendingPaneIds] = useState([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isModePickerOpen, setIsModePickerOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
@@ -297,15 +372,24 @@ export default function App() {
   const [pendingApprovalActionId, setPendingApprovalActionId] = useState('');
   const [pendingArchiveSession, setPendingArchiveSession] = useState(null);
   const [pendingRemoveWorkspace, setPendingRemoveWorkspace] = useState(null);
+  const [paneLayout, setPaneLayout] = useState(() => getInitialPaneLayout());
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
+  const [sessionViewCache, setSessionViewCache] = useState({});
   const [sessionSearchQuery, setSessionSearchQuery] = useState('');
 
   const hasHydratedExpandedWorkspaceIdsRef = useRef(false);
+  const hasInitializedPaneSelectionRef = useRef(false);
   const modePickerRef = useRef(null);
   const modelPickerRef = useRef(null);
+  const paneBoardRef = useRef(null);
+  const paneViewportRefs = useRef(new Map());
   const slashCommandMenuRef = useRef(null);
   const textareaRef = useRef(null);
-  const messageViewportRef = useRef(null);
+  const [paneBoardSize, setPaneBoardSize] = useState(() => getInitialPaneBoardSize());
+  const focusedPane = useMemo(
+    () => paneLayout.panes.find((pane) => pane.id === paneLayout.focusedPaneId) || paneLayout.panes[0] || null,
+    [paneLayout.focusedPaneId, paneLayout.panes],
+  );
 
   const selectedWorkspace = useMemo(
     () => appState.workspaces.find((workspace) => workspace.id === appState.selectedWorkspaceId) || null,
@@ -313,11 +397,36 @@ export default function App() {
   );
   const copy = COPY[language];
   const selectedSession = appState.activeSession;
+  const focusedWorkspace = useMemo(
+    () => appState.workspaces.find((workspace) => workspace.id === focusedPane?.workspaceId) || null,
+    [appState.workspaces, focusedPane?.workspaceId],
+  );
+  const focusedSessionCacheKey = useMemo(
+    () => createSessionCacheKey(focusedPane?.workspaceId, focusedPane?.sessionId),
+    [focusedPane?.sessionId, focusedPane?.workspaceId],
+  );
+  const focusedSession = useMemo(() => {
+    if (!focusedPane?.sessionId) {
+      return null;
+    }
+
+    const isSelectedPaneSession = (
+      selectedSession
+      && selectedSession.workspaceId === focusedPane.workspaceId
+      && selectedSession.id === focusedPane.sessionId
+    );
+
+    if (isSelectedPaneSession) {
+      return selectedSession;
+    }
+
+    return sessionViewCache[focusedSessionCacheKey] || null;
+  }, [focusedPane, focusedSessionCacheKey, selectedSession, sessionViewCache]);
   const normalizedSessionSearchQuery = sessionSearchQuery.trim().toLowerCase();
   const installedSkills = Array.isArray(appState.claude.skills) ? appState.claude.skills : [];
   const slashCommands = useMemo(() => getSlashCommands(language, installedSkills), [installedSkills, language]);
   const availableClaudeModels = Array.isArray(appState.claude.models) ? appState.claude.models : [];
-  const sessionPermissionMode = selectedSession?.permissionMode || 'default';
+  const sessionPermissionMode = focusedSession?.permissionMode || 'default';
   const modeOptions = useMemo(() => getComposerSessionModeOptions(copy), [copy]);
   const currentModeDisplay = useMemo(
     () => getSessionModeLabel(sessionPermissionMode, copy),
@@ -331,18 +440,18 @@ export default function App() {
     () => getSessionModeIcon(sessionPermissionMode),
     [sessionPermissionMode],
   );
-  const effectiveCurrentModel = selectedSession?.currentModel || selectedSession?.model || '';
+  const effectiveCurrentModel = focusedSession?.currentModel || focusedSession?.model || '';
   const modelOptions = useMemo(
-    () => getComposerModelOptions(copy, selectedSession?.model || '', effectiveCurrentModel, availableClaudeModels),
-    [availableClaudeModels, copy, effectiveCurrentModel, selectedSession?.model],
+    () => getComposerModelOptions(copy, focusedSession?.model || '', effectiveCurrentModel, availableClaudeModels),
+    [availableClaudeModels, copy, effectiveCurrentModel, focusedSession?.model],
   );
   const currentModelDisplay = useMemo(
     () => getModelDisplayName(effectiveCurrentModel, availableClaudeModels) || copy.modelOptionDefault,
     [availableClaudeModels, copy.modelOptionDefault, effectiveCurrentModel],
   );
   const currentModelCommandValue = useMemo(
-    () => ((selectedSession?.model || '').trim() || 'default'),
-    [selectedSession?.model],
+    () => ((focusedSession?.model || '').trim() || 'default'),
+    [focusedSession?.model],
   );
   const slashCommandQuery = useMemo(() => getSlashCommandQuery(inputValue), [inputValue]);
   const visibleSlashCommands = useMemo(
@@ -351,22 +460,49 @@ export default function App() {
   );
   const highlightedSlashCommand = visibleSlashCommands[selectedSlashCommandIndex] || visibleSlashCommands[0] || null;
   const isSlashCommandMenuOpen = slashCommandQuery !== null;
-  const pendingApprovals = Array.isArray(selectedSession?.pendingApprovals)
-    ? selectedSession.pendingApprovals.filter(Boolean)
+  const pendingApprovals = Array.isArray(focusedSession?.pendingApprovals)
+    ? focusedSession.pendingApprovals.filter(Boolean)
     : [];
-  const renderableMessages = useMemo(
-    () => mergeRenderableMessages(
-      selectedSession?.messages || [],
-      language,
-      Boolean(isSending || selectedSession?.status === 'running'),
-      pendingApprovals,
-    ),
-    [isSending, language, pendingApprovals, selectedSession?.messages, selectedSession?.status],
-  );
   const hasComposerAttachments = composerAttachments.length > 0;
   const composerHistoryEntries = useMemo(
-    () => getComposerHistoryEntries(selectedSession?.messages || []),
-    [selectedSession?.messages],
+    () => getComposerHistoryEntries(focusedSession?.messages || []),
+    [focusedSession?.messages],
+  );
+  const paneViews = useMemo(
+    () => paneLayout.panes.map((pane) => buildPaneViewModel({
+      activeSession: selectedSession,
+      appState,
+      copy,
+      focusedPaneId: paneLayout.focusedPaneId,
+      sendingPaneIds,
+      language,
+      paneCount: paneLayout.panes.length,
+      pane,
+      sessionViewCache,
+    })),
+    [appState, copy, language, paneLayout.focusedPaneId, paneLayout.panes, selectedSession, sendingPaneIds, sessionViewCache],
+  );
+  const pendingApprovalRequestIds = useMemo(
+    () => new Set(
+      paneViews.flatMap((pane) => (
+        Array.isArray(pane.session?.pendingApprovals)
+          ? pane.session.pendingApprovals.map((approval) => approval?.requestId).filter(Boolean)
+          : []
+      )),
+    ),
+    [paneViews],
+  );
+  const focusedPaneView = useMemo(
+    () => paneViews.find((pane) => pane.id === focusedPane?.id) || null,
+    [focusedPane?.id, paneViews],
+  );
+  const maxPaneCount = useMemo(
+    () => getAdaptivePaneLimit(paneBoardSize.width, paneBoardSize.height),
+    [paneBoardSize.height, paneBoardSize.width],
+  );
+  const paneGridSpec = useMemo(
+    () => getAdaptivePaneGridSpec(paneViews.length, paneBoardSize.width, paneBoardSize.height),
+    [paneBoardSize.height, paneBoardSize.width, paneViews.length],
   );
   const filteredWorkspaces = useMemo(() => {
     if (!normalizedSessionSearchQuery) {
@@ -390,10 +526,6 @@ export default function App() {
   const isMac = appState.platform === 'darwin';
   const topBarHeightClass = isMac ? 'h-10' : 'h-11';
   const topBarOffsetClass = isMac ? 'pt-10' : 'pt-11';
-  const shouldShowRunIndicator = useMemo(
-    () => shouldRenderRunIndicator(selectedSession, renderableMessages, isSending),
-    [isSending, renderableMessages, selectedSession],
-  );
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
 
   useEffect(() => {
@@ -472,11 +604,11 @@ export default function App() {
   }, [desktopClient]);
 
   useEffect(() => {
-    if (!selectedSession) {
+    if (!focusedSession) {
       setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     }
-  }, [selectedSession]);
+  }, [focusedSession]);
 
   useEffect(() => {
     if (!isSettingsOpen || typeof document === 'undefined') {
@@ -498,19 +630,37 @@ export default function App() {
   useEffect(() => {
     setComposerAttachments([]);
     setComposerHistoryIndex(-1);
-  }, [selectedSession?.id]);
+  }, [focusedPane?.id, focusedSession?.id]);
+
+  useEffect(() => {
+    if (!selectedSession) {
+      return;
+    }
+
+    const cacheKey = createSessionCacheKey(selectedSession.workspaceId, selectedSession.id);
+    setSessionViewCache((current) => {
+      if (areSessionSnapshotsEqual(current[cacheKey], selectedSession)) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [cacheKey]: selectedSession,
+      };
+    });
+  }, [selectedSession]);
 
   useEffect(() => {
     if (!pendingApprovalActionId) {
       return;
     }
 
-    if (pendingApprovals.some((approval) => approval.requestId === pendingApprovalActionId)) {
+    if (pendingApprovalRequestIds.has(pendingApprovalActionId)) {
       return;
     }
 
     setPendingApprovalActionId('');
-  }, [pendingApprovalActionId, pendingApprovals]);
+  }, [pendingApprovalActionId, pendingApprovalRequestIds]);
 
   useEffect(() => {
     if ((!isModePickerOpen && !isModelPickerOpen) || typeof document === 'undefined') {
@@ -548,6 +698,75 @@ export default function App() {
 
   useEffect(() => {
     if (typeof document === 'undefined') {
+      return undefined;
+    }
+
+    const handleGlobalPaneShortcuts = (event) => {
+      if (
+        event.defaultPrevented
+        || event.repeat
+        || !event.metaKey
+        || event.ctrlKey
+        || event.altKey
+        || event.shiftKey
+      ) {
+        return;
+      }
+
+      const shortcutKey = event.key.toLowerCase();
+      const paneShortcutIndex = Number.parseInt(shortcutKey, 10);
+      const isPaneShortcut = Number.isInteger(paneShortcutIndex) && paneShortcutIndex >= 1 && paneShortcutIndex <= 9;
+      if (shortcutKey !== 'n' && shortcutKey !== 'd' && shortcutKey !== 'w' && !isPaneShortcut) {
+        return;
+      }
+
+      if (isPaneShortcut) {
+        const targetPane = paneViews[paneShortcutIndex - 1];
+        if (!targetPane) {
+          return;
+        }
+
+        event.preventDefault();
+        void focusPane(targetPane.id);
+        return;
+      }
+
+      if (shortcutKey === 'd') {
+        event.preventDefault();
+        addPane();
+        return;
+      }
+
+      if (shortcutKey === 'w') {
+        if (!focusedPane?.id || paneLayout.panes.length <= 1) {
+          return;
+        }
+
+        event.preventDefault();
+        clearPane(focusedPane.id);
+        return;
+      }
+
+      const shortcutWorkspace = focusedWorkspace || selectedWorkspace;
+      if (!shortcutWorkspace) {
+        event.preventDefault();
+        setSidebarError(copy.noWorkspaceSelected);
+        return;
+      }
+
+      event.preventDefault();
+      void createSession(shortcutWorkspace.id);
+    };
+
+    document.addEventListener('keydown', handleGlobalPaneShortcuts);
+
+    return () => {
+      document.removeEventListener('keydown', handleGlobalPaneShortcuts);
+    };
+  }, [copy.noWorkspaceSelected, focusedPane?.id, focusedWorkspace, paneLayout.panes.length, paneViews, selectedWorkspace]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') {
       return;
     }
 
@@ -563,6 +782,14 @@ export default function App() {
 
     window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
   }, [themePreference]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(PANE_LAYOUT_STORAGE_KEY, JSON.stringify(paneLayout));
+  }, [paneLayout]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof document === 'undefined') {
@@ -592,6 +819,39 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (typeof window === 'undefined' || typeof ResizeObserver === 'undefined') {
+      return undefined;
+    }
+
+    const element = paneBoardRef.current;
+    if (!element) {
+      return undefined;
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) {
+        return;
+      }
+
+      const nextWidth = Math.round(entry.contentRect.width);
+      const nextHeight = Math.round(entry.contentRect.height);
+
+      setPaneBoardSize((current) => (
+        current.width === nextWidth && current.height === nextHeight
+          ? current
+          : { height: nextHeight, width: nextWidth }
+      ));
+    });
+
+    observer.observe(element);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [paneViews.length]);
+
+  useEffect(() => {
     if (!desktopClient) {
       setSidebarError(copy.bridgeUnavailable);
     }
@@ -606,7 +866,7 @@ export default function App() {
     const unsubscribe = desktopClient.onStateChange((event) => {
       if (event?.type === 'state' && event.state) {
         setAppState(event.state);
-        setIsSending(false);
+        setSendingPaneIds([]);
       }
     });
 
@@ -640,6 +900,149 @@ export default function App() {
   }, [appState.expandedWorkspaceIds, appState.workspaces, isBootstrapping]);
 
   useEffect(() => {
+    if (isBootstrapping) {
+      return;
+    }
+
+    setPaneLayout((current) => {
+      const next = normalizePaneLayoutWithAppState(current, appState);
+      if (arePaneLayoutsEqual(current, next)) {
+        return current;
+      }
+
+      return next;
+    });
+  }, [appState, isBootstrapping]);
+
+  useEffect(() => {
+    if (!desktopClient || isBootstrapping) {
+      return;
+    }
+
+    const pendingFetches = paneLayout.panes
+      .filter((pane) => pane.workspaceId && pane.sessionId)
+      .filter((pane) => (
+        !selectedSession
+        || pane.workspaceId !== selectedSession.workspaceId
+        || pane.sessionId !== selectedSession.id
+      ))
+      .filter((pane) => {
+        const workspace = appState.workspaces.find((entry) => entry.id === pane.workspaceId);
+        const sessionMeta = workspace?.sessions.find((entry) => entry.id === pane.sessionId) || null;
+        const cacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
+        const cachedSession = sessionViewCache[cacheKey];
+        if (!cachedSession || !sessionMeta) {
+          return !cachedSession;
+        }
+
+        return (
+          cachedSession.updatedAt !== sessionMeta.updatedAt
+          || cachedSession.status !== sessionMeta.status
+          || Boolean(cachedSession.isRunning) !== Boolean(sessionMeta.isRunning)
+        );
+      });
+
+    if (pendingFetches.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+
+    Promise.all(
+      pendingFetches.map(async (pane) => {
+        try {
+          const session = await desktopClient.getSession({
+            sessionId: pane.sessionId,
+            workspaceId: pane.workspaceId,
+          });
+          return session;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((sessions) => {
+      if (cancelled) {
+        return;
+      }
+
+      setSessionViewCache((current) => {
+        let mutated = false;
+        const next = { ...current };
+
+        for (const session of sessions.filter(Boolean)) {
+          const cacheKey = createSessionCacheKey(session.workspaceId, session.id);
+          if (areSessionSnapshotsEqual(next[cacheKey], session)) {
+            continue;
+          }
+
+          next[cacheKey] = session;
+          mutated = true;
+        }
+
+        return mutated ? next : current;
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [appState.workspaces, desktopClient, isBootstrapping, paneLayout.panes, selectedSession, sessionViewCache]);
+
+  useEffect(() => {
+    if (!desktopClient || isBootstrapping || hasInitializedPaneSelectionRef.current) {
+      return;
+    }
+
+    if (!paneLayout.panes.length) {
+      hasInitializedPaneSelectionRef.current = true;
+      return;
+    }
+
+    const targetPane = focusedPane || paneLayout.panes[0];
+
+    if (!targetPane?.workspaceId || !targetPane.sessionId) {
+      if (selectedSession) {
+        const existingPane = paneLayout.panes.find((pane) => (
+          pane.workspaceId === selectedSession.workspaceId
+          && pane.sessionId === selectedSession.id
+        ));
+
+        setPaneLayout((current) => {
+          const next = existingPane
+            ? focusPaneInLayout(current, existingPane.id)
+            : assignSessionToPaneState(current, current.focusedPaneId, {
+              sessionId: selectedSession.id,
+              workspaceId: selectedSession.workspaceId,
+            });
+
+          return arePaneLayoutsEqual(current, next) ? current : next;
+        });
+      }
+      hasInitializedPaneSelectionRef.current = true;
+      return;
+    }
+
+    hasInitializedPaneSelectionRef.current = true;
+
+    if (
+      appState.selectedWorkspaceId === targetPane.workspaceId
+      && appState.selectedSessionId === targetPane.sessionId
+    ) {
+      return;
+    }
+
+    void openSessionInPane(targetPane.workspaceId, targetPane.sessionId, { paneId: targetPane.id });
+  }, [
+    appState.selectedSessionId,
+    appState.selectedWorkspaceId,
+    desktopClient,
+    focusedPane,
+    isBootstrapping,
+    paneLayout.panes,
+    selectedSession,
+  ]);
+
+  useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) {
       return;
@@ -650,7 +1053,7 @@ export default function App() {
   }, [inputValue]);
 
   useEffect(() => {
-    const viewport = messageViewportRef.current;
+    const viewport = paneViewportRefs.current.get(focusedPane?.id);
     if (!viewport) {
       return undefined;
     }
@@ -661,7 +1064,7 @@ export default function App() {
         const top = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
         viewport.scrollTo({
           top,
-          behavior: selectedSession?.status === 'running' || shouldShowRunIndicator ? 'auto' : 'smooth',
+          behavior: focusedSession?.status === 'running' || focusedPaneView?.shouldShowRunIndicator ? 'auto' : 'smooth',
         });
       });
     });
@@ -672,7 +1075,7 @@ export default function App() {
         window.cancelAnimationFrame(nextFrameId);
       }
     };
-  }, [selectedSession?.id, selectedSession?.messages, selectedSession?.status, shouldShowRunIndicator]);
+  }, [focusedPane?.id, focusedPaneView?.shouldShowRunIndicator, focusedSession?.id, focusedSession?.messages, focusedSession?.status]);
 
   async function loadAppState() {
     if (!desktopClient) {
@@ -706,11 +1109,10 @@ export default function App() {
   }
 
   async function addWorkspace() {
-    if (!desktopClient || isPickingWorkspace || appState.claude.busy) {
+    if (!desktopClient || isPickingWorkspace) {
       return;
     }
 
-    setIsPickingWorkspace(true);
     setSidebarError('');
 
     try {
@@ -719,6 +1121,7 @@ export default function App() {
         return;
       }
 
+      setIsPickingWorkspace(true);
       const nextState = await desktopClient.addWorkspace(selectedPath);
       setAppState(nextState);
     } catch (error) {
@@ -728,8 +1131,32 @@ export default function App() {
     }
   }
 
-  async function createSession(workspaceId) {
-    if (!desktopClient || appState.claude.busy) {
+  async function openGitDiffWindow(workspaceId) {
+    if (!desktopClient || !workspaceId) {
+      return;
+    }
+
+    setSidebarError('');
+
+    try {
+      await desktopClient.openGitDiffWindow({ workspaceId });
+    } catch (error) {
+      setSidebarError(error.message);
+    }
+  }
+
+  function addPane() {
+    if (paneLayout.panes.length >= maxPaneCount) {
+      setSidebarError(copy.paneSplitLimitReached);
+      return;
+    }
+
+    setSidebarError('');
+    setPaneLayout((current) => appendPaneToLayout(current));
+  }
+
+  async function createSession(workspaceId, options = {}) {
+    if (!desktopClient) {
       return;
     }
 
@@ -738,13 +1165,17 @@ export default function App() {
     try {
       const nextState = await desktopClient.createSession(workspaceId);
       setAppState(nextState);
+      setPaneLayout((current) => assignSessionToPaneState(current, options.paneId || current.focusedPaneId, {
+        sessionId: nextState.selectedSessionId,
+        workspaceId: nextState.selectedWorkspaceId,
+      }));
       setInputValue('');
     } catch (error) {
       setSidebarError(error.message);
     }
   }
 
-  async function selectWorkspace(workspaceId) {
+  async function selectWorkspace(workspaceId, options = {}) {
     if (!desktopClient) {
       return;
     }
@@ -759,8 +1190,27 @@ export default function App() {
     }
   }
 
-  async function selectSession(workspaceId, sessionId) {
-    if (!desktopClient) {
+  async function openSessionInPane(workspaceId, sessionId, { paneId = paneLayout.focusedPaneId } = {}) {
+    if (!desktopClient || !workspaceId || !sessionId) {
+      return;
+    }
+
+    const existingPane = paneLayout.panes.find((pane) => pane.workspaceId === workspaceId && pane.sessionId === sessionId);
+    const targetPaneId = existingPane?.id || paneId || paneLayout.panes[0]?.id;
+    if (!targetPaneId) {
+      return;
+    }
+
+    setPaneLayout((current) => {
+      let next = focusPaneInLayout(current, targetPaneId);
+      next = assignSessionToPaneState(next, targetPaneId, { sessionId, workspaceId });
+      return next;
+    });
+
+    if (
+      appState.selectedWorkspaceId === workspaceId
+      && appState.selectedSessionId === sessionId
+    ) {
       return;
     }
 
@@ -772,6 +1222,28 @@ export default function App() {
     } catch (error) {
       setSidebarError(error.message);
     }
+  }
+
+  async function selectSession(workspaceId, sessionId, options = {}) {
+    await openSessionInPane(workspaceId, sessionId, options);
+  }
+
+  async function focusPane(paneId) {
+    const pane = paneLayout.panes.find((entry) => entry.id === paneId);
+    if (!pane) {
+      return;
+    }
+
+    if (!pane.sessionId || !pane.workspaceId) {
+      setPaneLayout((current) => focusPaneInLayout(current, paneId));
+      return;
+    }
+
+    await openSessionInPane(pane.workspaceId, pane.sessionId, { paneId });
+  }
+
+  function clearPane(paneId) {
+    setPaneLayout((current) => removePaneFromLayout(current, paneId));
   }
 
   function focusComposer() {
@@ -807,7 +1279,7 @@ export default function App() {
   }
 
   async function pickComposerAttachments() {
-    if (!desktopClient || appState.claude.busy || isBootstrapping) {
+    if (!desktopClient || isBootstrapping) {
       return;
     }
 
@@ -824,8 +1296,22 @@ export default function App() {
     }
   }
 
+  async function pickAttachmentsForPane() {
+    if (!desktopClient || isBootstrapping) {
+      return [];
+    }
+
+    try {
+      const pickedAttachments = await desktopClient.pickAttachments();
+      return Array.isArray(pickedAttachments) ? pickedAttachments : [];
+    } catch (error) {
+      setSidebarError(error.message);
+      return [];
+    }
+  }
+
   async function pasteComposerAttachments(clipboardData) {
-    if (!desktopClient || appState.claude.busy || isBootstrapping) {
+    if (!desktopClient || isBootstrapping) {
       return false;
     }
 
@@ -850,6 +1336,28 @@ export default function App() {
     } catch (error) {
       setSidebarError(error.message);
       return false;
+    }
+  }
+
+  async function preparePastedAttachmentsForPane(clipboardData) {
+    if (!desktopClient || isBootstrapping) {
+      return [];
+    }
+
+    const clipboardFiles = getClipboardFiles(clipboardData);
+    if (clipboardFiles.length === 0) {
+      return [];
+    }
+
+    try {
+      const preparedAttachments = await Promise.all(clipboardFiles.map((file) => createPastedAttachmentPayload(file)));
+      const nextAttachments = await desktopClient.preparePastedAttachments({
+        attachments: preparedAttachments.filter(Boolean),
+      });
+      return Array.isArray(nextAttachments) ? nextAttachments : [];
+    } catch (error) {
+      setSidebarError(error.message);
+      return [];
     }
   }
 
@@ -908,7 +1416,7 @@ export default function App() {
   }
 
   async function updateCurrentSessionModel(nextModel, { clearInput = false } = {}) {
-    if (!desktopClient || !selectedWorkspace || !selectedSession) {
+    if (!desktopClient || !focusedWorkspace || !focusedSession) {
       throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
     }
 
@@ -918,8 +1426,8 @@ export default function App() {
     try {
       const nextState = await desktopClient.updateSessionModel({
         model: nextModel,
-        sessionId: selectedSession.id,
-        workspaceId: selectedWorkspace.id,
+        sessionId: focusedSession.id,
+        workspaceId: focusedWorkspace.id,
       });
       setAppState(nextState);
 
@@ -933,7 +1441,7 @@ export default function App() {
   }
 
   async function updateCurrentSessionPermissionMode(nextPermissionMode, { clearInput = false } = {}) {
-    if (!desktopClient || !selectedWorkspace || !selectedSession) {
+    if (!desktopClient || !focusedWorkspace || !focusedSession) {
       throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
     }
 
@@ -943,8 +1451,8 @@ export default function App() {
     try {
       const nextState = await desktopClient.updateSessionPermissionMode({
         permissionMode: nextPermissionMode,
-        sessionId: selectedSession.id,
-        workspaceId: selectedWorkspace.id,
+        sessionId: focusedSession.id,
+        workspaceId: focusedWorkspace.id,
       });
       setAppState(nextState);
 
@@ -958,7 +1466,7 @@ export default function App() {
   }
 
   async function submitPrompt(prompt, { attachments = [], displayKind = '', displayPrompt, displayTitle = '' } = {}) {
-    if (!desktopClient || appState.claude.busy) {
+    if (!desktopClient) {
       return;
     }
 
@@ -968,7 +1476,7 @@ export default function App() {
       return;
     }
 
-    if (!selectedSession || !selectedWorkspace) {
+    if (!focusedSession || !focusedWorkspace) {
       setSidebarError(
         language === 'zh'
           ? '请先创建或选择一个会话，或输入 /clear。'
@@ -977,7 +1485,16 @@ export default function App() {
       return;
     }
 
-    setIsSending(true);
+    if (focusedSession.isRunning) {
+      setSidebarError(
+        language === 'zh'
+          ? '当前对话仍在运行，请先停止或等待完成。'
+          : 'This conversation is still running. Stop it or wait for it to finish first.',
+      );
+      return;
+    }
+
+    markPaneSending(focusedPane?.id);
     setSidebarError('');
     setComposerAttachments([]);
     setComposerHistoryIndex(-1);
@@ -990,11 +1507,11 @@ export default function App() {
         displayPrompt,
         displayTitle,
         prompt: normalizedPrompt,
-        sessionId: selectedSession.id,
-        workspaceId: selectedWorkspace.id,
+        sessionId: focusedSession.id,
+        workspaceId: focusedWorkspace.id,
       });
     } catch (error) {
-      setIsSending(false);
+      clearPaneSending(focusedPane?.id);
       setComposerAttachments(normalizedAttachments);
       setComposerHistoryIndex(-1);
       setInputValue(displayPrompt || normalizedPrompt);
@@ -1026,11 +1543,11 @@ export default function App() {
       }
 
       if (commandName === 'clear') {
-        if (!selectedWorkspace) {
+        if (!focusedWorkspace && !selectedWorkspace) {
           throw new Error(language === 'zh' ? '请先选择一个工作目录。' : 'Select a workspace first.');
         }
 
-        await createSession(selectedWorkspace.id);
+        await createSession((focusedWorkspace || selectedWorkspace).id);
         setComposerHistoryIndex(-1);
         setInputValue('');
         return true;
@@ -1066,7 +1583,7 @@ export default function App() {
       }
 
       if (commandName === 'mcp') {
-        if (!selectedWorkspace || !selectedSession) {
+        if (!focusedWorkspace || !focusedSession) {
           throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
         }
 
@@ -1076,8 +1593,8 @@ export default function App() {
 
         const nextState = await desktopClient.runMcpCommand({
           args: parsedCommand.args,
-          sessionId: selectedSession.id,
-          workspaceId: selectedWorkspace.id,
+          sessionId: focusedSession.id,
+          workspaceId: focusedWorkspace.id,
         });
         setAppState(nextState);
         setComposerHistoryIndex(-1);
@@ -1086,7 +1603,7 @@ export default function App() {
       }
 
       if (commandName === 'skills') {
-        if (!selectedWorkspace || !selectedSession) {
+        if (!focusedWorkspace || !focusedSession) {
           throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
         }
 
@@ -1095,8 +1612,8 @@ export default function App() {
 
         if (action === 'list') {
           const nextState = await desktopClient.listSkills({
-            sessionId: selectedSession.id,
-            workspaceId: selectedWorkspace.id,
+            sessionId: focusedSession.id,
+            workspaceId: focusedWorkspace.id,
           });
           setAppState(nextState);
           setComposerHistoryIndex(-1);
@@ -1112,8 +1629,8 @@ export default function App() {
 
           const nextState = await desktopClient.installSkill({
             args: installArgs,
-            sessionId: selectedSession.id,
-            workspaceId: selectedWorkspace.id,
+            sessionId: focusedSession.id,
+            workspaceId: focusedWorkspace.id,
           });
           setAppState(nextState);
           setComposerHistoryIndex(-1);
@@ -1159,22 +1676,352 @@ export default function App() {
     await submitPrompt(prompt, { attachments: composerAttachments });
   }
 
+  function getPaneContext(paneId) {
+    const pane = paneViews.find((entry) => entry.id === paneId) || null;
+    if (!pane) {
+      return null;
+    }
+
+    return {
+      pane,
+      session: pane.session || null,
+      workspace: pane.workspace || null,
+    };
+  }
+
+  function markPaneSending(paneId) {
+    if (!paneId) {
+      return;
+    }
+
+    setSendingPaneIds((current) => (
+      current.includes(paneId) ? current : [...current, paneId]
+    ));
+  }
+
+  function clearPaneSending(paneId) {
+    if (!paneId) {
+      return;
+    }
+
+    setSendingPaneIds((current) => current.filter((id) => id !== paneId));
+  }
+
+  async function submitPromptForPane(paneId, prompt, {
+    attachments = [],
+    displayKind = '',
+    displayPrompt,
+    displayTitle = '',
+  } = {}) {
+    if (!desktopClient) {
+      return false;
+    }
+
+    const context = getPaneContext(paneId);
+    const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
+    const normalizedAttachments = normalizeComposerAttachments(attachments);
+    if (!normalizedPrompt && normalizedAttachments.length === 0) {
+      return false;
+    }
+
+    if (!context?.session || !context.workspace) {
+      setSidebarError(
+        language === 'zh'
+          ? '请先在这个分屏里创建或选择一个会话。'
+          : 'Create or select a conversation in this pane first.',
+      );
+      return false;
+    }
+
+    if (context.pane?.isBusy) {
+      setSidebarError(
+        language === 'zh'
+          ? '这个分屏里的对话仍在运行，请先停止或等待完成。'
+          : 'This conversation is still running. Stop it or wait for it to finish first.',
+      );
+      return false;
+    }
+
+    markPaneSending(paneId);
+    setSidebarError('');
+
+    try {
+      await desktopClient.sendMessage({
+        attachments: normalizedAttachments,
+        displayKind,
+        displayPrompt,
+        displayTitle,
+        prompt: normalizedPrompt,
+        sessionId: context.session.id,
+        workspaceId: context.workspace.id,
+      });
+      return true;
+    } catch (error) {
+      clearPaneSending(paneId);
+      setSidebarError(error.message);
+      return false;
+    }
+  }
+
+  async function updateSessionModelForPane(paneId, nextModel) {
+    if (!desktopClient) {
+      return;
+    }
+
+    const context = getPaneContext(paneId);
+    if (!context?.workspace || !context.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingModel(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionModel({
+        model: nextModel,
+        sessionId: context.session.id,
+        workspaceId: context.workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingModel(false);
+    }
+  }
+
+  async function updateSessionPermissionModeForPane(paneId, nextPermissionMode) {
+    if (!desktopClient) {
+      return;
+    }
+
+    const context = getPaneContext(paneId);
+    if (!context?.workspace || !context.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingPermissionMode(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionPermissionMode({
+        permissionMode: nextPermissionMode,
+        sessionId: context.session.id,
+        workspaceId: context.workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingPermissionMode(false);
+    }
+  }
+
+  async function runSlashCommandForPane(paneId, rawInput) {
+    const parsedCommand = parseSlashCommand(rawInput);
+    if (!parsedCommand) {
+      return {
+        handled: false,
+      };
+    }
+
+    const context = getPaneContext(paneId);
+    const commandName = resolveSlashCommandName(parsedCommand.name);
+    const installedSkill = findInstalledSkillCommand(parsedCommand.name, installedSkills);
+    if (!commandName && !installedSkill) {
+      setSidebarError(formatUnknownSlashCommand(parsedCommand.name, language));
+      return { handled: true };
+    }
+
+    setSidebarError('');
+
+    try {
+      if (commandName === 'help') {
+        return {
+          handled: true,
+          nextInputValue: '/',
+        };
+      }
+
+      if (commandName === 'clear') {
+        const targetWorkspace = context?.workspace || focusedWorkspace || selectedWorkspace;
+        if (!targetWorkspace) {
+          throw new Error(language === 'zh' ? '请先选择一个工作目录。' : 'Select a workspace first.');
+        }
+
+        await createSession(targetWorkspace.id, { paneId });
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'theme') {
+        const nextTheme = normalizeThemeCommandArg(parsedCommand.args);
+        if (!nextTheme) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /theme light、/theme dark 或 /theme system。'
+              : 'Use /theme light, /theme dark, or /theme system.',
+          );
+        }
+
+        setThemePreference(nextTheme);
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'model') {
+        if (!context?.workspace || !context.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /model <模型名>，或 /model default 恢复默认模型。'
+              : 'Use /model <name>, or /model default to restore the default model.',
+          );
+        }
+
+        setIsUpdatingModel(true);
+        try {
+          const nextState = await desktopClient.updateSessionModel({
+            model: normalizeModelCommandArg(parsedCommand.args),
+            sessionId: context.session.id,
+            workspaceId: context.workspace.id,
+          });
+          setAppState(nextState);
+        } finally {
+          setIsUpdatingModel(false);
+        }
+
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'mcp') {
+        if (!context?.workspace || !context.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        if (!parsedCommand.args) {
+          throw new Error(language === 'zh' ? '请使用 /mcp list、/mcp get <name>、/mcp add ... 或 /mcp remove <name>。' : 'Use /mcp list, /mcp get <name>, /mcp add ..., or /mcp remove <name>.');
+        }
+
+        const nextState = await desktopClient.runMcpCommand({
+          args: parsedCommand.args,
+          sessionId: context.session.id,
+          workspaceId: context.workspace.id,
+        });
+        setAppState(nextState);
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'skills') {
+        if (!context?.workspace || !context.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        const tokens = tokenizeSlashArgs(parsedCommand.args);
+        const action = (tokens[0] || 'list').toLowerCase();
+
+        if (action === 'list') {
+          const nextState = await desktopClient.listSkills({
+            sessionId: context.session.id,
+            workspaceId: context.workspace.id,
+          });
+          setAppState(nextState);
+          return {
+            handled: true,
+            nextInputValue: '',
+          };
+        }
+
+        if (action === 'install') {
+          const installArgs = parsedCommand.args.slice(parsedCommand.args.toLowerCase().indexOf('install') + 'install'.length).trim();
+          if (!installArgs) {
+            throw new Error(language === 'zh' ? '请使用 /skills install <path> [--scope user|project]。' : 'Use /skills install <path> [--scope user|project].');
+          }
+
+          const nextState = await desktopClient.installSkill({
+            args: installArgs,
+            sessionId: context.session.id,
+            workspaceId: context.workspace.id,
+          });
+          setAppState(nextState);
+          return {
+            handled: true,
+            nextInputValue: '',
+          };
+        }
+
+        throw new Error(language === 'zh' ? '当前只支持 /skills list 和 /skills install <path> [--scope user|project]。' : 'Currently supported: /skills list and /skills install <path> [--scope user|project].');
+      }
+
+      if (installedSkill) {
+        const handled = await submitPromptForPane(
+          paneId,
+          buildSkillInvocationPrompt(installedSkill, parsedCommand.args, language),
+          {
+            displayKind: 'command',
+            displayPrompt: rawInput.trim(),
+            displayTitle: rawInput.trim(),
+          },
+        );
+
+        return {
+          handled,
+          nextInputValue: handled ? '' : rawInput,
+        };
+      }
+    } catch (error) {
+      setSidebarError(error.message);
+      return {
+        handled: true,
+      };
+    }
+
+    return {
+      handled: false,
+    };
+  }
+
   async function stopRun() {
-    if (!desktopClient || !appState.claude.busy) {
+    if (!focusedPane?.id) {
+      return;
+    }
+
+    await stopRunForPane(focusedPane.id);
+  }
+
+  async function stopRunForPane(paneId) {
+    if (!desktopClient) {
+      return;
+    }
+
+    const context = getPaneContext(paneId);
+    if (!context?.workspace || !context.session || !context.pane?.isBusy) {
       return;
     }
 
     try {
-      const nextState = await desktopClient.stopRun();
+      const nextState = await desktopClient.stopRun({
+        sessionId: context.session.id,
+        workspaceId: context.workspace.id,
+      });
       setAppState(nextState);
-      setIsSending(false);
+      clearPaneSending(paneId);
     } catch (error) {
       setSidebarError(error.message);
     }
   }
 
   async function respondToApproval(requestId, decision) {
-    if (!desktopClient || !requestId || !selectedSession) {
+    if (!desktopClient || !requestId) {
       return;
     }
 
@@ -1258,10 +2105,10 @@ export default function App() {
   const trimmedInputValue = inputValue.trim();
   const canSend = Boolean(
     desktopClient
-    && selectedWorkspace
-    && !appState.claude.busy
+    && focusedWorkspace
+    && !focusedSession?.isRunning
     && (trimmedInputValue || hasComposerAttachments)
-    && (selectedSession || trimmedInputValue.startsWith('/')),
+    && (focusedSession || trimmedInputValue.startsWith('/')),
   );
 
   return (
@@ -1276,16 +2123,27 @@ export default function App() {
           topBarOffsetClass,
         )}
       >
-        <aside className="flex w-[360px] min-w-[360px] shrink-0 flex-col overflow-hidden border-r border-border/70 bg-background/60">
+        <aside className="flex w-[280px] min-w-[280px] shrink-0 flex-col overflow-hidden border-r border-border/70 bg-background/60">
           <div className="border-b border-border/70 px-3 py-3">
             <div className="pr-2">
-              <div className="relative pr-12">
+              <div className="relative pr-24">
                 <StatusPill
                   tone={appState.claude.available ? 'success' : 'error'}
                   label={formatClaudeStatusLabel(appState.claude, language)}
                   title={normalizeClaudeVersion(appState.claude.version) || undefined}
                 />
                 <div className={SIDEBAR_ACTION_SLOT_CLASS}>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={addPane}
+                    disabled={!desktopClient || paneLayout.panes.length >= maxPaneCount}
+                    aria-label={copy.paneSplitAdd}
+                    title={formatShortcutTooltip(copy.paneSplitAdd, 'D', appState.platform)}
+                    className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'hover:bg-background/70')}
+                  >
+                    <Columns2 className="h-4 w-4" />
+                  </Button>
                   <Button
                     variant="ghost"
                     size="icon"
@@ -1320,7 +2178,7 @@ export default function App() {
                       variant="ghost"
                       size="icon"
                       onClick={addWorkspace}
-                      disabled={!desktopClient || isPickingWorkspace || appState.claude.busy}
+                      disabled={!desktopClient || isPickingWorkspace}
                       aria-label={copy.addWorkspace}
                       title={copy.addWorkspace}
                       className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'text-foreground')}
@@ -1348,7 +2206,7 @@ export default function App() {
                       <WorkspaceItem
                         copy={copy}
                         key={workspace.id}
-                        disabled={appState.claude.busy}
+                        disabled={isArchivingSession || isRemovingWorkspace}
                         isExpanded={normalizedSessionSearchQuery ? true : expandedWorkspaceIds.includes(workspace.id)}
                         onArchiveSession={(session) => setPendingArchiveSession({
                           sessionId: session.id,
@@ -1356,6 +2214,7 @@ export default function App() {
                           workspaceId: workspace.id,
                         })}
                         onCreateSession={() => createSession(workspace.id)}
+                        onOpenGitDiffWindow={() => openGitDiffWindow(workspace.id)}
                         onRemoveWorkspace={() => setPendingRemoveWorkspace({
                           title: workspace.name,
                           workspaceId: workspace.id,
@@ -1363,7 +2222,8 @@ export default function App() {
                         onSelectSession={(sessionId) => selectSession(workspace.id, sessionId)}
                         onSelectWorkspace={() => selectWorkspace(workspace.id)}
                         onToggleExpand={() => toggleWorkspaceExpansion(workspace.id)}
-                        selectedSessionId={appState.selectedSessionId}
+                        platform={appState.platform}
+                        selectedSessionId={focusedPane?.sessionId || appState.selectedSessionId}
                         language={language}
                         workspace={workspace}
                       />
@@ -1375,295 +2235,57 @@ export default function App() {
         </aside>
 
         <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-background/35">
-          <div className="border-b border-border/70 px-4 py-2">
-            <div className="flex items-center justify-between gap-3">
-              <p className="min-w-0 flex-1 truncate pr-3 text-[12px] font-medium text-foreground">
-                {selectedSession?.title || (selectedWorkspace ? copy.noConversationOpen : copy.noWorkspaceSelected)}
-              </p>
-              <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-                {selectedWorkspace && (
-                  <Badge variant="outline" className="h-6 bg-background/80 px-2 text-[10px] text-foreground">
-                    {selectedWorkspace.name}
-                  </Badge>
-                )}
-                {selectedWorkspace?.gitBranch && (
-                  <Badge
-                    variant="outline"
-                    className="h-6 bg-background/80 px-2 text-[10px] text-foreground"
-                    title={selectedWorkspace.gitRoot || selectedWorkspace.gitBranch}
-                  >
-                    <GitBranch className="mr-1 h-3 w-3" />
-                    {truncateMiddle(selectedWorkspace.gitBranch, 28)}
-                  </Badge>
-                )}
-                {selectedSession && (
-                  <Badge variant="outline" className="h-6 bg-background/80 px-2 text-[10px] text-foreground">
-                    {currentModelDisplay}
-                  </Badge>
-                )}
-                {selectedSession?.claudeSessionId && (
-                  <Badge variant="outline" className="h-6 px-2 text-[10px]">
-                    {truncateMiddle(selectedSession.claudeSessionId, 18)}
-                  </Badge>
-                )}
-              </div>
-            </div>
-          </div>
-
-          <div className="min-h-0 flex-1">
-            {!selectedWorkspace ? (
+          <div className="min-h-0 flex-1 overflow-hidden">
+            {appState.workspaces.length === 0 ? (
               <ConversationEmptyState
                 icon={Folder}
                 title={copy.startByAddingWorkspace}
                 description={copy.startByAddingWorkspaceDescription}
               />
-            ) : !selectedSession ? (
-              <ConversationEmptyState
-                icon={MessageSquarePlus}
-                title={copy.createConversationForWorkspace}
-                description={copy.workspaceSelectedDescription}
-              />
             ) : (
-              <ScrollArea viewportRef={messageViewportRef} className="h-full px-4 md:px-5">
-                <div className="mx-auto flex w-full max-w-[780px] flex-col gap-3 py-4">
-                    {renderableMessages.length === 0 ? (
-                      <ConversationEmptyState
-                        icon={Bot}
-                        title={copy.conversationEmpty}
-                      />
-                    ) : (
-                    <>
-                      {renderableMessages.map((message) => (
-                        <ChatMessage
-                          key={message.id}
-                          approvalActionId={pendingApprovalActionId}
-                          language={language}
-                          message={message}
-                          onApprovalDecision={respondToApproval}
-                        />
-                      ))}
-                      {shouldShowRunIndicator && <RunIndicator language={language} />}
-                    </>
-                  )}
-                </div>
-              </ScrollArea>
+              <div
+                ref={paneBoardRef}
+                className="grid h-full min-h-0 gap-px bg-border/70"
+                style={{
+                  gridTemplateColumns: `repeat(${paneGridSpec.columns}, minmax(0, 1fr))`,
+                  gridTemplateRows: `repeat(${paneGridSpec.rows}, minmax(0, 1fr))`,
+                }}
+              >
+                {paneViews.map((pane, paneIndex) => (
+                  <ConversationPane
+                    key={pane.id}
+                    canClear={!pane.isBusy}
+                    copy={copy}
+                    language={language}
+                    maxPaneCount={maxPaneCount}
+                    onCreateSession={(workspaceId) => createSession(workspaceId, { paneId: pane.id })}
+                    pane={pane}
+                    paneShortcutLabel={formatShortcutLabel(appState.platform, String(paneIndex + 1))}
+                    onClear={() => clearPane(pane.id)}
+                    onFocus={() => {
+                      void focusPane(pane.id);
+                    }}
+                    onApprovalDecision={respondToApproval}
+                    onPickAttachments={pickAttachmentsForPane}
+                    platform={appState.platform}
+                    onPreparePastedAttachments={preparePastedAttachmentsForPane}
+                    onRunSlashCommand={runSlashCommandForPane}
+                    onSendMessage={submitPromptForPane}
+                    onStopRun={stopRunForPane}
+                    onUpdateSessionModel={updateSessionModelForPane}
+                    onUpdateSessionPermissionMode={updateSessionPermissionModeForPane}
+                    availableClaudeModels={availableClaudeModels}
+                    isUpdatingModel={isUpdatingModel}
+                    isUpdatingPermissionMode={isUpdatingPermissionMode}
+                    pendingApprovalActionId={pendingApprovalActionId}
+                    registerViewport={(node) => setPaneViewportNode(paneViewportRefs, pane.id, node)}
+                    slashCommands={slashCommands}
+                  />
+                ))}
+              </div>
             )}
           </div>
 
-          <div className="p-3">
-            <div className="mx-auto w-full max-w-[780px]">
-              <div className="relative">
-                {hasComposerAttachments && (
-                  <div className="absolute left-3 right-24 top-3 z-10 overflow-x-auto pb-1">
-                    <div className="flex min-w-max items-center gap-2 pr-2">
-                      {composerAttachments.map((attachment) => (
-                        <ComposerAttachmentChip
-                          key={attachment.path}
-                          attachment={attachment}
-                          removeLabel={copy.removeAttachment}
-                          onRemove={removeComposerAttachment}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )}
-                <Textarea
-                  ref={textareaRef}
-                  value={inputValue}
-                  onChange={(event) => {
-                    if (composerHistoryIndex !== -1) {
-                      setComposerHistoryIndex(-1);
-                    }
-
-                    setInputValue(event.target.value);
-                  }}
-                  onPaste={(event) => {
-                    const clipboardData = event.clipboardData;
-                    if (!clipboardData) {
-                      return;
-                    }
-
-                    const hasClipboardFiles = getClipboardFiles(clipboardData).length > 0;
-                    if (!hasClipboardFiles) {
-                      return;
-                    }
-
-                    event.preventDefault();
-                    void pasteComposerAttachments(clipboardData);
-                  }}
-                  onKeyDown={(event) => {
-                    if (isSlashCommandMenuOpen && visibleSlashCommands.length > 0) {
-                      if (event.key === 'ArrowDown') {
-                        event.preventDefault();
-                        setSelectedSlashCommandIndex((current) => (
-                          current >= visibleSlashCommands.length - 1 ? 0 : current + 1
-                        ));
-                        return;
-                      }
-
-                      if (event.key === 'ArrowUp') {
-                        event.preventDefault();
-                        setSelectedSlashCommandIndex((current) => (
-                          current <= 0 ? visibleSlashCommands.length - 1 : current - 1
-                        ));
-                        return;
-                      }
-
-                      if (event.key === 'Tab') {
-                        event.preventDefault();
-                        applySlashCommand(highlightedSlashCommand);
-                        return;
-                      }
-
-                      if (event.key === 'Enter' && !event.shiftKey && !resolveSlashCommandName(slashCommandQuery)) {
-                        event.preventDefault();
-                        applySlashCommand(highlightedSlashCommand);
-                        return;
-                      }
-                    }
-
-                    const canNavigateComposerHistory = !event.altKey
-                      && !event.ctrlKey
-                      && !event.metaKey
-                      && !event.shiftKey
-                      && (composerHistoryIndex !== -1 || inputValue.trim() === '');
-
-                    if (canNavigateComposerHistory && event.key === 'ArrowUp') {
-                      if (applyComposerHistory('previous')) {
-                        event.preventDefault();
-                        return;
-                      }
-                    }
-
-                    if (canNavigateComposerHistory && event.key === 'ArrowDown') {
-                      if (applyComposerHistory('next')) {
-                        event.preventDefault();
-                        return;
-                      }
-                    }
-
-                    if (event.key === 'Enter' && !event.shiftKey) {
-                      event.preventDefault();
-                      sendMessage();
-                    }
-                  }}
-                  placeholder={
-                    selectedWorkspace
-                      ? (selectedSession ? copy.inputPlaceholder : copy.noSessionCommandHint)
-                      : copy.noSessionsYet
-                  }
-                  className={cn(
-                    'min-h-[116px] resize-none pb-24 pl-3 pr-24',
-                    hasComposerAttachments && 'pt-16',
-                  )}
-                  disabled={!selectedWorkspace || !desktopClient || appState.claude.busy || isBootstrapping}
-                />
-                <div className="absolute bottom-3 left-3 right-24 z-10 pb-1">
-                  <div className="flex items-center gap-2 pr-2">
-                    <ComposerSelectPicker
-                      ariaLabel={copy.modeLabel}
-                      buttonIcon={CurrentModeIcon}
-                      buttonValue={currentModeCommandValue}
-                      currentLabel={currentModeDisplay}
-                      disabled={!selectedSession || !desktopClient || appState.claude.busy || isBootstrapping || isUpdatingPermissionMode}
-                      isOpen={isModePickerOpen}
-                      menuDescription={copy.modeMenuDescription}
-                      menuHint={copy.modeMenuHint}
-                      menuTitle={copy.modeMenuTitle}
-                      options={modeOptions}
-                      pickerRef={modePickerRef}
-                      selectedValue={sessionPermissionMode}
-                      onOpenChange={(nextOpen) => {
-                        setIsModelPickerOpen(false);
-                        setIsModePickerOpen(nextOpen);
-                      }}
-                      onSelect={async (nextPermissionMode) => {
-                        if (nextPermissionMode === sessionPermissionMode) {
-                          setIsModePickerOpen(false);
-                          return;
-                        }
-
-                        try {
-                          await updateCurrentSessionPermissionMode(nextPermissionMode);
-                          setIsModePickerOpen(false);
-                        } catch (error) {
-                          setSidebarError(error.message);
-                        }
-                      }}
-                    />
-                    <ComposerSelectPicker
-                      ariaLabel={copy.modelLabel}
-                      buttonIcon={Sparkles}
-                      buttonValue={currentModelCommandValue}
-                      currentLabel={currentModelDisplay}
-                      disabled={!selectedSession || !desktopClient || appState.claude.busy || isBootstrapping || isUpdatingModel}
-                      isOpen={isModelPickerOpen}
-                      menuDescription={copy.modelMenuDescription}
-                      menuHint={copy.modelMenuHint}
-                      menuTitle={copy.modelMenuTitle}
-                      options={modelOptions}
-                      pickerRef={modelPickerRef}
-                      selectedValue={selectedSession?.model || ''}
-                      onOpenChange={(nextOpen) => {
-                        setIsModePickerOpen(false);
-                        setIsModelPickerOpen(nextOpen);
-                      }}
-                      onSelect={async (nextModel) => {
-                        if (nextModel === (selectedSession?.model || '')) {
-                          setIsModelPickerOpen(false);
-                          return;
-                        }
-
-                        try {
-                          await updateCurrentSessionModel(nextModel);
-                          setIsModelPickerOpen(false);
-                        } catch (error) {
-                          setSidebarError(error.message);
-                        }
-                      }}
-                    />
-                  </div>
-                </div>
-                {isSlashCommandMenuOpen && (
-                  <SlashCommandMenu
-                    commands={visibleSlashCommands}
-                    emptyLabel={language === 'zh' ? '没有匹配的指令' : 'No matching commands'}
-                    highlightedCommandName={highlightedSlashCommand?.name || ''}
-                    language={language}
-                    menuRef={slashCommandMenuRef}
-                    onSelectCommand={applySlashCommand}
-                  />
-                )}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  onClick={pickComposerAttachments}
-                  disabled={!selectedWorkspace || !desktopClient || appState.claude.busy || isBootstrapping}
-                  aria-label={copy.addAttachment}
-                  title={copy.addAttachment}
-                  className="absolute bottom-3 right-14 h-8 w-8 rounded-full border-border/80 bg-background shadow-sm hover:bg-muted"
-                >
-                  <Paperclip className="h-3.5 w-3.5" />
-                </Button>
-                <Button
-                  onClick={appState.claude.busy ? stopRun : sendMessage}
-                  disabled={appState.claude.busy ? false : !canSend}
-                  size="icon"
-                  aria-label={appState.claude.busy ? copy.runStop : (isSending ? copy.sending : copy.sendMessage)}
-                  className="absolute bottom-3 right-3 h-8 w-8 rounded-full shadow-sm"
-                >
-                  {appState.claude.busy ? (
-                    <Square className="h-3.5 w-3.5" />
-                  ) : isSending ? (
-                    <LoaderCircle className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <ArrowUp className="h-4 w-4" />
-                  )}
-                </Button>
-              </div>
-            </div>
-          </div>
         </section>
       </main>
 
@@ -1711,6 +2333,598 @@ export default function App() {
           onThemeChange={setThemePreference}
         />
       )}
+    </div>
+  );
+}
+
+function ConversationPane({
+  availableClaudeModels,
+  canClear,
+  copy,
+  isUpdatingModel,
+  isUpdatingPermissionMode,
+  language,
+  onCreateSession,
+  onApprovalDecision,
+  onClear,
+  onFocus,
+  onPickAttachments,
+  platform,
+  onPreparePastedAttachments,
+  onRunSlashCommand,
+  onSendMessage,
+  onStopRun,
+  onUpdateSessionModel,
+  onUpdateSessionPermissionMode,
+  pane,
+  paneShortcutLabel,
+  pendingApprovalActionId,
+  registerViewport,
+  slashCommands,
+}) {
+  const [inputValue, setInputValue] = useState('');
+  const [composerAttachments, setComposerAttachments] = useState([]);
+  const [composerHistoryIndex, setComposerHistoryIndex] = useState(-1);
+  const [isComposerTextareaFocused, setIsComposerTextareaFocused] = useState(false);
+  const [isModePickerOpen, setIsModePickerOpen] = useState(false);
+  const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
+  const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
+  const modePickerRef = useRef(null);
+  const modelPickerRef = useRef(null);
+  const slashMenuRef = useRef(null);
+  const textareaRef = useRef(null);
+  const slashCommandQuery = useMemo(() => getSlashCommandQuery(inputValue), [inputValue]);
+  const visibleSlashCommands = useMemo(
+    () => filterSlashCommands(slashCommands, slashCommandQuery),
+    [slashCommandQuery, slashCommands],
+  );
+  const highlightedSlashCommand = visibleSlashCommands[selectedSlashCommandIndex] || visibleSlashCommands[0] || null;
+  const isSlashCommandMenuOpen = pane.isFocused && slashCommandQuery !== null;
+  const hasFloatingOverlayOpen = isSlashCommandMenuOpen || isModePickerOpen || isModelPickerOpen;
+  const hasComposerAttachments = composerAttachments.length > 0;
+  const composerHistoryEntries = useMemo(
+    () => getComposerHistoryEntries(pane.session?.messages || []),
+    [pane.session?.messages],
+  );
+  const trimmedInputValue = inputValue.trim();
+  const canSend = Boolean(
+    !pane.isBusy
+    && pane.workspace
+    && (trimmedInputValue || hasComposerAttachments)
+    && (pane.session || trimmedInputValue.startsWith('/')),
+  );
+  const sessionPermissionMode = pane.session?.permissionMode || 'default';
+  const modeOptions = useMemo(() => getComposerSessionModeOptions(copy), [copy]);
+  const currentModeDisplay = useMemo(
+    () => getSessionModeLabel(sessionPermissionMode, copy),
+    [copy, sessionPermissionMode],
+  );
+  const currentModeCommandValue = useMemo(
+    () => getSessionModeCommandValue(sessionPermissionMode),
+    [sessionPermissionMode],
+  );
+  const CurrentModeIcon = useMemo(
+    () => getSessionModeIcon(sessionPermissionMode),
+    [sessionPermissionMode],
+  );
+  const effectiveCurrentModel = pane.session?.currentModel || pane.session?.model || '';
+  const modelOptions = useMemo(
+    () => getComposerModelOptions(copy, pane.session?.model || '', effectiveCurrentModel, availableClaudeModels),
+    [availableClaudeModels, copy, effectiveCurrentModel, pane.session?.model],
+  );
+  const currentModelDisplay = useMemo(
+    () => getModelDisplayName(effectiveCurrentModel, availableClaudeModels) || copy.modelOptionDefault,
+    [availableClaudeModels, copy.modelOptionDefault, effectiveCurrentModel],
+  );
+  const currentModelCommandValue = useMemo(
+    () => ((pane.session?.model || '').trim() || 'default'),
+    [pane.session?.model],
+  );
+  useEffect(() => {
+    setComposerAttachments([]);
+    setComposerHistoryIndex(-1);
+    setIsComposerTextareaFocused(false);
+    setInputValue('');
+  }, [pane.session?.id]);
+
+  useEffect(() => {
+    if (!pane.isFocused) {
+      setIsModePickerOpen(false);
+      setIsModelPickerOpen(false);
+    }
+  }, [pane.isFocused]);
+
+  useEffect(() => {
+    if ((!isModePickerOpen && !isModelPickerOpen) || typeof document === 'undefined') {
+      return undefined;
+    }
+
+    const isInsidePicker = (target) => (
+      modePickerRef.current?.contains(target)
+      || modelPickerRef.current?.contains(target)
+    );
+
+    const closePickersOnOutsidePointer = (event) => {
+      if (isInsidePicker(event.target)) {
+        return;
+      }
+
+      setIsModePickerOpen(false);
+      setIsModelPickerOpen(false);
+    };
+
+    const closePickersOnFocusMove = (event) => {
+      if (isInsidePicker(event.target)) {
+        return;
+      }
+
+      setIsModePickerOpen(false);
+      setIsModelPickerOpen(false);
+    };
+
+    const closePickersOnEscape = (event) => {
+      if (event.key !== 'Escape') {
+        return;
+      }
+
+      setIsModePickerOpen(false);
+      setIsModelPickerOpen(false);
+    };
+
+    const closePickersOnWindowBlur = () => {
+      setIsModePickerOpen(false);
+      setIsModelPickerOpen(false);
+    };
+
+    document.addEventListener('pointerdown', closePickersOnOutsidePointer);
+    document.addEventListener('focusin', closePickersOnFocusMove);
+    document.addEventListener('keydown', closePickersOnEscape);
+    window.addEventListener('blur', closePickersOnWindowBlur);
+
+    return () => {
+      document.removeEventListener('pointerdown', closePickersOnOutsidePointer);
+      document.removeEventListener('focusin', closePickersOnFocusMove);
+      document.removeEventListener('keydown', closePickersOnEscape);
+      window.removeEventListener('blur', closePickersOnWindowBlur);
+    };
+  }, [isModePickerOpen, isModelPickerOpen]);
+
+  useEffect(() => {
+    setSelectedSlashCommandIndex(0);
+  }, [slashCommandQuery]);
+
+  useEffect(() => {
+    if (!isSlashCommandMenuOpen) {
+      return;
+    }
+
+    const menu = slashMenuRef.current;
+    if (!menu) {
+      return;
+    }
+
+    const highlightedItem = menu.querySelector('[data-slash-command-highlighted="true"]');
+    highlightedItem?.scrollIntoView({
+      block: 'nearest',
+    });
+  }, [highlightedSlashCommand?.name, isSlashCommandMenuOpen]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return;
+    }
+
+    textarea.style.height = '0px';
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+  }, [inputValue]);
+
+  function applySlashCommand(command) {
+    if (!command) {
+      return;
+    }
+
+    setComposerHistoryIndex(-1);
+    setInputValue(command.template);
+  }
+
+  function applyComposerHistory(direction) {
+    if (!composerHistoryEntries.length) {
+      return false;
+    }
+
+    let nextIndex = composerHistoryIndex;
+
+    if (direction === 'previous') {
+      nextIndex = composerHistoryIndex < 0
+        ? 0
+        : Math.min(composerHistoryIndex + 1, composerHistoryEntries.length - 1);
+    } else if (direction === 'next') {
+      if (composerHistoryIndex < 0) {
+        return false;
+      }
+
+      nextIndex = composerHistoryIndex - 1;
+    } else {
+      return false;
+    }
+
+    if (nextIndex < 0) {
+      setComposerHistoryIndex(-1);
+      setInputValue('');
+      return true;
+    }
+
+    const nextEntry = composerHistoryEntries[nextIndex];
+    if (!nextEntry) {
+      return false;
+    }
+
+    setComposerHistoryIndex(nextIndex);
+    setInputValue(nextEntry);
+    return true;
+  }
+
+  async function handlePickAttachments() {
+    const pickedAttachments = await onPickAttachments?.();
+    if (!Array.isArray(pickedAttachments) || pickedAttachments.length === 0) {
+      return;
+    }
+
+    setComposerAttachments((current) => mergeComposerAttachments(current, pickedAttachments));
+  }
+
+  async function handlePasteAttachments(clipboardData) {
+    const nextAttachments = await onPreparePastedAttachments?.(clipboardData);
+    if (!Array.isArray(nextAttachments) || nextAttachments.length === 0) {
+      return false;
+    }
+
+    setComposerAttachments((current) => mergeComposerAttachments(current, nextAttachments));
+    return true;
+  }
+
+  async function handleSend() {
+    if (!trimmedInputValue && composerAttachments.length === 0) {
+      return;
+    }
+
+    if (trimmedInputValue.startsWith('/')) {
+      const result = await onRunSlashCommand?.(pane.id, trimmedInputValue);
+      if (result?.handled) {
+        if (typeof result.nextInputValue === 'string') {
+          setInputValue(result.nextInputValue);
+          if (result.nextInputValue === '') {
+            setComposerAttachments([]);
+            setComposerHistoryIndex(-1);
+          }
+        }
+        return;
+      }
+    }
+
+    const didSend = await onSendMessage?.(pane.id, trimmedInputValue, {
+      attachments: composerAttachments,
+    });
+
+    if (didSend) {
+      setComposerAttachments([]);
+      setComposerHistoryIndex(-1);
+      setInputValue('');
+    }
+  }
+
+  return (
+    <div
+      data-conversation-pane="true"
+      onMouseDownCapture={() => {
+        void onFocus?.();
+      }}
+      className={cn(
+        'relative flex min-h-0 min-w-0 flex-col overflow-visible bg-background transition-colors duration-150',
+        hasFloatingOverlayOpen ? 'z-20' : (pane.isFocused ? 'z-10' : 'z-0'),
+        pane.isFocused
+          ? 'bg-background'
+          : 'bg-background/95',
+      )}
+    >
+      {pane.isFocused && !pane.isOnlyPane ? (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 z-[2] shadow-[inset_0_0_0_1px_hsl(var(--ring)/0.24)]"
+        />
+      ) : null}
+      <div
+        className={cn(
+          'relative z-[1] flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2 transition-colors',
+          pane.isFocused && !pane.isOnlyPane ? 'bg-accent/15' : 'bg-transparent',
+        )}
+      >
+        <div className="min-w-0 flex-1 overflow-hidden">
+          <p className="w-full truncate text-[12px] font-medium text-foreground">
+            {paneShortcutLabel ? `${paneShortcutLabel} ${pane.title}` : pane.title}
+          </p>
+        </div>
+        <div className="flex min-w-0 shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={!canClear || pane.isBusy || pane.isOnlyPane}
+            aria-label={copy.paneClose}
+            title={formatShortcutTooltip(copy.paneClose, 'W', platform)}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      <div className="relative z-[1] min-h-0 flex-1">
+        {pane.isLoading ? (
+          <div className="flex h-full items-center justify-center px-5">
+            <div className="px-4 py-3 text-[13px] text-muted-foreground">
+              {copy.paneLoading}
+            </div>
+          </div>
+        ) : pane.session ? (
+          <ScrollArea viewportRef={registerViewport} className="h-full px-3">
+            <div className="flex w-full flex-col gap-3 py-3">
+              {pane.renderableMessages.length === 0 ? (
+                <ConversationEmptyState
+                  icon={Bot}
+                  title={copy.conversationEmpty}
+                />
+              ) : (
+                <>
+                  {pane.renderableMessages.map((message) => (
+                    <ChatMessage
+                      key={message.id}
+                      approvalActionId={pendingApprovalActionId}
+                      language={language}
+                      message={message}
+                      onApprovalDecision={onApprovalDecision}
+                    />
+                  ))}
+                  {pane.shouldShowRunIndicator && <RunIndicator language={language} />}
+                </>
+              )}
+            </div>
+          </ScrollArea>
+        ) : (
+          <div className="flex h-full items-center justify-center px-5">
+            <div className="max-w-sm px-5 py-6 text-center">
+              <div className="mx-auto flex h-10 w-10 items-center justify-center text-secondary-foreground">
+                <MessageSquarePlus className="h-5 w-5" />
+              </div>
+              <p className="mt-3 text-sm font-medium text-foreground">{copy.paneEmptyTitle}</p>
+              <p className="mt-1.5 text-[13px] leading-6 text-muted-foreground">{copy.paneEmptyDescription}</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="relative z-[1] border-t border-border/70 bg-background/75 p-3">
+        <div
+          className={cn(
+            'relative rounded-xl border bg-background shadow-sm transition-[border-color,box-shadow]',
+            isComposerTextareaFocused
+              ? 'border-ring/35 shadow-[0_0_0_1px_hsl(var(--ring)/0.14)]'
+              : 'border-input',
+          )}
+        >
+          {hasComposerAttachments && (
+            <div className="absolute left-3 right-24 top-3 z-10 overflow-x-auto pb-1">
+              <div className="flex min-w-max items-center gap-2 pr-2">
+                {composerAttachments.map((attachment) => (
+                  <ComposerAttachmentChip
+                    key={attachment.path}
+                    attachment={attachment}
+                    removeLabel={copy.removeAttachment}
+                    onRemove={(attachmentPath) => {
+                      setComposerAttachments((current) => current.filter((attachment) => attachment.path !== attachmentPath));
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+          <Textarea
+            ref={textareaRef}
+            value={inputValue}
+            onChange={(event) => {
+              if (composerHistoryIndex !== -1) {
+                setComposerHistoryIndex(-1);
+              }
+
+              setInputValue(event.target.value);
+            }}
+            onFocus={() => {
+              setIsComposerTextareaFocused(true);
+            }}
+            onBlur={() => {
+              setIsComposerTextareaFocused(false);
+            }}
+            onPaste={(event) => {
+              const clipboardData = event.clipboardData;
+              if (!clipboardData || getClipboardFiles(clipboardData).length === 0) {
+                return;
+              }
+
+              event.preventDefault();
+              void handlePasteAttachments(clipboardData);
+            }}
+            onKeyDown={(event) => {
+              if (isSlashCommandMenuOpen && visibleSlashCommands.length > 0) {
+                if (event.key === 'ArrowDown') {
+                  event.preventDefault();
+                  setSelectedSlashCommandIndex((current) => (
+                    current >= visibleSlashCommands.length - 1 ? 0 : current + 1
+                  ));
+                  return;
+                }
+
+                if (event.key === 'ArrowUp') {
+                  event.preventDefault();
+                  setSelectedSlashCommandIndex((current) => (
+                    current <= 0 ? visibleSlashCommands.length - 1 : current - 1
+                  ));
+                  return;
+                }
+
+                if (event.key === 'Tab') {
+                  event.preventDefault();
+                  applySlashCommand(highlightedSlashCommand);
+                  return;
+                }
+
+                if (event.key === 'Enter' && !event.shiftKey && !resolveSlashCommandName(slashCommandQuery)) {
+                  event.preventDefault();
+                  applySlashCommand(highlightedSlashCommand);
+                  return;
+                }
+              }
+
+              const canNavigateComposerHistory = !event.altKey
+                && !event.ctrlKey
+                && !event.metaKey
+                && !event.shiftKey
+                && (composerHistoryIndex !== -1 || inputValue.trim() === '');
+
+              if (canNavigateComposerHistory && event.key === 'ArrowUp') {
+                if (applyComposerHistory('previous')) {
+                  event.preventDefault();
+                  return;
+                }
+              }
+
+              if (canNavigateComposerHistory && event.key === 'ArrowDown') {
+                if (applyComposerHistory('next')) {
+                  event.preventDefault();
+                  return;
+                }
+              }
+
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                void handleSend();
+              }
+            }}
+            placeholder={
+              pane.session ? copy.inputPlaceholder : copy.noSessionCommandHint
+            }
+            className={cn(
+              'min-h-[108px] resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-24 text-[13px] shadow-none focus-visible:ring-0',
+              hasComposerAttachments && 'pt-16',
+            )}
+            disabled={!pane.workspace || pane.isBusy}
+          />
+          <div className="absolute bottom-3 left-3 right-24 z-10 pb-1">
+            <div className="flex items-center gap-2 pr-2">
+              <ComposerSelectPicker
+                ariaLabel={copy.modeLabel}
+                buttonIcon={CurrentModeIcon}
+                buttonValue={currentModeCommandValue}
+                currentLabel={currentModeDisplay}
+                disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode}
+                isOpen={isModePickerOpen}
+                menuDescription={copy.modeMenuDescription}
+                menuHint={copy.modeMenuHint}
+                menuTitle={copy.modeMenuTitle}
+                options={modeOptions}
+                pickerRef={modePickerRef}
+                selectedValue={sessionPermissionMode}
+                onOpenChange={(nextOpen) => {
+                  setIsModelPickerOpen(false);
+                  setIsModePickerOpen(nextOpen);
+                }}
+                onSelect={async (nextPermissionMode) => {
+                  if (nextPermissionMode === sessionPermissionMode) {
+                    setIsModePickerOpen(false);
+                    return;
+                  }
+
+                  try {
+                    await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
+                    setIsModePickerOpen(false);
+                  } catch (error) {
+                    console.error(error);
+                  }
+                }}
+              />
+              <ComposerSelectPicker
+                ariaLabel={copy.modelLabel}
+                buttonIcon={Sparkles}
+                buttonValue={currentModelCommandValue}
+                currentLabel={currentModelDisplay}
+                disabled={!pane.session || pane.isBusy || isUpdatingModel}
+                isOpen={isModelPickerOpen}
+                menuDescription={copy.modelMenuDescription}
+                menuHint={copy.modelMenuHint}
+                menuTitle={copy.modelMenuTitle}
+                options={modelOptions}
+                pickerRef={modelPickerRef}
+                selectedValue={pane.session?.model || ''}
+                onOpenChange={(nextOpen) => {
+                  setIsModePickerOpen(false);
+                  setIsModelPickerOpen(nextOpen);
+                }}
+                onSelect={async (nextModel) => {
+                  if (nextModel === (pane.session?.model || '')) {
+                    setIsModelPickerOpen(false);
+                    return;
+                  }
+
+                  try {
+                    await onUpdateSessionModel?.(pane.id, nextModel);
+                    setIsModelPickerOpen(false);
+                  } catch (error) {
+                    console.error(error);
+                  }
+                }}
+              />
+            </div>
+          </div>
+          {isSlashCommandMenuOpen ? (
+            <SlashCommandMenu
+              commands={visibleSlashCommands}
+              emptyLabel={language === 'zh' ? '没有匹配的指令' : 'No matching commands'}
+              highlightedCommandName={highlightedSlashCommand?.name || ''}
+              language={language}
+              menuRef={slashMenuRef}
+              onSelectCommand={applySlashCommand}
+            />
+          ) : null}
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={handlePickAttachments}
+            disabled={!pane.workspace || pane.isBusy}
+            aria-label={copy.addAttachment}
+            title={copy.addAttachment}
+            className="absolute bottom-3 right-14 h-8 w-8 rounded-full border-border/80 bg-background shadow-sm hover:bg-muted"
+          >
+            <Paperclip className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            onClick={pane.session?.isRunning ? () => onStopRun?.(pane.id) : () => {
+              void handleSend();
+            }}
+            disabled={pane.session?.isRunning ? false : !canSend}
+            size="icon"
+            aria-label={pane.session?.isRunning ? copy.runStop : (pane.isSending ? copy.sending : copy.sendMessage)}
+            className="absolute bottom-3 right-3 h-8 w-8 rounded-full shadow-sm"
+          >
+            {pane.session?.isRunning ? (
+              <Square className="h-3.5 w-3.5" />
+            ) : pane.isSending ? (
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+            ) : (
+              <ArrowUp className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1809,7 +3023,6 @@ function SettingsDialog({ copy, language, onClose, onLanguageChange, onThemeChan
 function ComposerSelectPicker({
   ariaLabel,
   buttonIcon: ButtonIcon,
-  buttonValue,
   currentLabel,
   disabled,
   isOpen,
@@ -1822,8 +3035,59 @@ function ComposerSelectPicker({
   pickerRef,
   selectedValue,
 }) {
+  const localPickerRef = useRef(null);
+  const [menuWidth, setMenuWidth] = useState(240);
+
+  useEffect(() => {
+    const root = localPickerRef.current;
+    if (!root) {
+      return undefined;
+    }
+
+    const assignRef = () => {
+      if (!pickerRef) {
+        return;
+      }
+
+      if (typeof pickerRef === 'function') {
+        pickerRef(root);
+        return;
+      }
+
+      pickerRef.current = root;
+    };
+
+    assignRef();
+
+    if (!isOpen || typeof ResizeObserver === 'undefined' || typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const pane = root.closest('[data-conversation-pane="true"]');
+    const measure = () => {
+      const triggerWidth = root.getBoundingClientRect().width;
+      const paneWidth = pane instanceof HTMLElement ? pane.getBoundingClientRect().width : window.innerWidth;
+      const nextWidth = Math.max(180, Math.min(300, paneWidth - 24, triggerWidth + 72));
+      setMenuWidth(Math.round(nextWidth));
+    };
+
+    measure();
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(root);
+    if (pane instanceof HTMLElement) {
+      observer.observe(pane);
+    }
+    window.addEventListener('resize', measure);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [isOpen, pickerRef]);
+
   return (
-    <div ref={pickerRef} className="relative min-w-0 max-w-full shrink-0">
+    <div ref={localPickerRef} className="relative min-w-0 basis-[152px] shrink max-w-[152px]">
       <button
         type="button"
         aria-label={ariaLabel}
@@ -1831,18 +3095,18 @@ function ComposerSelectPicker({
         aria-haspopup="dialog"
         disabled={disabled}
         onClick={() => onOpenChange(!isOpen)}
-        className="flex h-8 max-w-[280px] items-center gap-2 rounded border border-border/80 bg-background px-3 text-left text-[12px] text-foreground shadow-sm outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex h-8 w-full items-center gap-2 rounded border border-border/80 bg-background px-2.5 text-left text-[12px] text-foreground shadow-sm outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
       >
         {ButtonIcon ? <ButtonIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
         <span className="min-w-0 flex-1 truncate font-medium">{currentLabel}</span>
-        {buttonValue ? (
-          <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{buttonValue}</code>
-        ) : null}
         <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform', isOpen && 'rotate-180')} />
       </button>
 
       {isOpen && (
-        <div className="absolute bottom-[calc(100%+10px)] left-0 z-20 w-[min(560px,calc(100vw-48px))] overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl">
+        <div
+          className="absolute bottom-[calc(100%+8px)] left-0 z-20 overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl"
+          style={{ width: `${menuWidth}px`, maxWidth: 'calc(100vw - 48px)' }}
+        >
           <div className="border-b border-border/70 px-3 py-3">
             <p className="text-[13px] font-semibold text-foreground">{menuTitle}</p>
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{menuDescription}</p>
@@ -1867,9 +3131,6 @@ function ComposerSelectPicker({
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <span className="text-[13px] font-medium text-foreground">{option.label}</span>
-                        {option.commandValue ? (
-                          <code className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{option.commandValue}</code>
-                        ) : null}
                       </div>
                       <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{option.summary}</p>
                     </div>
@@ -1944,14 +3205,45 @@ function WorkspaceItem({
   language,
   onArchiveSession,
   onCreateSession,
+  onOpenGitDiffWindow,
   onRemoveWorkspace,
   onSelectSession,
   onSelectWorkspace,
   onToggleExpand,
+  platform,
   selectedSessionId,
   workspace,
 }) {
   const FolderIcon = isExpanded ? FolderOpen : Folder;
+  const workspaceGitBadge = workspace.gitBranch ? (
+    workspace.gitDirty ? (
+      <button
+        type="button"
+        onClick={onOpenGitDiffWindow}
+        disabled={disabled}
+        className="inline-flex max-w-full items-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:opacity-50"
+        title={copy.viewGitChanges}
+      >
+        <span className="inline-flex h-5 max-w-full items-center gap-1 rounded border border-emerald-200 bg-emerald-50 px-1.5 text-[10px] font-medium text-emerald-700 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-100">
+          <GitBranch className="h-3 w-3 shrink-0" />
+          <span className="truncate">{truncateMiddle(workspace.gitBranch, 18)}</span>
+          <span className="whitespace-nowrap text-[9px] font-semibold">
+            <span className="text-emerald-700">+{workspace.gitAddedLines || 0}</span>
+            {' '}
+            <span className="text-rose-600">-{workspace.gitDeletedLines || 0}</span>
+          </span>
+        </span>
+      </button>
+    ) : (
+      <div
+        className="inline-flex max-w-full items-center rounded border border-border/80 bg-background/80 px-1.5 py-0.5 text-[10px] font-medium text-foreground"
+        title={workspace.gitRoot || workspace.gitBranch}
+      >
+        <GitBranch className="mr-1 h-3 w-3 shrink-0" />
+        <span className="truncate">{truncateMiddle(workspace.gitBranch, 18)}</span>
+      </div>
+    )
+  ) : null;
 
   return (
     <div title={workspace.path} className="py-0.5">
@@ -1994,7 +3286,7 @@ function WorkspaceItem({
               SIDEBAR_ACTION_BUTTON_CLASS,
               'pointer-events-none opacity-0 transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:opacity-100',
             )}
-            title={copy.createConversationInWorkspace(workspace.path)}
+            title={formatShortcutTooltip(copy.createConversationInWorkspace(workspace.path), 'N', platform)}
           >
             <MessageSquarePlus className="h-4 w-4" />
           </Button>
@@ -2013,9 +3305,13 @@ function WorkspaceItem({
           </Button>
         </div>
       </div>
-
       {isExpanded && (
         <div className="mt-1.5 ml-5 border-l border-border/70 pl-2">
+          {workspaceGitBadge ? (
+            <div className="pb-2 pl-3 pr-2">
+              {workspaceGitBadge}
+            </div>
+          ) : null}
           {workspace.sessions.length === 0 ? (
             <p className="py-1.5 text-[11px] text-muted-foreground">{copy.noConversationsInWorkspace}</p>
           ) : (
@@ -2048,22 +3344,17 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
       <button
         type="button"
         onClick={onSelect}
-        className="w-full overflow-hidden px-3 py-2.5 text-left transition-[background-color,color,transform,box-shadow] hover:bg-background/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/35 active:translate-y-px active:bg-background"
+        className="w-full overflow-hidden px-3 py-1.5 text-left transition-[background-color,color,transform,box-shadow] hover:bg-background/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/35 active:translate-y-px active:bg-background"
       >
         <div className="flex items-center gap-2">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             {showRunningDot && <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-hidden="true" />}
             <p className="min-w-0 flex-1 truncate text-[12px] font-medium text-foreground/90">{session.title}</p>
           </div>
-          <span className="flex h-8 w-8 shrink-0 items-center justify-center" aria-hidden="true" />
-        </div>
-        <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-muted-foreground/90">{session.preview}</p>
-        <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground/90">
-          <span>{formatDateTime(session.updatedAt, language)}</span>
-          {session.claudeSessionId && <span>{truncateMiddle(session.claudeSessionId, 14)}</span>}
+          <span className="flex h-6 w-8 shrink-0 items-center justify-center" aria-hidden="true" />
         </div>
       </button>
-      <div className="absolute right-3 top-2 flex h-8 w-8 items-center justify-center">
+      <div className="absolute right-3 top-1/2 flex h-6 w-8 -translate-y-1/2 items-center justify-center">
         <Button
           variant="ghost"
           size="icon"
@@ -2071,7 +3362,7 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
           disabled={disabled || session.isRunning}
           className={cn(
             SIDEBAR_ACTION_BUTTON_CLASS,
-            'pointer-events-none opacity-0 transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-30',
+            'pointer-events-none opacity-0 transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-destructive focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-30',
           )}
           title={session.isRunning ? copy.toolArchiveDisabled : copy.archiveConversation}
         >
@@ -4386,6 +5677,393 @@ function normalizeModelCommandArg(value) {
   return ['clear', 'default', 'reset'].includes(normalized.toLowerCase()) ? '' : normalized;
 }
 
+function getInitialPaneLayout() {
+  if (typeof window === 'undefined') {
+    return DEFAULT_PANE_LAYOUT;
+  }
+
+  try {
+    const storedValue = window.localStorage.getItem(PANE_LAYOUT_STORAGE_KEY);
+    if (!storedValue) {
+      return DEFAULT_PANE_LAYOUT;
+    }
+
+    return normalizePaneLayout(JSON.parse(storedValue));
+  } catch {
+    return DEFAULT_PANE_LAYOUT;
+  }
+}
+
+function getInitialPaneBoardSize() {
+  if (typeof window === 'undefined') {
+    return { height: 0, width: 0 };
+  }
+
+  const estimatedSidebarWidth = 280;
+  const estimatedTopBarHeight = 44;
+  const estimatedPanePadding = 2;
+
+  return {
+    height: Math.max(0, window.innerHeight - estimatedTopBarHeight - estimatedPanePadding),
+    width: Math.max(0, window.innerWidth - estimatedSidebarWidth - estimatedPanePadding),
+  };
+}
+
+function normalizePaneLayout(value) {
+  const requestedCount = Array.isArray(value?.panes) && value.panes.length > 0 ? value.panes.length : 1;
+  const nextPanes = normalizePaneLayoutPanes(value?.panes, requestedCount);
+  const focusedPaneId = nextPanes.some((pane) => pane.id === value?.focusedPaneId)
+    ? value.focusedPaneId
+    : nextPanes[0].id;
+
+  return {
+    focusedPaneId,
+    panes: nextPanes,
+  };
+}
+
+function normalizePaneLayoutPanes(value, targetCount) {
+  const normalized = Array.isArray(value)
+    ? value
+      .filter(Boolean)
+      .map((pane, index) => {
+        const sessionId = typeof pane.sessionId === 'string' && pane.sessionId.trim() ? pane.sessionId.trim() : null;
+        const workspaceId = sessionId && typeof pane.workspaceId === 'string' && pane.workspaceId.trim()
+          ? pane.workspaceId.trim()
+          : null;
+
+        return {
+          id: typeof pane.id === 'string' && pane.id.trim() ? pane.id.trim() : `pane-${index + 1}`,
+          sessionId,
+          workspaceId,
+        };
+      })
+    : [];
+
+  const nextPanes = normalized.slice(0, targetCount);
+  let nextIndex = nextPanes.length + 1;
+
+  while (nextPanes.length < targetCount) {
+    nextPanes.push({
+      id: `pane-${nextIndex}`,
+      sessionId: null,
+      workspaceId: null,
+    });
+    nextIndex += 1;
+  }
+
+  return nextPanes;
+}
+
+function appendPaneToLayout(currentLayout, payload = {}) {
+  return normalizePaneLayout({
+    ...currentLayout,
+    focusedPaneId: createNextPaneId(currentLayout?.panes),
+    panes: [
+      ...normalizePaneLayout(currentLayout).panes,
+      {
+        id: createNextPaneId(currentLayout?.panes),
+        sessionId: null,
+        workspaceId: payload.workspaceId || null,
+      },
+    ],
+  });
+}
+
+function focusPaneInLayout(currentLayout, paneId) {
+  if (!paneId) {
+    return normalizePaneLayout(currentLayout);
+  }
+
+  return normalizePaneLayout({
+    ...currentLayout,
+    focusedPaneId: paneId,
+  });
+}
+
+function assignSessionToPaneState(currentLayout, paneId, payload) {
+  const normalized = normalizePaneLayout(currentLayout);
+  const targetPaneId = normalized.panes.some((pane) => pane.id === paneId)
+    ? paneId
+    : normalized.focusedPaneId;
+
+  return normalizePaneLayout({
+    ...normalized,
+    focusedPaneId: targetPaneId,
+    panes: normalized.panes.map((pane) => (
+      pane.id === targetPaneId
+        ? {
+          ...pane,
+          sessionId: payload?.sessionId || null,
+          workspaceId: payload?.workspaceId || null,
+        }
+        : pane
+    )),
+  });
+}
+
+function assignWorkspaceToPaneState(currentLayout, paneId, workspaceId) {
+  const normalized = normalizePaneLayout(currentLayout);
+  const targetPaneId = normalized.panes.some((pane) => pane.id === paneId)
+    ? paneId
+    : normalized.focusedPaneId;
+
+  return normalizePaneLayout({
+    ...normalized,
+    panes: normalized.panes.map((pane) => (
+      pane.id === targetPaneId
+        ? {
+          ...pane,
+          sessionId: pane.sessionId,
+          workspaceId: pane.sessionId ? (workspaceId || null) : null,
+        }
+        : pane
+    )),
+  });
+}
+
+function removePaneFromLayout(currentLayout, paneId) {
+  const normalized = normalizePaneLayout(currentLayout);
+  if (normalized.panes.length <= 1) {
+    const targetPaneId = normalized.panes.some((pane) => pane.id === paneId)
+      ? paneId
+      : normalized.focusedPaneId;
+
+    return normalizePaneLayout({
+      ...normalized,
+      focusedPaneId: targetPaneId,
+      panes: normalized.panes.map((pane) => (
+        pane.id === targetPaneId
+          ? {
+            ...pane,
+            sessionId: null,
+            workspaceId: null,
+          }
+          : pane
+      )),
+    });
+  }
+
+  const filteredPanes = normalized.panes.filter((pane) => pane.id !== paneId);
+  const nextFocusedPane = filteredPanes.find((pane) => pane.id === normalized.focusedPaneId)
+    || filteredPanes[Math.max(0, normalized.panes.findIndex((pane) => pane.id === paneId) - 1)]
+    || filteredPanes[0];
+
+  return normalizePaneLayout({
+    focusedPaneId: nextFocusedPane?.id || filteredPanes[0]?.id || DEFAULT_PANE_LAYOUT.focusedPaneId,
+    panes: filteredPanes,
+  });
+}
+
+function normalizePaneLayoutWithAppState(currentLayout, appState) {
+  const normalized = normalizePaneLayout(currentLayout);
+
+  const panes = normalized.panes.map((pane) => {
+    if (!pane.workspaceId) {
+      return pane;
+    }
+
+    const workspace = appState.workspaces.find((entry) => entry.id === pane.workspaceId);
+    if (!workspace) {
+      return {
+        ...pane,
+        sessionId: null,
+        workspaceId: null,
+      };
+    }
+
+    if (!pane.sessionId) {
+      return pane;
+    }
+
+    const session = workspace.sessions.find((entry) => entry.id === pane.sessionId);
+    if (session) {
+      return pane;
+    }
+
+    return {
+      ...pane,
+      sessionId: null,
+      workspaceId: workspace.id,
+    };
+  });
+
+  return normalizePaneLayout({
+    ...normalized,
+    panes,
+  });
+}
+
+function arePaneLayoutsEqual(left, right) {
+  return JSON.stringify(normalizePaneLayout(left)) === JSON.stringify(normalizePaneLayout(right));
+}
+
+function createNextPaneId(existingPanes) {
+  const normalized = Array.isArray(existingPanes) ? existingPanes : [];
+  const maxIndex = normalized.reduce((currentMax, pane) => {
+    const match = /^pane-(\d+)$/.exec(pane?.id || '');
+    if (!match) {
+      return currentMax;
+    }
+
+    return Math.max(currentMax, Number.parseInt(match[1], 10));
+  }, 0);
+
+  return `pane-${maxIndex + 1}`;
+}
+
+function createSessionCacheKey(workspaceId, sessionId) {
+  if (!workspaceId || !sessionId) {
+    return '';
+  }
+
+  return `${workspaceId}:${sessionId}`;
+}
+
+function areSessionSnapshotsEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (!left || !right) {
+    return false;
+  }
+
+  return (
+    left.id === right.id
+    && left.workspaceId === right.workspaceId
+    && left.updatedAt === right.updatedAt
+    && left.status === right.status
+    && (left.messages?.length || 0) === (right.messages?.length || 0)
+    && (left.pendingApprovals?.length || 0) === (right.pendingApprovals?.length || 0)
+  );
+}
+
+function buildPaneViewModel({
+  activeSession,
+  appState,
+  copy,
+  focusedPaneId,
+  sendingPaneIds,
+  language,
+  paneCount,
+  pane,
+  sessionViewCache,
+}) {
+  const workspace = appState.workspaces.find((entry) => entry.id === pane.workspaceId) || null;
+  const sessionMeta = workspace?.sessions.find((entry) => entry.id === pane.sessionId) || null;
+  const sessionCacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
+  const isSelectedPaneSession = (
+    activeSession
+    && activeSession.workspaceId === pane.workspaceId
+    && activeSession.id === pane.sessionId
+  );
+  const session = isSelectedPaneSession
+    ? activeSession
+    : (sessionViewCache[sessionCacheKey] || null);
+  const pendingApprovals = Array.isArray(session?.pendingApprovals)
+    ? session.pendingApprovals.filter(Boolean)
+    : [];
+  const isPaneSending = Array.isArray(sendingPaneIds) && sendingPaneIds.includes(pane.id);
+  const renderableMessages = session
+    ? mergeRenderableMessages(
+      session.messages || [],
+      language,
+      Boolean(isPaneSending || session.status === 'running'),
+      pendingApprovals,
+    )
+    : [];
+  const isRunning = Boolean(session?.isRunning || sessionMeta?.isRunning || session?.status === 'running');
+
+  return {
+    id: pane.id,
+    isBusy: isRunning,
+    isFocused: pane.id === focusedPaneId,
+    isLoading: Boolean(pane.sessionId && !session && sessionMeta),
+    isOnlyPane: paneCount <= 1,
+    isSending: Boolean(isPaneSending),
+    renderableMessages,
+    session,
+    sessionMeta,
+    shouldShowRunIndicator: shouldRenderRunIndicator(session, renderableMessages, isPaneSending),
+    title: sessionMeta?.title || session?.title || copy.paneEmptyTitle,
+    workspace,
+    workspaceName: workspace?.name || '',
+  };
+}
+
+function getAdaptivePaneLimit(width, height) {
+  if (!width || !height) {
+    return 1;
+  }
+
+  const maxColumns = Math.max(1, Math.floor(width / 420));
+  const maxRows = Math.max(1, Math.floor(height / 320));
+  return Math.max(1, Math.min(6, maxColumns * maxRows));
+}
+
+function getAdaptivePaneGridSpec(count, width, height) {
+  const paneCount = Math.max(1, count || 1);
+  if (!width || !height) {
+    return {
+      columns: 1,
+      rows: paneCount,
+    };
+  }
+  const isLandscape = width >= height;
+
+  if (paneCount === 1) {
+    return { columns: 1, rows: 1 };
+  }
+
+  if (paneCount === 2) {
+    return isLandscape ? { columns: 2, rows: 1 } : { columns: 1, rows: 2 };
+  }
+
+  if (paneCount === 3) {
+    return isLandscape ? { columns: 3, rows: 1 } : { columns: 1, rows: 3 };
+  }
+
+  if (paneCount === 4) {
+    if (width >= height * 1.7) {
+      return { columns: 4, rows: 1 };
+    }
+
+    if (height >= width * 1.7) {
+      return { columns: 1, rows: 4 };
+    }
+
+    return { columns: 2, rows: 2 };
+  }
+
+  if (isLandscape) {
+    const columns = Math.min(paneCount, Math.max(2, Math.floor(width / 420)));
+    return {
+      columns,
+      rows: Math.ceil(paneCount / columns),
+    };
+  }
+
+  const rows = Math.min(paneCount, Math.max(2, Math.floor(height / 320)));
+  return {
+    columns: Math.ceil(paneCount / rows),
+    rows,
+  };
+}
+
+function setPaneViewportNode(refStore, paneId, node) {
+  if (!refStore?.current || !paneId) {
+    return;
+  }
+
+  if (node) {
+    refStore.current.set(paneId, node);
+    return;
+  }
+
+  refStore.current.delete(paneId);
+}
+
 function getInitialThemePreference() {
   if (typeof window === 'undefined') {
     return 'system';
@@ -4418,6 +6096,14 @@ function getInitialLanguage() {
   }
 
   return window.navigator.language?.toLowerCase().startsWith('zh') ? 'zh' : 'en';
+}
+
+function getWindowView() {
+  if (typeof window === 'undefined') {
+    return 'main';
+  }
+
+  return new URLSearchParams(window.location.search).get('view') || 'main';
 }
 
 function formatClaudeStatusLabel(claude, language) {

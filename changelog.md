@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-03-19 (最新)
+
+### electron/preload.cjs
+
+- 新增 IPC 通道：`openLink`（打开链接）、`pickAttachments`（选择附件）、`preparePastedAttachments`（处理粘贴附件）、`respondToApproval`（响应审批）
+- 新增 `updateSessionPermissionMode` IPC 通道，支持为当前会话切换权限模式
+
+### electron/runtime.cjs
+
+- Schema 版本升级至 v5，新增 `approvalRules` 字段（工作区级别的审批规则持久化）
+- 新增附件处理功能：支持通过文件选择器或粘贴方式添加附件，base64 数据自动保存至 userData 目录；支持图片及多种文档格式
+- 新增审批流程：处理 `control_request` 事件，展示待审批卡片；支持 allow / deny / allow_always 三种决策；allow_always 会将规则持久化到工作区
+- 新增权限模式管理：`updateSessionPermissionMode` 支持 `acceptEdits / auto / bypassPermissions / default / dontAsk / plan` 六种模式，并在启动 Claude 进程时通过 `--permission-mode` 传入
+- 新增 Git 信息缓存：获取工作区分支信息（TTL 3秒），workspace 序列化时附带 `gitBranch`、`gitRoot` 字段
+- 新增 `hasStreamedAssistantText` 标志，防止流式输出完成后创建多余的空助手消息
+- 新增 `toolUses` Map，追踪工具调用详情；runState 重置时同步清空
+- 工具描述系统重构：用 `describeToolUse` 替换原有 `summarizeToolInput/Result`，为各类工具（Read、Browse、Search、Command、Edit、WebFetch、Skill、MCP）添加专属格式化函数
+- 新增链接处理：支持打开本地路径和外部链接
+- Claude 进程通信切换为 `stream-json` 输入格式，通过 stdin 写入 JSON 行；新增 `--replay-user-messages` 和 `--permission-prompt-tool stdio` 参数
+- 工具消息状态修复：进程关闭/停止/出错时调用 `finalizeRunningToolMessages` 将未完成工具消息标记为对应状态
+
+### src/App.jsx
+
+- 新增附件管理：composer 中支持添加、粘贴、移除附件
+- 新增审批 UI：显示待审批项目卡片，支持允许/拒绝操作
+- 新增消息历史导航：支持上下箭头键浏览历史消息
+- 新增 Git 分支徽章：顶部栏显示当前工作区的 Git 分支（带截断处理）
+- 助手消息渲染重构为分段模式（文本段 + 工具活动段），新增 `AssistantToolActivity` 组件
+- `TypingIndicator` 改为接受 `label` / `labelLoading` props，显示 "Thinking" 文字标签
+- 用户气泡颜色从硬编码改为 CSS 变量：`--user-bubble`、`--user-bubble-border`、`--user-bubble-foreground` 等
+- 新增 Markdown 复制功能：代码块和表格支持一键复制
+
+### src/index.css
+
+- 新增用户气泡相关 CSS 变量，支持浅色/深色主题
+- 新增工具活动加载动画（`loading-copy`、`loading-flash` 关键帧）
+- 新增 Markdown 复制工具栏样式及表格滚动容器样式
+
+### src/lib/markdown.js
+
+- 为代码块和表格添加复制工具栏（动态生成复制按钮）
+- 新增中英文复制按钮多语言支持
+
+---
+
 ## 2026-03-19
 
 ### 当前改动总结

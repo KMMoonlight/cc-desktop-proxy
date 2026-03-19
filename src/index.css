@@ -25,6 +25,12 @@
     --ring: 222 18% 12%;
     --app-gradient-start: 210 20% 98%;
     --app-gradient-end: 220 24% 96%;
+    --user-bubble: 220 16% 94%;
+    --user-bubble-foreground: 222 20% 17%;
+    --user-bubble-border: 220 14% 90%;
+    --user-bubble-selection: 210 74% 81%;
+    --user-bubble-selection-foreground: 222 20% 15%;
+    --user-bubble-shadow: 220 20% 60% / 0.18;
     --radius: 0.95rem;
   }
 
@@ -50,6 +56,12 @@
     --ring: 210 40% 96%;
     --app-gradient-start: 224 31% 12%;
     --app-gradient-end: 222 32% 8%;
+    --user-bubble: 222 16% 16%;
+    --user-bubble-foreground: 210 25% 96%;
+    --user-bubble-border: 220 14% 22%;
+    --user-bubble-selection: 210 58% 48%;
+    --user-bubble-selection-foreground: 210 33% 98%;
+    --user-bubble-shadow: 220 30% 2% / 0.48;
   }
 
   * {
@@ -92,9 +104,36 @@
   .no-drag {
     -webkit-app-region: no-drag;
   }
+
+  @keyframes loading-flash {
+    0%, 100% {
+      opacity: 1;
+    }
+
+    50% {
+      opacity: 0.38;
+    }
+  }
+
+  .loading-copy {
+    animation: loading-flash 1.05s ease-in-out infinite;
+  }
 }
 
 @layer components {
+  .user-bubble-message {
+    background-color: hsl(var(--user-bubble));
+    border-color: hsl(var(--user-bubble-border));
+    box-shadow: 0 16px 28px -24px hsl(var(--user-bubble-shadow));
+    color: hsl(var(--user-bubble-foreground));
+  }
+
+  .user-bubble-message::selection,
+  .user-bubble-message *::selection {
+    background-color: hsl(var(--user-bubble-selection));
+    color: hsl(var(--user-bubble-selection-foreground));
+  }
+
   .markdown-body > :first-child {
     margin-top: 0;
   }
@@ -146,6 +185,42 @@
 
   .markdown-body code {
     @apply rounded bg-secondary/90 px-1.5 py-0.5 text-[0.875em] text-foreground;
+  }
+
+  .markdown-body .markdown-copy-shell {
+    @apply relative mt-2.5;
+  }
+
+  .markdown-body .markdown-copy-toolbar {
+    @apply pointer-events-none absolute right-2.5 top-2.5 z-[1] flex;
+  }
+
+  .markdown-body .markdown-copy-button {
+    @apply pointer-events-auto inline-flex h-6 w-6 items-center justify-center border-0 bg-transparent p-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-0;
+    --markdown-copy-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='9' y='9' width='13' height='13' rx='2'/%3E%3Cpath d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/%3E%3C/svg%3E");
+  }
+
+  .markdown-body .markdown-copy-button::before {
+    content: '';
+    width: 13px;
+    height: 13px;
+    background-color: currentColor;
+    -webkit-mask: var(--markdown-copy-icon) center / contain no-repeat;
+    mask: var(--markdown-copy-icon) center / contain no-repeat;
+  }
+
+  .markdown-body .markdown-copy-button[data-copy-active="true"] {
+    @apply text-foreground;
+    --markdown-copy-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  }
+
+  .markdown-body .markdown-copy-shell > pre,
+  .markdown-body .markdown-copy-table-scroll > table {
+    margin-top: 0;
+  }
+
+  .markdown-body .markdown-copy-table-scroll {
+    @apply overflow-x-auto;
   }
 
   .markdown-body pre {

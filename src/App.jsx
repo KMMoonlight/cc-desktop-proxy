@@ -9,19 +9,27 @@ import {
   ChevronDown,
   ChevronRight,
   CheckCircle2,
+  FileText,
   Folder,
   FolderOpen,
   FolderPlus,
+  GitBranch,
+  Hand,
+  Image as ImageIcon,
   LoaderCircle,
   MessageSquarePlus,
+  Paperclip,
+  Pencil,
   PlugZap,
   Search,
+  Settings,
   Sparkles,
   Square,
   TerminalSquare,
   Trash2,
   Workflow,
   Wrench,
+  X,
 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
@@ -50,14 +58,41 @@ const EMPTY_APP_STATE = {
 
 const LANGUAGE_STORAGE_KEY = 'cc-desktop-proxy-language';
 const THEME_STORAGE_KEY = 'cc-desktop-proxy-theme';
+const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
+  'apng',
+  'avif',
+  'bmp',
+  'gif',
+  'heic',
+  'heif',
+  'jpeg',
+  'jpg',
+  'png',
+  'svg',
+  'tif',
+  'tiff',
+  'webp',
+]);
+const SIDEBAR_ACTION_BUTTON_CLASS = 'h-8 w-8 shrink-0 rounded-md bg-transparent p-0 text-muted-foreground shadow-none hover:bg-background/80 hover:text-foreground';
+const SIDEBAR_ACTION_SLOT_CLASS = 'absolute right-3 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center';
 const COPY = {
   zh: {
     addWorkspace: '添加工作目录',
+    addAttachment: '添加附件',
     archiveConversation: '归档话题',
     archiveConversationConfirm: '确认归档',
     archiveConversationConfirming: '归档中...',
     archiveConversationDescription: '归档后，这个话题会从当前列表中隐藏。',
     archiveConversationTitle: '确认归档这个话题？',
+    approvalAction: '申请执行',
+    approvalAllow: '允许',
+    approvalAllowAlwaysCommand: '一直允许此命令',
+    approvalBlockedPath: '目标路径',
+    approvalDeny: '拒绝',
+    approvalReason: '原因',
+    approvalResponding: '提交中...',
+    approvalTitle: '需要你的审批',
+    assistantThinking: '正在思考',
     bridgeUnavailable: '当前页面没有接到 Electron bridge，请通过桌面应用启动。',
     cancel: '取消',
     claudeCode: 'Claude Code',
@@ -74,6 +109,16 @@ const COPY = {
     languageLabel: '语言',
     languageChinese: '🇨🇳 中文',
     languageEnglish: '🇺🇸 English',
+    modeLabel: '模式',
+    modeMenuDescription: '切换当前会话的 Claude Code 原生模式。',
+    modeMenuHint: '修改会在下一条消息时生效。',
+    modeMenuTitle: '选择模式',
+    modeOptionAskBeforeEdits: 'Ask before edits',
+    modeOptionEditAutomatically: 'Edit automatically',
+    modeOptionPlanMode: 'Plan mode',
+    modeSummaryAskBeforeEdits: 'Claude 会在每次编辑前先请求审批。',
+    modeSummaryEditAutomatically: 'Claude 会自动编辑你选中的文本或整个文件。',
+    modeSummaryPlanMode: 'Claude 会先探索代码并给出计划，再开始编辑。',
     modelDefault: '跟随 Claude 默认值',
     modelLabel: '模型',
     modelMenuDescription: '切换当前会话的 Claude 模型，命令值与 Claude Code 的 /model 保持一致。',
@@ -102,11 +147,16 @@ const COPY = {
     removeWorkspaceDescription: '移除后，这个工作目录及其本地话题记录会从应用列表中删除。',
     removeWorkspaceTitle: '确认移除这个工作目录？',
     removeWorkspaceWithPath: (path) => `移除 ${path}`,
+    removeAttachment: '移除附件',
     runStop: '停止生成',
     searchPlaceholder: '搜索对话标题、摘要或会话 ID',
     searchNoResult: (query) => `没有找到和“${query}”相关的对话。`,
     sendMessage: '发送消息',
     sending: '发送中',
+    settings: '设置',
+    settingsDescription: '调整客户端语言和主题偏好。',
+    settingsTitle: '设置',
+    settingsClose: '关闭',
     startByAddingWorkspace: '先添加一个工作目录',
     startByAddingWorkspaceDescription: '工作目录会成为 Claude Code 运行时的本地上下文。你可以创建多个目录，并在左侧切换它们各自的历史对话。',
     themeDark: '🌙 深色',
@@ -124,11 +174,21 @@ const COPY = {
   },
   en: {
     addWorkspace: 'Add workspace',
+    addAttachment: 'Add attachment',
     archiveConversation: 'Archive conversation',
     archiveConversationConfirm: 'Archive',
     archiveConversationConfirming: 'Archiving...',
     archiveConversationDescription: 'After archiving, this conversation will be hidden from the current list.',
     archiveConversationTitle: 'Archive this conversation?',
+    approvalAction: 'Requested action',
+    approvalAllow: 'Allow',
+    approvalAllowAlwaysCommand: 'Always allow this command',
+    approvalBlockedPath: 'Path',
+    approvalDeny: 'Deny',
+    approvalReason: 'Reason',
+    approvalResponding: 'Submitting...',
+    approvalTitle: 'Approval needed',
+    assistantThinking: 'Thinking',
     bridgeUnavailable: 'Electron bridge is not available on this page. Please open it from the desktop app.',
     cancel: 'Cancel',
     claudeCode: 'Claude Code',
@@ -145,6 +205,16 @@ const COPY = {
     languageLabel: 'Language',
     languageChinese: '🇨🇳 Chinese',
     languageEnglish: '🇺🇸 English',
+    modeLabel: 'Mode',
+    modeMenuDescription: 'Switch the native Claude Code mode for this conversation.',
+    modeMenuHint: 'Changes apply on the next message.',
+    modeMenuTitle: 'Select mode',
+    modeOptionAskBeforeEdits: 'Ask before edits',
+    modeOptionEditAutomatically: 'Edit automatically',
+    modeOptionPlanMode: 'Plan mode',
+    modeSummaryAskBeforeEdits: 'Claude will ask for approval before making each edit.',
+    modeSummaryEditAutomatically: 'Claude will edit your selected text or the whole file.',
+    modeSummaryPlanMode: 'Claude will explore the code and present a plan before editing.',
     modelDefault: 'Follow Claude default',
     modelLabel: 'Model',
     modelMenuDescription: 'Switch Claude models for this conversation. Command values match Claude Code /model.',
@@ -173,11 +243,16 @@ const COPY = {
     removeWorkspaceDescription: 'Removing this workspace will delete it and its local conversation history from the app list.',
     removeWorkspaceTitle: 'Remove this workspace?',
     removeWorkspaceWithPath: (path) => `Remove ${path}`,
+    removeAttachment: 'Remove attachment',
     runStop: 'Stop generation',
     searchPlaceholder: 'Search titles, previews, or session IDs',
     searchNoResult: (query) => `No conversations found for "${query}".`,
     sendMessage: 'Send message',
     sending: 'Sending',
+    settings: 'Settings',
+    settingsDescription: 'Adjust the client language and theme preferences.',
+    settingsTitle: 'Settings',
+    settingsClose: 'Close',
     startByAddingWorkspace: 'Add a workspace first',
     startByAddingWorkspaceDescription: 'A workspace becomes the local context for Claude Code. You can add multiple folders and switch between their conversation histories from the left sidebar.',
     themeDark: '🌙 Dark',
@@ -203,6 +278,8 @@ export default function App() {
   const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
   const [systemTheme, setSystemTheme] = useState(() => getSystemTheme());
   const [inputValue, setInputValue] = useState('');
+  const [composerAttachments, setComposerAttachments] = useState([]);
+  const [composerHistoryIndex, setComposerHistoryIndex] = useState(-1);
   const [sidebarError, setSidebarError] = useState(
     desktopClient ? '' : COPY[getInitialLanguage()].bridgeUnavailable,
   );
@@ -212,14 +289,19 @@ export default function App() {
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
   const [isRemovingWorkspace, setIsRemovingWorkspace] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isModePickerOpen, setIsModePickerOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
+  const [isUpdatingPermissionMode, setIsUpdatingPermissionMode] = useState(false);
   const [isUpdatingModel, setIsUpdatingModel] = useState(false);
+  const [pendingApprovalActionId, setPendingApprovalActionId] = useState('');
   const [pendingArchiveSession, setPendingArchiveSession] = useState(null);
   const [pendingRemoveWorkspace, setPendingRemoveWorkspace] = useState(null);
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
   const [sessionSearchQuery, setSessionSearchQuery] = useState('');
 
   const hasHydratedExpandedWorkspaceIdsRef = useRef(false);
+  const modePickerRef = useRef(null);
   const modelPickerRef = useRef(null);
   const slashCommandMenuRef = useRef(null);
   const textareaRef = useRef(null);
@@ -235,6 +317,20 @@ export default function App() {
   const installedSkills = Array.isArray(appState.claude.skills) ? appState.claude.skills : [];
   const slashCommands = useMemo(() => getSlashCommands(language, installedSkills), [installedSkills, language]);
   const availableClaudeModels = Array.isArray(appState.claude.models) ? appState.claude.models : [];
+  const sessionPermissionMode = selectedSession?.permissionMode || 'default';
+  const modeOptions = useMemo(() => getComposerSessionModeOptions(copy), [copy]);
+  const currentModeDisplay = useMemo(
+    () => getSessionModeLabel(sessionPermissionMode, copy),
+    [copy, sessionPermissionMode],
+  );
+  const currentModeCommandValue = useMemo(
+    () => getSessionModeCommandValue(sessionPermissionMode),
+    [sessionPermissionMode],
+  );
+  const CurrentModeIcon = useMemo(
+    () => getSessionModeIcon(sessionPermissionMode),
+    [sessionPermissionMode],
+  );
   const effectiveCurrentModel = selectedSession?.currentModel || selectedSession?.model || '';
   const modelOptions = useMemo(
     () => getComposerModelOptions(copy, selectedSession?.model || '', effectiveCurrentModel, availableClaudeModels),
@@ -255,9 +351,22 @@ export default function App() {
   );
   const highlightedSlashCommand = visibleSlashCommands[selectedSlashCommandIndex] || visibleSlashCommands[0] || null;
   const isSlashCommandMenuOpen = slashCommandQuery !== null;
+  const pendingApprovals = Array.isArray(selectedSession?.pendingApprovals)
+    ? selectedSession.pendingApprovals.filter(Boolean)
+    : [];
   const renderableMessages = useMemo(
-    () => mergeRenderableMessages(selectedSession?.messages || [], language),
-    [language, selectedSession?.messages],
+    () => mergeRenderableMessages(
+      selectedSession?.messages || [],
+      language,
+      Boolean(isSending || selectedSession?.status === 'running'),
+      pendingApprovals,
+    ),
+    [isSending, language, pendingApprovals, selectedSession?.messages, selectedSession?.status],
+  );
+  const hasComposerAttachments = composerAttachments.length > 0;
+  const composerHistoryEntries = useMemo(
+    () => getComposerHistoryEntries(selectedSession?.messages || []),
+    [selectedSession?.messages],
   );
   const filteredWorkspaces = useMemo(() => {
     if (!normalizedSessionSearchQuery) {
@@ -282,8 +391,8 @@ export default function App() {
   const topBarHeightClass = isMac ? 'h-10' : 'h-11';
   const topBarOffsetClass = isMac ? 'pt-10' : 'pt-11';
   const shouldShowRunIndicator = useMemo(
-    () => shouldRenderRunIndicator(selectedSession, isSending),
-    [isSending, selectedSession],
+    () => shouldRenderRunIndicator(selectedSession, renderableMessages, isSending),
+    [isSending, renderableMessages, selectedSession],
   );
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
 
@@ -309,6 +418,8 @@ export default function App() {
 
   useEffect(() => {
     if (isSlashCommandMenuOpen) {
+      setIsSettingsOpen(false);
+      setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     }
   }, [isSlashCommandMenuOpen]);
@@ -322,26 +433,106 @@ export default function App() {
   }, [isSlashCommandMenuOpen]);
 
   useEffect(() => {
+    if (!desktopClient || typeof document === 'undefined') {
+      return undefined;
+    }
+
+    const handleDocumentClick = (event) => {
+      if (event.defaultPrevented || !(event.target instanceof Element)) {
+        return;
+      }
+
+      const copyButton = event.target.closest('[data-markdown-copy-button="true"]');
+      if (copyButton) {
+        event.preventDefault();
+        void handleMarkdownCopyClick(copyButton);
+        return;
+      }
+
+      const anchor = event.target.closest('a[href]');
+      if (!anchor) {
+        return;
+      }
+
+      const href = anchor.getAttribute('href');
+      if (!href) {
+        return;
+      }
+
+      event.preventDefault();
+      desktopClient.openLink(href).catch((error) => {
+        setSidebarError(error.message);
+      });
+    };
+
+    document.addEventListener('click', handleDocumentClick);
+    return () => {
+      document.removeEventListener('click', handleDocumentClick);
+    };
+  }, [desktopClient]);
+
+  useEffect(() => {
     if (!selectedSession) {
+      setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     }
   }, [selectedSession]);
 
   useEffect(() => {
-    if (!isModelPickerOpen || typeof document === 'undefined') {
+    if (!isSettingsOpen || typeof document === 'undefined') {
+      return undefined;
+    }
+
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        setIsSettingsOpen(false);
+      }
+    };
+
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [isSettingsOpen]);
+
+  useEffect(() => {
+    setComposerAttachments([]);
+    setComposerHistoryIndex(-1);
+  }, [selectedSession?.id]);
+
+  useEffect(() => {
+    if (!pendingApprovalActionId) {
+      return;
+    }
+
+    if (pendingApprovals.some((approval) => approval.requestId === pendingApprovalActionId)) {
+      return;
+    }
+
+    setPendingApprovalActionId('');
+  }, [pendingApprovalActionId, pendingApprovals]);
+
+  useEffect(() => {
+    if ((!isModePickerOpen && !isModelPickerOpen) || typeof document === 'undefined') {
       return undefined;
     }
 
     const closeOnOutsidePointer = (event) => {
+      if (modePickerRef.current?.contains(event.target)) {
+        return;
+      }
+
       if (modelPickerRef.current?.contains(event.target)) {
         return;
       }
 
+      setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     };
 
     const closeOnEscape = (event) => {
       if (event.key === 'Escape') {
+        setIsModePickerOpen(false);
         setIsModelPickerOpen(false);
       }
     };
@@ -353,7 +544,7 @@ export default function App() {
       document.removeEventListener('pointerdown', closeOnOutsidePointer);
       document.removeEventListener('keydown', closeOnEscape);
     };
-  }, [isModelPickerOpen]);
+  }, [isModePickerOpen, isModelPickerOpen]);
 
   useEffect(() => {
     if (typeof document === 'undefined') {
@@ -596,11 +787,122 @@ export default function App() {
     });
   }
 
+  async function handleMarkdownCopyClick(button) {
+    const copyShell = button.closest('[data-markdown-copy-shell="true"]');
+    if (!(copyShell instanceof HTMLElement)) {
+      return;
+    }
+
+    const textToCopy = getMarkdownCopyText(copyShell);
+    if (!textToCopy) {
+      return;
+    }
+
+    try {
+      await copyTextToClipboard(textToCopy);
+      flashMarkdownCopyButton(button);
+    } catch (error) {
+      setSidebarError(error?.message || (language === 'zh' ? '复制失败。' : 'Copy failed.'));
+    }
+  }
+
+  async function pickComposerAttachments() {
+    if (!desktopClient || appState.claude.busy || isBootstrapping) {
+      return;
+    }
+
+    try {
+      const pickedAttachments = await desktopClient.pickAttachments();
+      if (!Array.isArray(pickedAttachments) || pickedAttachments.length === 0) {
+        return;
+      }
+
+      setComposerAttachments((current) => mergeComposerAttachments(current, pickedAttachments));
+      focusComposer();
+    } catch (error) {
+      setSidebarError(error.message);
+    }
+  }
+
+  async function pasteComposerAttachments(clipboardData) {
+    if (!desktopClient || appState.claude.busy || isBootstrapping) {
+      return false;
+    }
+
+    const clipboardFiles = getClipboardFiles(clipboardData);
+    if (clipboardFiles.length === 0) {
+      return false;
+    }
+
+    try {
+      const preparedAttachments = await Promise.all(clipboardFiles.map((file) => createPastedAttachmentPayload(file)));
+      const nextAttachments = await desktopClient.preparePastedAttachments({
+        attachments: preparedAttachments.filter(Boolean),
+      });
+
+      if (!Array.isArray(nextAttachments) || nextAttachments.length === 0) {
+        return false;
+      }
+
+      setComposerAttachments((current) => mergeComposerAttachments(current, nextAttachments));
+      focusComposer();
+      return true;
+    } catch (error) {
+      setSidebarError(error.message);
+      return false;
+    }
+  }
+
+  function removeComposerAttachment(attachmentPath) {
+    setComposerAttachments((current) => current.filter((attachment) => attachment.path !== attachmentPath));
+    focusComposer();
+  }
+
+  function applyComposerHistory(direction) {
+    if (!composerHistoryEntries.length) {
+      return false;
+    }
+
+    let nextIndex = composerHistoryIndex;
+
+    if (direction === 'previous') {
+      nextIndex = composerHistoryIndex < 0
+        ? 0
+        : Math.min(composerHistoryIndex + 1, composerHistoryEntries.length - 1);
+    } else if (direction === 'next') {
+      if (composerHistoryIndex < 0) {
+        return false;
+      }
+
+      nextIndex = composerHistoryIndex - 1;
+    } else {
+      return false;
+    }
+
+    if (nextIndex < 0) {
+      setComposerHistoryIndex(-1);
+      setInputValue('');
+      focusComposer();
+      return true;
+    }
+
+    const nextEntry = composerHistoryEntries[nextIndex];
+    if (!nextEntry) {
+      return false;
+    }
+
+    setComposerHistoryIndex(nextIndex);
+    setInputValue(nextEntry);
+    focusComposer();
+    return true;
+  }
+
   function applySlashCommand(command) {
     if (!command) {
       return;
     }
 
+    setComposerHistoryIndex(-1);
     setInputValue(command.template);
     focusComposer();
   }
@@ -622,6 +924,7 @@ export default function App() {
       setAppState(nextState);
 
       if (clearInput) {
+        setComposerHistoryIndex(-1);
         setInputValue('');
       }
     } finally {
@@ -629,13 +932,39 @@ export default function App() {
     }
   }
 
-  async function submitPrompt(prompt, { displayKind = '', displayPrompt, displayTitle = '' } = {}) {
+  async function updateCurrentSessionPermissionMode(nextPermissionMode, { clearInput = false } = {}) {
+    if (!desktopClient || !selectedWorkspace || !selectedSession) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingPermissionMode(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionPermissionMode({
+        permissionMode: nextPermissionMode,
+        sessionId: selectedSession.id,
+        workspaceId: selectedWorkspace.id,
+      });
+      setAppState(nextState);
+
+      if (clearInput) {
+        setComposerHistoryIndex(-1);
+        setInputValue('');
+      }
+    } finally {
+      setIsUpdatingPermissionMode(false);
+    }
+  }
+
+  async function submitPrompt(prompt, { attachments = [], displayKind = '', displayPrompt, displayTitle = '' } = {}) {
     if (!desktopClient || appState.claude.busy) {
       return;
     }
 
     const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
-    if (!normalizedPrompt) {
+    const normalizedAttachments = normalizeComposerAttachments(attachments);
+    if (!normalizedPrompt && normalizedAttachments.length === 0) {
       return;
     }
 
@@ -650,10 +979,13 @@ export default function App() {
 
     setIsSending(true);
     setSidebarError('');
+    setComposerAttachments([]);
+    setComposerHistoryIndex(-1);
     setInputValue('');
 
     try {
       await desktopClient.sendMessage({
+        attachments: normalizedAttachments,
         displayKind,
         displayPrompt,
         displayTitle,
@@ -663,6 +995,8 @@ export default function App() {
       });
     } catch (error) {
       setIsSending(false);
+      setComposerAttachments(normalizedAttachments);
+      setComposerHistoryIndex(-1);
       setInputValue(displayPrompt || normalizedPrompt);
       setSidebarError(error.message);
     }
@@ -685,6 +1019,7 @@ export default function App() {
 
     try {
       if (commandName === 'help') {
+        setComposerHistoryIndex(-1);
         setInputValue('/');
         focusComposer();
         return true;
@@ -696,6 +1031,7 @@ export default function App() {
         }
 
         await createSession(selectedWorkspace.id);
+        setComposerHistoryIndex(-1);
         setInputValue('');
         return true;
       }
@@ -711,6 +1047,7 @@ export default function App() {
         }
 
         setThemePreference(nextTheme);
+        setComposerHistoryIndex(-1);
         setInputValue('');
         return true;
       }
@@ -743,6 +1080,7 @@ export default function App() {
           workspaceId: selectedWorkspace.id,
         });
         setAppState(nextState);
+        setComposerHistoryIndex(-1);
         setInputValue('');
         return true;
       }
@@ -761,6 +1099,7 @@ export default function App() {
             workspaceId: selectedWorkspace.id,
           });
           setAppState(nextState);
+          setComposerHistoryIndex(-1);
           setInputValue('');
           return true;
         }
@@ -777,6 +1116,7 @@ export default function App() {
             workspaceId: selectedWorkspace.id,
           });
           setAppState(nextState);
+          setComposerHistoryIndex(-1);
           setInputValue('');
           return true;
         }
@@ -805,7 +1145,7 @@ export default function App() {
 
   async function sendMessage() {
     const prompt = inputValue.trim();
-    if (!prompt) {
+    if (!prompt && composerAttachments.length === 0) {
       return;
     }
 
@@ -816,7 +1156,7 @@ export default function App() {
       }
     }
 
-    await submitPrompt(prompt);
+    await submitPrompt(prompt, { attachments: composerAttachments });
   }
 
   async function stopRun() {
@@ -830,6 +1170,23 @@ export default function App() {
       setIsSending(false);
     } catch (error) {
       setSidebarError(error.message);
+    }
+  }
+
+  async function respondToApproval(requestId, decision) {
+    if (!desktopClient || !requestId || !selectedSession) {
+      return;
+    }
+
+    setPendingApprovalActionId(requestId);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.respondToApproval({ decision, requestId });
+      setAppState(nextState);
+    } catch (error) {
+      setSidebarError(error.message);
+      setPendingApprovalActionId('');
     }
   }
 
@@ -903,7 +1260,7 @@ export default function App() {
     desktopClient
     && selectedWorkspace
     && !appState.claude.busy
-    && trimmedInputValue
+    && (trimmedInputValue || hasComposerAttachments)
     && (selectedSession || trimmedInputValue.startsWith('/')),
   );
 
@@ -911,45 +1268,7 @@ export default function App() {
     <div className="relative h-screen overflow-hidden bg-background text-foreground">
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,hsl(var(--card)/0.88)_0%,transparent_18%,transparent_82%,hsl(var(--background)/0.96)_100%)]" />
 
-      <div
-        className={cn(
-          'drag-region fixed inset-x-0 top-0 z-40 border-b border-border/80 bg-background/90 backdrop-blur',
-          topBarHeightClass,
-        )}
-      >
-        <div
-          className={cn(
-            'flex h-full w-full items-center gap-2 px-3 text-[10px] sm:px-4',
-            isMac && 'pl-24 sm:pl-28',
-          )}
-        >
-          <div className="flex items-center gap-2">
-            <StatusPill
-              tone={appState.claude.available ? 'success' : 'error'}
-              label={formatClaudeStatusLabel(appState.claude, language)}
-            />
-            <div className="no-drag flex items-center gap-2">
-              <TopbarSelect
-                value={language}
-                onChange={(event) => setLanguage(event.target.value)}
-                ariaLabel={copy.languageLabel}
-              >
-                <option value="zh">{copy.languageChinese}</option>
-                <option value="en">{copy.languageEnglish}</option>
-              </TopbarSelect>
-              <TopbarSelect
-                value={themePreference}
-                onChange={(event) => setThemePreference(event.target.value)}
-                ariaLabel={copy.themeLabel}
-              >
-                <option value="system">{copy.themeSystem}</option>
-                <option value="light">{copy.themeLight}</option>
-                <option value="dark">{copy.themeDark}</option>
-              </TopbarSelect>
-            </div>
-          </div>
-        </div>
-      </div>
+      <div className={cn('drag-region fixed inset-x-0 top-0 z-40 bg-transparent', topBarHeightClass)} />
 
       <main
         className={cn(
@@ -958,6 +1277,29 @@ export default function App() {
         )}
       >
         <aside className="flex w-[360px] min-w-[360px] shrink-0 flex-col overflow-hidden border-r border-border/70 bg-background/60">
+          <div className="border-b border-border/70 px-3 py-3">
+            <div className="pr-2">
+              <div className="relative pr-12">
+                <StatusPill
+                  tone={appState.claude.available ? 'success' : 'error'}
+                  label={formatClaudeStatusLabel(appState.claude, language)}
+                  title={normalizeClaudeVersion(appState.claude.version) || undefined}
+                />
+                <div className={SIDEBAR_ACTION_SLOT_CLASS}>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setIsSettingsOpen(true)}
+                    aria-label={copy.settings}
+                    title={copy.settings}
+                    className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'hover:bg-background/70')}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
           <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-3 py-3">
             <div className="space-y-5 pr-2">
                 {sidebarError && (
@@ -981,7 +1323,7 @@ export default function App() {
                       disabled={!desktopClient || isPickingWorkspace || appState.claude.busy}
                       aria-label={copy.addWorkspace}
                       title={copy.addWorkspace}
-                      className="h-7 w-7 shrink-0 rounded-md bg-transparent p-0 text-foreground shadow-none hover:bg-background/80"
+                      className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'text-foreground')}
                     >
                       {isPickingWorkspace ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <FolderPlus className="h-4 w-4" />}
                     </Button>
@@ -1044,6 +1386,16 @@ export default function App() {
                     {selectedWorkspace.name}
                   </Badge>
                 )}
+                {selectedWorkspace?.gitBranch && (
+                  <Badge
+                    variant="outline"
+                    className="h-6 bg-background/80 px-2 text-[10px] text-foreground"
+                    title={selectedWorkspace.gitRoot || selectedWorkspace.gitBranch}
+                  >
+                    <GitBranch className="mr-1 h-3 w-3" />
+                    {truncateMiddle(selectedWorkspace.gitBranch, 28)}
+                  </Badge>
+                )}
                 {selectedSession && (
                   <Badge variant="outline" className="h-6 bg-background/80 px-2 text-[10px] text-foreground">
                     {currentModelDisplay}
@@ -1081,7 +1433,15 @@ export default function App() {
                       />
                     ) : (
                     <>
-                      {renderableMessages.map((message) => <ChatMessage key={message.id} language={language} message={message} />)}
+                      {renderableMessages.map((message) => (
+                        <ChatMessage
+                          key={message.id}
+                          approvalActionId={pendingApprovalActionId}
+                          language={language}
+                          message={message}
+                          onApprovalDecision={respondToApproval}
+                        />
+                      ))}
                       {shouldShowRunIndicator && <RunIndicator language={language} />}
                     </>
                   )}
@@ -1093,10 +1453,44 @@ export default function App() {
           <div className="p-3">
             <div className="mx-auto w-full max-w-[780px]">
               <div className="relative">
+                {hasComposerAttachments && (
+                  <div className="absolute left-3 right-24 top-3 z-10 overflow-x-auto pb-1">
+                    <div className="flex min-w-max items-center gap-2 pr-2">
+                      {composerAttachments.map((attachment) => (
+                        <ComposerAttachmentChip
+                          key={attachment.path}
+                          attachment={attachment}
+                          removeLabel={copy.removeAttachment}
+                          onRemove={removeComposerAttachment}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <Textarea
                   ref={textareaRef}
                   value={inputValue}
-                  onChange={(event) => setInputValue(event.target.value)}
+                  onChange={(event) => {
+                    if (composerHistoryIndex !== -1) {
+                      setComposerHistoryIndex(-1);
+                    }
+
+                    setInputValue(event.target.value);
+                  }}
+                  onPaste={(event) => {
+                    const clipboardData = event.clipboardData;
+                    if (!clipboardData) {
+                      return;
+                    }
+
+                    const hasClipboardFiles = getClipboardFiles(clipboardData).length > 0;
+                    if (!hasClipboardFiles) {
+                      return;
+                    }
+
+                    event.preventDefault();
+                    void pasteComposerAttachments(clipboardData);
+                  }}
                   onKeyDown={(event) => {
                     if (isSlashCommandMenuOpen && visibleSlashCommands.length > 0) {
                       if (event.key === 'ArrowDown') {
@@ -1128,6 +1522,26 @@ export default function App() {
                       }
                     }
 
+                    const canNavigateComposerHistory = !event.altKey
+                      && !event.ctrlKey
+                      && !event.metaKey
+                      && !event.shiftKey
+                      && (composerHistoryIndex !== -1 || inputValue.trim() === '');
+
+                    if (canNavigateComposerHistory && event.key === 'ArrowUp') {
+                      if (applyComposerHistory('previous')) {
+                        event.preventDefault();
+                        return;
+                      }
+                    }
+
+                    if (canNavigateComposerHistory && event.key === 'ArrowDown') {
+                      if (applyComposerHistory('next')) {
+                        event.preventDefault();
+                        return;
+                      }
+                    }
+
                     if (event.key === 'Enter' && !event.shiftKey) {
                       event.preventDefault();
                       sendMessage();
@@ -1138,36 +1552,78 @@ export default function App() {
                       ? (selectedSession ? copy.inputPlaceholder : copy.noSessionCommandHint)
                       : copy.noSessionsYet
                   }
-                  className="min-h-[96px] resize-none pb-14 pl-3 pr-14"
+                  className={cn(
+                    'min-h-[116px] resize-none pb-24 pl-3 pr-24',
+                    hasComposerAttachments && 'pt-16',
+                  )}
                   disabled={!selectedWorkspace || !desktopClient || appState.claude.busy || isBootstrapping}
                 />
-                <ComposerModelPicker
-                  ariaLabel={copy.modelLabel}
-                  buttonValue={currentModelCommandValue}
-                  currentLabel={currentModelDisplay}
-                  disabled={!selectedSession || !desktopClient || appState.claude.busy || isBootstrapping || isUpdatingModel}
-                  isOpen={isModelPickerOpen}
-                  menuDescription={copy.modelMenuDescription}
-                  menuHint={copy.modelMenuHint}
-                  menuTitle={copy.modelMenuTitle}
-                  options={modelOptions}
-                  pickerRef={modelPickerRef}
-                  selectedValue={selectedSession?.model || ''}
-                  onOpenChange={setIsModelPickerOpen}
-                  onSelect={async (nextModel) => {
-                    if (nextModel === (selectedSession?.model || '')) {
-                      setIsModelPickerOpen(false);
-                      return;
-                    }
+                <div className="absolute bottom-3 left-3 right-24 z-10 pb-1">
+                  <div className="flex items-center gap-2 pr-2">
+                    <ComposerSelectPicker
+                      ariaLabel={copy.modeLabel}
+                      buttonIcon={CurrentModeIcon}
+                      buttonValue={currentModeCommandValue}
+                      currentLabel={currentModeDisplay}
+                      disabled={!selectedSession || !desktopClient || appState.claude.busy || isBootstrapping || isUpdatingPermissionMode}
+                      isOpen={isModePickerOpen}
+                      menuDescription={copy.modeMenuDescription}
+                      menuHint={copy.modeMenuHint}
+                      menuTitle={copy.modeMenuTitle}
+                      options={modeOptions}
+                      pickerRef={modePickerRef}
+                      selectedValue={sessionPermissionMode}
+                      onOpenChange={(nextOpen) => {
+                        setIsModelPickerOpen(false);
+                        setIsModePickerOpen(nextOpen);
+                      }}
+                      onSelect={async (nextPermissionMode) => {
+                        if (nextPermissionMode === sessionPermissionMode) {
+                          setIsModePickerOpen(false);
+                          return;
+                        }
 
-                    try {
-                      await updateCurrentSessionModel(nextModel);
-                      setIsModelPickerOpen(false);
-                    } catch (error) {
-                      setSidebarError(error.message);
-                    }
-                  }}
-                />
+                        try {
+                          await updateCurrentSessionPermissionMode(nextPermissionMode);
+                          setIsModePickerOpen(false);
+                        } catch (error) {
+                          setSidebarError(error.message);
+                        }
+                      }}
+                    />
+                    <ComposerSelectPicker
+                      ariaLabel={copy.modelLabel}
+                      buttonIcon={Sparkles}
+                      buttonValue={currentModelCommandValue}
+                      currentLabel={currentModelDisplay}
+                      disabled={!selectedSession || !desktopClient || appState.claude.busy || isBootstrapping || isUpdatingModel}
+                      isOpen={isModelPickerOpen}
+                      menuDescription={copy.modelMenuDescription}
+                      menuHint={copy.modelMenuHint}
+                      menuTitle={copy.modelMenuTitle}
+                      options={modelOptions}
+                      pickerRef={modelPickerRef}
+                      selectedValue={selectedSession?.model || ''}
+                      onOpenChange={(nextOpen) => {
+                        setIsModePickerOpen(false);
+                        setIsModelPickerOpen(nextOpen);
+                      }}
+                      onSelect={async (nextModel) => {
+                        if (nextModel === (selectedSession?.model || '')) {
+                          setIsModelPickerOpen(false);
+                          return;
+                        }
+
+                        try {
+                          await updateCurrentSessionModel(nextModel);
+                          setIsModelPickerOpen(false);
+                        } catch (error) {
+                          setSidebarError(error.message);
+                        }
+                      }}
+                    />
+                  </div>
+                </div>
                 {isSlashCommandMenuOpen && (
                   <SlashCommandMenu
                     commands={visibleSlashCommands}
@@ -1178,6 +1634,18 @@ export default function App() {
                     onSelectCommand={applySlashCommand}
                   />
                 )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={pickComposerAttachments}
+                  disabled={!selectedWorkspace || !desktopClient || appState.claude.busy || isBootstrapping}
+                  aria-label={copy.addAttachment}
+                  title={copy.addAttachment}
+                  className="absolute bottom-3 right-14 h-8 w-8 rounded-full border-border/80 bg-background shadow-sm hover:bg-muted"
+                >
+                  <Paperclip className="h-3.5 w-3.5" />
+                </Button>
                 <Button
                   onClick={appState.claude.busy ? stopRun : sendMessage}
                   disabled={appState.claude.busy ? false : !canSend}
@@ -1232,6 +1700,17 @@ export default function App() {
           onConfirm={confirmRemoveWorkspace}
         />
       )}
+
+      {isSettingsOpen && (
+        <SettingsDialog
+          copy={copy}
+          language={language}
+          themePreference={themePreference}
+          onClose={() => setIsSettingsOpen(false)}
+          onLanguageChange={setLanguage}
+          onThemeChange={setThemePreference}
+        />
+      )}
     </div>
   );
 }
@@ -1241,7 +1720,7 @@ function SidebarSection({ action, title, children }) {
     <section className="space-y-2.5">
       <div className="relative pr-12">
         <p className="min-w-0 text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground">{title}</p>
-        <div className="absolute right-3 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center">
+        <div className={SIDEBAR_ACTION_SLOT_CLASS}>
           {action}
         </div>
       </div>
@@ -1256,22 +1735,80 @@ function SidebarEmpty({ text }) {
 
 function TopbarSelect({ ariaLabel, children, onChange, value }) {
   return (
-    <div className="relative">
+    <div className="relative w-full">
       <select
         value={value}
         onChange={onChange}
         aria-label={ariaLabel}
-        className="h-7 appearance-none rounded border border-border/70 bg-background/70 py-0 pl-2 pr-8 text-[11px] text-foreground outline-none transition-colors hover:bg-background focus:ring-1 focus:ring-ring/20"
+        className="h-8 w-full appearance-none rounded border border-border/80 bg-background px-3 pr-9 text-[12px] text-foreground outline-none transition-colors hover:bg-background focus:ring-2 focus:ring-ring/20"
       >
         {children}
       </select>
-      <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
     </div>
   );
 }
 
-function ComposerModelPicker({
+function SettingsDialog({ copy, language, onClose, onLanguageChange, onThemeChange, themePreference }) {
+  return (
+    <div
+      className="absolute inset-0 z-50 flex items-center justify-center bg-foreground/20 px-4 backdrop-blur-[2px]"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm rounded-2xl border border-border/80 bg-background p-5 shadow-xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-foreground">{copy.settingsTitle}</p>
+            <p className="mt-1 text-[13px] leading-6 text-muted-foreground">{copy.settingsDescription}</p>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            aria-label={copy.settingsClose}
+            title={copy.settingsClose}
+            className="h-8 w-8 shrink-0 rounded-xl text-muted-foreground hover:text-foreground"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+
+        <div className="mt-5 space-y-4">
+          <div className="space-y-1.5">
+            <p className="text-[12px] font-medium text-foreground">{copy.languageLabel}</p>
+            <TopbarSelect
+              value={language}
+              onChange={(event) => onLanguageChange(event.target.value)}
+              ariaLabel={copy.languageLabel}
+            >
+              <option value="zh">{copy.languageChinese}</option>
+              <option value="en">{copy.languageEnglish}</option>
+            </TopbarSelect>
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-[12px] font-medium text-foreground">{copy.themeLabel}</p>
+            <TopbarSelect
+              value={themePreference}
+              onChange={(event) => onThemeChange(event.target.value)}
+              ariaLabel={copy.themeLabel}
+            >
+              <option value="system">{copy.themeSystem}</option>
+              <option value="light">{copy.themeLight}</option>
+              <option value="dark">{copy.themeDark}</option>
+            </TopbarSelect>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ComposerSelectPicker({
   ariaLabel,
+  buttonIcon: ButtonIcon,
   buttonValue,
   currentLabel,
   disabled,
@@ -1286,7 +1823,7 @@ function ComposerModelPicker({
   selectedValue,
 }) {
   return (
-    <div ref={pickerRef} className="absolute bottom-3 left-3 z-10">
+    <div ref={pickerRef} className="relative min-w-0 max-w-full shrink-0">
       <button
         type="button"
         aria-label={ariaLabel}
@@ -1294,16 +1831,18 @@ function ComposerModelPicker({
         aria-haspopup="dialog"
         disabled={disabled}
         onClick={() => onOpenChange(!isOpen)}
-        className="flex h-8 max-w-[240px] items-center gap-2 rounded-lg border border-border/80 bg-background/92 px-3 text-left text-[12px] text-foreground shadow-sm outline-none transition-colors hover:bg-background focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex h-8 max-w-[280px] items-center gap-2 rounded border border-border/80 bg-background px-3 text-left text-[12px] text-foreground shadow-sm outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
       >
-        <Sparkles className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        {ButtonIcon ? <ButtonIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
         <span className="min-w-0 flex-1 truncate font-medium">{currentLabel}</span>
-        <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{buttonValue}</code>
+        {buttonValue ? (
+          <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{buttonValue}</code>
+        ) : null}
         <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform', isOpen && 'rotate-180')} />
       </button>
 
       {isOpen && (
-        <div className="absolute bottom-[calc(100%+10px)] left-0 z-20 w-[min(560px,calc(100vw-48px))] overflow-hidden rounded-2xl border border-border/80 bg-background/96 shadow-xl backdrop-blur">
+        <div className="absolute bottom-[calc(100%+10px)] left-0 z-20 w-[min(560px,calc(100vw-48px))] overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl">
           <div className="border-b border-border/70 px-3 py-3">
             <p className="text-[13px] font-semibold text-foreground">{menuTitle}</p>
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{menuDescription}</p>
@@ -1311,6 +1850,7 @@ function ComposerModelPicker({
           <div className="max-h-72 overflow-y-auto p-2">
             {options.map((option) => {
               const isSelected = option.value === selectedValue;
+              const OptionIcon = option.icon;
 
               return (
                 <button
@@ -1318,15 +1858,18 @@ function ComposerModelPicker({
                   type="button"
                   onClick={() => onSelect(option.value)}
                   className={cn(
-                    'w-full rounded-xl px-3 py-2.5 text-left transition-colors hover:bg-muted/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35',
-                    isSelected && 'bg-muted/80',
+                    'w-full rounded-md px-3 py-2.5 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35',
+                    isSelected && 'bg-muted',
                   )}
                 >
                   <div className="flex items-start gap-3">
+                    {OptionIcon ? <OptionIcon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" /> : null}
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <span className="text-[13px] font-medium text-foreground">{option.label}</span>
-                        <code className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{option.commandValue}</code>
+                        {option.commandValue ? (
+                          <code className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{option.commandValue}</code>
+                        ) : null}
                       </div>
                       <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{option.summary}</p>
                     </div>
@@ -1352,7 +1895,7 @@ function SlashCommandMenu({
   onSelectCommand,
 }) {
   return (
-    <div ref={menuRef} className="absolute inset-x-0 bottom-[calc(100%+10px)] z-20 overflow-hidden rounded-2xl border border-border/80 bg-background/96 shadow-xl backdrop-blur">
+    <div ref={menuRef} className="absolute inset-x-0 bottom-[calc(100%+10px)] z-20 overflow-hidden rounded-2xl border border-border bg-popover text-popover-foreground shadow-xl">
       <div className="border-b border-border/70 px-3 py-2 text-[11px] font-medium text-muted-foreground">
         {language === 'zh' ? 'Slash 指令' : 'Slash commands'}
       </div>
@@ -1372,10 +1915,13 @@ function SlashCommandMenu({
                 onClick={() => onSelectCommand(command)}
                 className={cn(
                   'flex w-full items-start gap-3 px-3 py-2 text-left transition-colors',
-                  isHighlighted ? 'bg-accent/70 text-accent-foreground' : 'hover:bg-accent/40',
+                  isHighlighted ? 'bg-accent text-accent-foreground' : 'hover:bg-accent',
                 )}
               >
-                <code className="mt-0.5 min-w-[88px] rounded bg-background/80 px-1.5 py-0.5 text-[11px] font-semibold text-foreground">
+                <code
+                  className="mt-0.5 inline-block w-[120px] shrink-0 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] font-semibold text-foreground"
+                  title={`/${command.name}`}
+                >
                   /{command.name}
                 </code>
                 <div className="min-w-0">
@@ -1444,7 +1990,10 @@ function WorkspaceItem({
             size="icon"
             onClick={onCreateSession}
             disabled={disabled}
-            className="pointer-events-none h-7 w-7 shrink-0 rounded-none border-0 bg-transparent p-0 text-muted-foreground opacity-0 shadow-none transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 hover:bg-transparent hover:text-foreground focus-visible:opacity-100"
+            className={cn(
+              SIDEBAR_ACTION_BUTTON_CLASS,
+              'pointer-events-none opacity-0 transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:opacity-100',
+            )}
             title={copy.createConversationInWorkspace(workspace.path)}
           >
             <MessageSquarePlus className="h-4 w-4" />
@@ -1454,7 +2003,10 @@ function WorkspaceItem({
             size="icon"
             onClick={onRemoveWorkspace}
             disabled={disabled}
-            className="pointer-events-none h-7 w-7 shrink-0 rounded-none border-0 bg-transparent p-0 text-muted-foreground opacity-0 shadow-none transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 hover:bg-transparent hover:text-destructive focus-visible:opacity-100"
+            className={cn(
+              SIDEBAR_ACTION_BUTTON_CLASS,
+              'pointer-events-none opacity-0 transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-destructive focus-visible:opacity-100',
+            )}
             title={copy.removeWorkspaceWithPath(workspace.path)}
           >
             <Trash2 className="h-4 w-4" />
@@ -1503,7 +2055,7 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
             {showRunningDot && <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-hidden="true" />}
             <p className="min-w-0 flex-1 truncate text-[12px] font-medium text-foreground/90">{session.title}</p>
           </div>
-          <span className="flex h-7 w-7 shrink-0 items-center justify-center" aria-hidden="true" />
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center" aria-hidden="true" />
         </div>
         <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-muted-foreground/90">{session.preview}</p>
         <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground/90">
@@ -1511,13 +2063,16 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
           {session.claudeSessionId && <span>{truncateMiddle(session.claudeSessionId, 14)}</span>}
         </div>
       </button>
-      <div className="absolute right-3 top-[10px] flex h-7 w-7 items-center justify-center">
+      <div className="absolute right-3 top-2 flex h-8 w-8 items-center justify-center">
         <Button
           variant="ghost"
           size="icon"
           onClick={onArchive}
           disabled={disabled || session.isRunning}
-          className="pointer-events-none h-7 w-7 rounded-none border-0 bg-transparent p-0 text-muted-foreground opacity-0 shadow-none transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 hover:bg-transparent hover:text-foreground focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-30"
+          className={cn(
+            SIDEBAR_ACTION_BUTTON_CLASS,
+            'pointer-events-none opacity-0 transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-30',
+          )}
           title={session.isRunning ? copy.toolArchiveDisabled : copy.archiveConversation}
         >
           <Archive className="h-4 w-4" />
@@ -1563,34 +2118,66 @@ function ConversationEmptyState({ description, icon: Icon, title }) {
   );
 }
 
-function ChatMessage({ language, message }) {
+function MessageLeadIcon({ children, className }) {
+  return (
+    <div className={cn('mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md', className)}>
+      {children}
+    </div>
+  );
+}
+
+function ChatMessage({ approvalActionId, language, message, onApprovalDecision }) {
   if (message.role === 'event') {
     return <EventMessage language={language} message={message} />;
   }
 
+  const copy = COPY[language];
   const isUser = message.role === 'user';
+  const messageAttachments = isUser ? getMessageAttachments(message) : [];
+  const assistantSegments = isUser ? [] : getAssistantSegments(message);
+  const showThinkingIndicator = (message.streaming || message.pendingThinking)
+    && !assistantMessageHasText(message)
+    && !assistantMessageHasRunningToolActivity(message)
+    && !assistantMessageHasPendingApproval(message);
 
   if (!isUser) {
     return (
       <div className="flex items-start gap-2.5">
-        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-          <Bot className="h-4 w-4" />
-        </div>
+        <MessageLeadIcon className="bg-primary/10 text-primary">
+          <Bot className="h-3.5 w-3.5" />
+        </MessageLeadIcon>
         <div className="min-w-0 max-w-[min(100%,46rem)] flex-1 pt-0.5">
-          <div className="mb-2 flex items-center gap-1.5 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-            <Bot className="h-3.5 w-3.5" />
-            Claude
+          <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Claude</div>
+          <div className="space-y-3">
+            {assistantSegments.map((segment) => {
+              if (segment.type === 'tool_activity') {
+                return <AssistantToolActivity key={segment.key} activity={segment.toolActivity} language={language} />;
+              }
+
+              if (segment.type === 'approval') {
+                return (
+                  <AssistantApprovalCard
+                    key={segment.key}
+                    approval={segment.approval}
+                    isSubmitting={approvalActionId === segment.approval.requestId}
+                    language={language}
+                    onDecision={onApprovalDecision}
+                  />
+                );
+              }
+
+              return (
+                <div
+                  key={segment.key}
+                  className={cn('markdown-body text-[13px] leading-6', segment.error && 'text-destructive')}
+                  dangerouslySetInnerHTML={{
+                    __html: renderMarkdown(segment.content, language),
+                  }}
+                />
+              );
+            })}
+            {showThinkingIndicator ? <TypingIndicator label={copy.assistantThinking} labelLoading /> : null}
           </div>
-          {message.streaming && !message.content ? (
-            <TypingIndicator />
-          ) : (
-            <div
-              className={cn('markdown-body text-[13px] leading-6', message.error && 'text-destructive')}
-              dangerouslySetInnerHTML={{
-                __html: renderMarkdown(message.content),
-              }}
-            />
-          )}
         </div>
       </div>
     );
@@ -1598,11 +2185,271 @@ function ChatMessage({ language, message }) {
 
   return (
     <div className="flex items-start justify-end gap-2.5">
-      <div className="max-w-[min(100%,42rem)] rounded-2xl border border-primary/10 bg-primary px-2.5 py-2 text-primary-foreground shadow-sm">
-        <div className="whitespace-pre-wrap text-[13px] leading-6">{message.content}</div>
+      <div className="user-bubble-message max-w-[min(100%,42rem)] rounded-2xl border px-2.5 py-2">
+        {messageAttachments.length > 0 ? <MessageAttachmentList attachments={messageAttachments} /> : null}
+        {message.content ? (
+          <div className={cn('whitespace-pre-wrap text-[13px] leading-6', messageAttachments.length > 0 && 'mt-2')}>
+            {message.content}
+          </div>
+        ) : null}
       </div>
     </div>
   );
+}
+
+function ComposerAttachmentChip({ attachment, onRemove, removeLabel }) {
+  return (
+    <span className="inline-flex h-8 max-w-[220px] items-center gap-2 rounded-full border border-border/80 bg-background px-3 text-[12px] text-foreground shadow-sm">
+      <AttachmentKindIcon attachment={attachment} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      <span className="truncate" title={attachment.path || attachment.name}>{attachment.name}</span>
+      <button
+        type="button"
+        onClick={() => onRemove(attachment.path)}
+        aria-label={removeLabel}
+        title={removeLabel}
+        className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </span>
+  );
+}
+
+function MessageAttachmentList({ attachments }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {attachments.map((attachment) => (
+        <span
+          key={attachment.path}
+          className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[hsl(var(--user-bubble-border))] bg-[hsl(var(--user-bubble-foreground)/0.08)] px-3 py-1 text-[12px] leading-5"
+          title={attachment.path || attachment.name}
+        >
+          <AttachmentKindIcon attachment={attachment} className="h-3.5 w-3.5 shrink-0 opacity-80" />
+          <span className="truncate">{attachment.name}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function AttachmentKindIcon({ attachment, className }) {
+  const Icon = attachment?.kind === 'image' ? ImageIcon : FileText;
+  return <Icon className={className} />;
+}
+
+function AssistantToolActivity({ activity, language }) {
+  const visibleItems = getVisibleToolActivityItems(activity);
+  const summaryParts = Array.isArray(activity?.summaryParts) ? activity.summaryParts : [];
+
+  if (!activity || (summaryParts.length === 0 && visibleItems.length === 0)) {
+    return null;
+  }
+
+  return (
+    <div className="space-y-1 text-[12px] leading-5 text-muted-foreground">
+      {summaryParts.length > 0 ? (
+        <p className="font-medium text-muted-foreground/95">
+          {summaryParts.map((part, index) => (
+            <span key={part.key}>
+              {index > 0 ? (activity.summarySeparator || ' ') : ''}
+              <span className={cn(part.status === 'running' && 'loading-copy')}>{part.label}</span>
+            </span>
+          ))}
+        </p>
+      ) : null}
+      {visibleItems.length > 0 ? (
+        <div className="space-y-0.5">
+          {visibleItems.map((item) => (
+            <p key={item.key} className={cn('break-words text-muted-foreground/85', item.status === 'running' && 'loading-copy')}>
+              <ToolActivityItemLabel item={item} language={language} />
+            </p>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function AssistantApprovalCard({ approval, isSubmitting, language, onDecision }) {
+  const copy = COPY[language];
+  const actionLabel = formatPendingApprovalActionLabel(approval, language);
+  const reason = (approval?.description || approval?.decisionReason || '').trim();
+  const blockedPath = (approval?.blockedPath || '').trim();
+  const canAlwaysAllowCommand = approval?.category === 'command';
+
+  return (
+    <div className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-3 text-[12px] leading-5 text-foreground/90">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="font-medium text-foreground">{copy.approvalTitle}</p>
+        {isSubmitting ? <span className="text-[11px] text-muted-foreground">{copy.approvalResponding}</span> : null}
+      </div>
+      <p className="mt-1 break-words text-muted-foreground">{actionLabel}</p>
+      {blockedPath ? (
+        <div className="mt-2">
+          <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground/80">{copy.approvalBlockedPath}</p>
+          <code className="mt-1 block break-all rounded-lg bg-background/80 px-2 py-1.5 text-[11px] text-foreground/90">{blockedPath}</code>
+        </div>
+      ) : null}
+      {reason ? (
+        <p className="mt-2 break-words text-muted-foreground">
+          <span className="font-medium text-foreground/90">{copy.approvalReason}:</span>
+          {' '}
+          {reason}
+        </p>
+      ) : null}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          onClick={() => onDecision?.(approval.requestId, 'allow')}
+          disabled={isSubmitting}
+          className="h-7 rounded-lg bg-foreground px-2.5 text-[11px] text-background hover:bg-foreground/90"
+        >
+          {copy.approvalAllow}
+        </Button>
+        {canAlwaysAllowCommand ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => onDecision?.(approval.requestId, 'allow_always')}
+            disabled={isSubmitting}
+            className="h-7 rounded-lg border-border/80 px-2.5 text-[11px]"
+          >
+            {copy.approvalAllowAlwaysCommand}
+          </Button>
+        ) : null}
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => onDecision?.(approval.requestId, 'deny')}
+          disabled={isSubmitting}
+          className="h-7 rounded-lg border-border/80 px-2.5 text-[11px]"
+        >
+          {copy.approvalDeny}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ToolActivityItemLabel({ item, language }) {
+  if (isEditToolActivityItem(item)) {
+    return <EditToolActivityLabel item={item} language={language} />;
+  }
+
+  return item.label;
+}
+
+function EditToolActivityLabel({ item, language }) {
+  const toolMeta = item.toolMeta || null;
+  const fileName = toolMeta?.fileName || normalizeToolActivityLabel(item.category, item.label);
+  const filePath = toolMeta?.filePath || '';
+  const addedLines = typeof toolMeta?.addedLines === 'number' ? toolMeta.addedLines : null;
+  const deletedLines = typeof toolMeta?.deletedLines === 'number' ? toolMeta.deletedLines : null;
+  const prefix = language === 'zh'
+    ? (
+      item.status === 'running'
+        ? '正在编辑'
+        : (item.status === 'completed'
+          ? '已编辑'
+          : (item.status === 'stopped' ? '已停止编辑' : '编辑失败'))
+    )
+    : (
+      item.status === 'running'
+        ? 'Editing'
+        : (item.status === 'completed'
+          ? 'Edited'
+          : (item.status === 'stopped' ? 'Stopped editing' : 'Edit failed'))
+    );
+  const showAddedLines = typeof addedLines === 'number' && addedLines > 0;
+  const showDeletedLines = typeof deletedLines === 'number' && deletedLines > 0;
+
+  return (
+    <span className="inline-flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+      <span>{prefix}</span>
+      {fileName ? (
+        <span className="font-medium text-foreground/95" title={filePath || undefined}>
+          {fileName}
+        </span>
+      ) : null}
+      {showAddedLines ? <span className="font-medium text-emerald-600">+{addedLines}</span> : null}
+      {showDeletedLines ? <span className="font-medium text-rose-500">-{deletedLines}</span> : null}
+    </span>
+  );
+}
+
+function isEditToolActivityItem(item) {
+  return item?.category === 'edit' && item?.toolMeta?.type === 'edit';
+}
+
+function getAssistantSegments(message) {
+  if (Array.isArray(message?.segments) && message.segments.length > 0) {
+    return message.segments;
+  }
+
+  const segments = [];
+
+  if (message?.toolActivity) {
+    segments.push({
+      key: `${message.id}-tool`,
+      toolActivity: message.toolActivity,
+      type: 'tool_activity',
+    });
+  }
+
+  if (Array.isArray(message?.pendingApprovals)) {
+    for (const approval of message.pendingApprovals.filter(Boolean)) {
+      segments.push({
+        approval,
+        key: `${message.id}-approval-${approval.requestId || approval.createdAt}`,
+        type: 'approval',
+      });
+    }
+  }
+
+  if (message?.content) {
+    segments.push({
+      content: message.content,
+      error: message.error,
+      key: `${message.id}-text`,
+      type: 'text',
+    });
+  }
+
+  return segments;
+}
+
+function assistantMessageHasText(message) {
+  return getAssistantSegments(message).some((segment) => segment.type === 'text' && segment.content);
+}
+
+function assistantMessageHasRunningToolActivity(message) {
+  return getAssistantSegments(message).some((segment) => segment.type === 'tool_activity' && hasRunningToolActivity(segment.toolActivity));
+}
+
+function assistantMessageHasPendingApproval(message) {
+  return getAssistantSegments(message).some((segment) => segment.type === 'approval');
+}
+
+function assistantMessageHasToolActivity(message) {
+  return getAssistantSegments(message).some((segment) => segment.type === 'tool_activity');
+}
+
+function getVisibleToolActivityItems(activity) {
+  if (!Array.isArray(activity?.items)) {
+    return [];
+  }
+
+  return activity.items.filter((item) => {
+    if (item.status === 'running' || item.status === 'error') {
+      return true;
+    }
+
+    return item.status === 'completed' && (item.category === 'command' || item.category === 'edit');
+  });
+}
+
+function hasRunningToolActivity(activity) {
+  return Array.isArray(activity?.items) && activity.items.some((item) => item.status === 'running');
 }
 
 function EventMessage({ language, message }) {
@@ -1654,9 +2501,9 @@ function EventMessage({ language, message }) {
 
   return (
     <div className="flex items-start gap-2.5 py-0.5">
-      <div className={cn('mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md', meta.iconWrapperClassName)}>
+      <MessageLeadIcon className={meta.iconWrapperClassName}>
         <Icon className="h-3.5 w-3.5" />
-      </div>
+      </MessageLeadIcon>
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <p className="text-[12px] font-medium text-muted-foreground">{message.title}</p>
@@ -1687,9 +2534,10 @@ function EventMessage({ language, message }) {
   );
 }
 
-function StatusPill({ label, tone }) {
+function StatusPill({ label, title, tone }) {
   return (
     <span
+      title={title}
       className={cn(
         'inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]',
         tone === 'success' && 'border-emerald-200 bg-emerald-50 text-emerald-700',
@@ -1712,32 +2560,29 @@ function StatusPill({ label, tone }) {
   );
 }
 
-function TypingIndicator() {
+function TypingIndicator({ className, label, labelLoading = false }) {
+  if (!label) {
+    return null;
+  }
+
   return (
-    <div className="flex items-center gap-2 py-1.5">
-      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary/70 [animation-delay:0ms]" />
-      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary/50 [animation-delay:150ms]" />
-      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary/35 [animation-delay:300ms]" />
+    <div className={cn('py-1.5 text-muted-foreground', className)}>
+      <span className={cn('text-[12px] leading-5', labelLoading && 'loading-copy')}>{label}</span>
     </div>
   );
 }
 
-function RunIndicator() {
+function RunIndicator({ language }) {
+  const copy = COPY[language];
+
   return (
     <div className="flex items-start gap-2.5 py-0.5">
-      <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-        <Bot className="h-4 w-4" />
-      </div>
+      <MessageLeadIcon className="bg-primary/10 text-primary">
+        <Bot className="h-3.5 w-3.5" />
+      </MessageLeadIcon>
       <div className="pt-0.5">
-        <div className="mb-2 flex items-center gap-1.5 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-          <Bot className="h-3.5 w-3.5" />
-          Claude
-        </div>
-        <div className="flex items-center gap-1.5 text-muted-foreground">
-          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-primary/80 [animation-delay:0ms]" />
-          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-primary/60 [animation-delay:120ms]" />
-          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-primary/40 [animation-delay:240ms]" />
-        </div>
+        <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Claude</div>
+        <TypingIndicator label={copy.assistantThinking} labelLoading />
       </div>
     </div>
   );
@@ -1832,7 +2677,201 @@ function createEventPreview(content) {
   return content.replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
-function mergeRenderableMessages(messages, language) {
+function isMergeableToolEvent(message) {
+  return message?.role === 'event' && ['mcp', 'skill', 'tool', 'tool_result'].includes(message.kind);
+}
+
+function mergeRenderableMessages(messages, language, sessionRunning = false, pendingApprovals = []) {
+  const normalizedMessages = normalizeRenderableToolMessages(messages, sessionRunning);
+  const merged = [];
+  let assistantSegments = [];
+  let toolEventBuffer = [];
+
+  const pushAssistantSegments = () => {
+    if (assistantSegments.length === 0) {
+      return;
+    }
+
+    merged.push(createRenderableAssistantMessage(assistantSegments));
+    assistantSegments = [];
+  };
+
+  const flushAssistantSegments = () => {
+    flushToolEventBuffer();
+    pushAssistantSegments();
+  };
+
+  const flushToolEventBuffer = () => {
+    if (toolEventBuffer.length === 0) {
+      return;
+    }
+
+    const toolActivity = buildToolActivity(toolEventBuffer, language);
+    if (toolActivity) {
+      assistantSegments.push({
+        createdAt: toolEventBuffer[0].createdAt,
+        key: `tool-${toolEventBuffer[0].id}`,
+        sourceId: toolEventBuffer[0].id,
+        toolActivity,
+        type: 'tool_activity',
+      });
+    } else if (toolEventBuffer.length === 1) {
+      pushAssistantSegments();
+      merged.push(toolEventBuffer[0]);
+    } else {
+      pushAssistantSegments();
+      merged.push(createToolEventGroup(toolEventBuffer, language));
+    }
+
+    toolEventBuffer = [];
+  };
+
+  for (const message of normalizedMessages) {
+    if (isMergeableToolEvent(message)) {
+      toolEventBuffer.push(message);
+      continue;
+    }
+
+    if (message?.role === 'assistant') {
+      flushToolEventBuffer();
+
+      if (message.content) {
+        assistantSegments.push({
+          content: message.content,
+          createdAt: message.createdAt,
+          error: message.error,
+          key: `text-${message.id}`,
+          sourceId: message.id,
+          streaming: message.streaming,
+          type: 'text',
+        });
+      }
+
+      continue;
+    }
+
+    flushAssistantSegments();
+    merged.push(message);
+  }
+
+  flushAssistantSegments();
+
+  attachPendingApprovalsToRenderableMessages(merged, pendingApprovals);
+
+  if (sessionRunning) {
+    markTrailingAssistantMessageAsPending(merged);
+  }
+
+  return merged;
+}
+
+function normalizeRenderableToolMessages(messages, sessionRunning) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return [];
+  }
+
+  if (sessionRunning) {
+    return messages;
+  }
+
+  let mutated = false;
+  const normalizedMessages = messages.map((message) => {
+    if (!isMergeableToolEvent(message) || message?.status !== 'running') {
+      return message;
+    }
+
+    mutated = true;
+    return {
+      ...message,
+      status: 'stopped',
+    };
+  });
+
+  return mutated ? normalizedMessages : messages;
+}
+
+function createRenderableAssistantMessage(segments) {
+  const normalizedSegments = segments.map(({ sourceId, ...segment }) => segment);
+  const lastToolSegment = [...normalizedSegments].reverse().find((segment) => segment.type === 'tool_activity') || null;
+  const approvalSegments = normalizedSegments.filter((segment) => segment.type === 'approval');
+
+  return {
+    id: `assistant-group-${segments[0].sourceId}`,
+    role: 'assistant',
+    content: segments.length === 1 && segments[0].type === 'text' ? segments[0].content : '',
+    createdAt: segments[0].createdAt,
+    error: normalizedSegments.some((segment) => segment.type === 'text' && segment.error),
+    pendingThinking: false,
+    pendingApprovals: approvalSegments.map((segment) => segment.approval),
+    segments: normalizedSegments,
+    streaming: normalizedSegments.some((segment) => segment.type === 'text' && segment.streaming),
+    toolActivity: lastToolSegment?.toolActivity || null,
+  };
+}
+
+function attachPendingApprovalsToRenderableMessages(messages, pendingApprovals) {
+  if (!Array.isArray(pendingApprovals) || pendingApprovals.length === 0) {
+    return;
+  }
+
+  const approvalSegments = pendingApprovals
+    .filter(Boolean)
+    .sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime())
+    .map((approval) => ({
+      approval,
+      createdAt: approval.createdAt,
+      key: `approval-${approval.requestId}`,
+      sourceId: `approval-${approval.requestId}`,
+      type: 'approval',
+    }));
+
+  if (approvalSegments.length === 0) {
+    return;
+  }
+
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage?.role === 'assistant') {
+    const existingSegments = getAssistantSegments(lastMessage);
+    const nextSegments = [
+      ...existingSegments.filter((segment) => segment.type !== 'approval'),
+      ...approvalSegments.map(({ sourceId, ...segment }) => segment),
+    ];
+    messages[messages.length - 1] = {
+      ...lastMessage,
+      pendingApprovals: approvalSegments.map((segment) => segment.approval),
+      segments: nextSegments,
+    };
+    return;
+  }
+
+  messages.push(createRenderableAssistantMessage(approvalSegments));
+}
+
+function markTrailingAssistantMessageAsPending(messages) {
+  const lastUserIndex = findLastMessageIndex(messages, 'user');
+  if (lastUserIndex === -1) {
+    return;
+  }
+
+  for (let index = messages.length - 1; index > lastUserIndex; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'assistant') {
+      continue;
+    }
+
+    if (assistantMessageHasText(message)) {
+      return;
+    }
+
+    if (assistantMessageHasToolActivity(message)) {
+      message.pendingThinking = true;
+    }
+
+    return;
+  }
+}
+
+function mergeLegacyToolEvents(messages, language) {
   const merged = [];
   let toolEventBuffer = [];
 
@@ -1864,8 +2903,691 @@ function mergeRenderableMessages(messages, language) {
   return merged;
 }
 
-function isMergeableToolEvent(message) {
-  return message?.role === 'event' && ['mcp', 'skill', 'tool', 'tool_result'].includes(message.kind);
+function buildToolActivity(messages, language) {
+  const items = collectToolActivityItems(messages);
+  if (items.length === 0) {
+    return null;
+  }
+
+  return {
+    items: items.map((item) => ({
+      category: item.category,
+      key: item.key,
+      label: formatToolActivityItemLabel(item, language),
+      name: item.name,
+      status: item.status,
+      toolMeta: item.toolMeta || null,
+    })),
+    summaryParts: summarizeToolActivity(items, language),
+    summarySeparator: language === 'zh' ? '，' : ', ',
+  };
+}
+
+function collectToolActivityItems(messages) {
+  const order = [];
+  const latestByKey = new Map();
+
+  for (const message of messages) {
+    const item = normalizeToolActivityEvent(message);
+    if (!item) {
+      continue;
+    }
+
+    if (!latestByKey.has(item.key)) {
+      order.push(item.key);
+    }
+
+    const previousItem = latestByKey.get(item.key);
+    latestByKey.set(item.key, mergeToolActivityItems(previousItem, item));
+  }
+
+  return order.map((key) => latestByKey.get(key)).filter(Boolean);
+}
+
+function mergeToolActivityItems(previousItem, nextItem) {
+  if (!previousItem) {
+    return nextItem;
+  }
+
+  const mergedItem = {
+    ...nextItem,
+    toolMeta: nextItem.toolMeta || previousItem.toolMeta || null,
+  };
+
+  if (shouldPreservePreviousToolActivityLabel(previousItem, nextItem)) {
+    return {
+      ...mergedItem,
+      label: previousItem.label,
+    };
+  }
+
+  return mergedItem;
+}
+
+function shouldPreservePreviousToolActivityLabel(previousItem, nextItem) {
+  if (!previousItem?.label) {
+    return false;
+  }
+
+  if (!nextItem?.label) {
+    return true;
+  }
+
+  const previousCategory = previousItem.category || 'generic';
+  const nextCategory = nextItem.category || 'generic';
+  if (previousCategory !== nextCategory) {
+    return false;
+  }
+
+  return isGenericToolActivityDetail(nextCategory, nextItem.label) && !isGenericToolActivityDetail(previousCategory, previousItem.label);
+}
+
+function isGenericToolActivityDetail(category, label) {
+  const value = (label || '').trim();
+  if (!value) {
+    return true;
+  }
+
+  if (category === 'read') {
+    return /^Read file$/i.test(value);
+  }
+
+  if (category === 'browse') {
+    return /^Browsed files?$/i.test(value);
+  }
+
+  if (category === 'search') {
+    return /^Searched files?$/i.test(value);
+  }
+
+  if (category === 'command') {
+    return /^Run command$/i.test(value);
+  }
+
+  if (category === 'edit') {
+    return /^(Wrote|Edited|Updated) file$/i.test(value);
+  }
+
+  if (category === 'fetch') {
+    return /^Fetched webpage$/i.test(value);
+  }
+
+  if (category === 'todo') {
+    return /^Updated todo$/i.test(value);
+  }
+
+  if (category === 'mcp') {
+    return /^Called MCP$/i.test(value);
+  }
+
+  if (category === 'skill') {
+    return /^Used skill$/i.test(value);
+  }
+
+  return false;
+}
+
+function normalizeToolActivityEvent(message) {
+  if (!message) {
+    return null;
+  }
+
+  if (!message.toolUseId && message.kind === 'tool_result') {
+    return null;
+  }
+
+  const label = (message.toolLabel || message.content || message.title || '').trim();
+  if (!label) {
+    return null;
+  }
+
+  if (!message.toolUseId && /^[\[{]/.test(label)) {
+    return null;
+  }
+
+  return {
+    category: message.toolCategory || inferLegacyToolCategory(message),
+    key: message.toolUseId || message.id,
+    label,
+    name: (message.toolName || '').trim(),
+    status: message.status || (message.kind === 'tool_result' ? 'completed' : 'running'),
+    toolMeta: normalizeToolActivityMeta(message.toolMeta),
+  };
+}
+
+function normalizeToolActivityMeta(toolMeta) {
+  if (!toolMeta || typeof toolMeta !== 'object') {
+    return null;
+  }
+
+  if (toolMeta.type === 'edit') {
+    const filePath = typeof toolMeta.filePath === 'string' ? toolMeta.filePath : '';
+    const fileName = typeof toolMeta.fileName === 'string' ? toolMeta.fileName : '';
+    const addedLines = Number.isFinite(toolMeta.addedLines) && toolMeta.addedLines >= 0 ? toolMeta.addedLines : null;
+    const deletedLines = Number.isFinite(toolMeta.deletedLines) && toolMeta.deletedLines >= 0 ? toolMeta.deletedLines : null;
+
+    return {
+      addedLines,
+      deletedLines,
+      fileName,
+      filePath,
+      type: 'edit',
+    };
+  }
+
+  return null;
+}
+
+function inferLegacyToolCategory(message) {
+  const haystack = `${message?.title || ''} ${message?.content || ''}`.toLowerCase();
+
+  if (haystack.includes('read ')) {
+    return 'read';
+  }
+
+  if (haystack.includes('search')) {
+    return 'search';
+  }
+
+  if (haystack.includes('bash') || haystack.includes('git ') || haystack.includes('python ') || haystack.includes('command')) {
+    return 'command';
+  }
+
+  if (haystack.includes('edit ') || haystack.includes('write ')) {
+    return 'edit';
+  }
+
+  return 'generic';
+}
+
+function summarizeToolActivity(items, language) {
+  const summary = [];
+
+  for (const status of ['completed', 'running', 'stopped', 'error']) {
+    const counts = countToolActivityByCategory(items, status);
+    for (const [category, count] of counts) {
+      if (count === 1) {
+        const singleItem = items.find((item) => item.status === status && (item.category || 'generic') === category);
+        if (singleItem && shouldUseDetailedToolActivitySummary(singleItem)) {
+          summary.push({
+            key: `${status}-${category}-${singleItem.key}`,
+            label: formatDetailedToolActivitySummary(singleItem, language),
+            status,
+          });
+          continue;
+        }
+      }
+
+      summary.push({
+        key: `${status}-${category}-${count}`,
+        label: formatToolActivityPhrase(status, category, count, language),
+        status,
+      });
+    }
+  }
+
+  return summary;
+}
+
+function shouldUseDetailedToolActivitySummary(item) {
+  const category = item?.category || 'generic';
+  return item?.status === 'running' || category === 'skill' || category === 'mcp';
+}
+
+function formatDetailedToolActivitySummary(item, language) {
+  if (item.category === 'skill') {
+    const detail = normalizeNamedToolActivityDetail(item);
+    return formatNamedToolActivityText(
+      item.status,
+      language === 'zh' ? '正在使用 Skill' : 'Using skill',
+      language === 'zh' ? '已使用 Skill' : 'Used skill',
+      language === 'zh' ? '已停止使用 Skill' : 'Stopped using skill',
+      language === 'zh' ? 'Skill 执行失败' : 'Skill failed',
+      detail,
+    );
+  }
+
+  if (item.category === 'mcp') {
+    const detail = normalizeNamedToolActivityDetail(item);
+    return formatNamedToolActivityText(
+      item.status,
+      language === 'zh' ? '正在调用 MCP' : 'Calling MCP',
+      language === 'zh' ? '已调用 MCP' : 'Called MCP',
+      language === 'zh' ? '已停止调用 MCP' : 'Stopped calling MCP',
+      language === 'zh' ? 'MCP 调用失败' : 'MCP call failed',
+      detail,
+    );
+  }
+
+  return formatToolActivityItemLabel(item, language);
+}
+
+function normalizeNamedToolActivityDetail(item) {
+  if (item?.category === 'mcp') {
+    const normalizedName = normalizeMcpToolName(item.name);
+    if (normalizedName) {
+      return normalizedName;
+    }
+  }
+
+  return normalizeToolActivityLabel(item?.category, item?.label || '');
+}
+
+function normalizeMcpToolName(value) {
+  const normalized = (value || '').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (!normalized.startsWith('mcp__')) {
+    return normalized;
+  }
+
+  return normalized
+    .replace(/^mcp__/, '')
+    .split('__')
+    .filter(Boolean)
+    .join(' / ');
+}
+
+function formatNamedToolActivityText(status, runningPrefix, completedPrefix, stoppedPrefix, errorPrefix, detail) {
+  const prefix = status === 'running'
+    ? runningPrefix
+    : (status === 'completed'
+      ? completedPrefix
+      : (status === 'stopped' ? stoppedPrefix : errorPrefix));
+
+  return detail ? `${prefix} ${detail}` : prefix;
+}
+
+function countToolActivityByCategory(items, targetStatus) {
+  const orderedCategories = [];
+  const counts = new Map();
+
+  for (const item of items) {
+    if (item.status !== targetStatus) {
+      continue;
+    }
+
+    const category = item.category || 'generic';
+    if (category === 'edit') {
+      continue;
+    }
+
+    if (!counts.has(category)) {
+      orderedCategories.push(category);
+      counts.set(category, 0);
+    }
+    counts.set(category, counts.get(category) + 1);
+  }
+
+  return orderedCategories.map((category) => [category, counts.get(category)]);
+}
+
+function formatToolActivityPhrase(status, category, count, language) {
+  if (language === 'zh') {
+    return formatChineseToolActivityPhrase(status, category, count);
+  }
+
+  return formatEnglishToolActivityPhrase(status, category, count);
+}
+
+function formatChineseToolActivityPhrase(status, category, count) {
+  if (category === 'read') {
+    return formatChineseActivityLabel(status, count, '正在浏览文件', '已浏览文件', '已停止浏览文件', '浏览文件失败', '浏览', '个文件');
+  }
+
+  if (category === 'browse') {
+    return formatChineseActivityLabel(status, count, '正在浏览目录', '已浏览目录', '已停止浏览目录', '浏览目录失败', '浏览', '个目录');
+  }
+
+  if (category === 'search') {
+    return formatChineseActivityLabel(status, count, '正在执行搜索', '已执行搜索', '已停止执行搜索', '搜索失败', '执行', '个搜索');
+  }
+
+  if (category === 'command') {
+    return formatChineseActivityLabel(status, count, '正在运行命令', '已运行命令', '已停止运行命令', '命令运行失败', '运行', '条命令');
+  }
+
+  if (category === 'edit') {
+    return formatChineseActivityLabel(status, count, '正在编辑文件', '已编辑文件', '已停止编辑文件', '编辑文件失败', '编辑', '个文件');
+  }
+
+  if (category === 'fetch') {
+    return formatChineseActivityLabel(status, count, '正在获取网页', '已获取网页', '已停止获取网页', '获取网页失败', '获取', '个网页');
+  }
+
+  if (category === 'todo') {
+    return formatChineseActivityLabel(status, count, '正在更新待办', '已更新待办', '已停止更新待办', '待办更新失败', '更新', '项待办');
+  }
+
+  if (category === 'mcp') {
+    return formatChineseActivityLabel(status, count, '正在调用 MCP', '已调用 MCP', '已停止调用 MCP', 'MCP 调用失败', '调用', '个 MCP 调用');
+  }
+
+  if (category === 'skill') {
+    return formatChineseActivityLabel(status, count, '正在使用 Skill', '已使用 Skill', '已停止使用 Skill', 'Skill 执行失败', '使用', '个 Skill');
+  }
+
+  return formatChineseActivityLabel(status, count, '正在执行操作', '已执行操作', '已停止执行操作', '操作执行失败', '执行', '个操作');
+}
+
+function formatChineseActivityLabel(status, count, singularRunning, singularCompleted, singularStopped, singularError, pluralVerb, pluralUnit) {
+  if (status === 'running') {
+    if (count <= 1) {
+      return singularRunning;
+    }
+
+    return `正在${pluralVerb} ${count} ${pluralUnit}`;
+  }
+
+  if (status === 'completed') {
+    return `已${pluralVerb} ${count} ${pluralUnit}`;
+  }
+
+  if (status === 'stopped') {
+    if (count <= 1) {
+      return singularStopped;
+    }
+
+    return `已停止${pluralVerb} ${count} ${pluralUnit}`;
+  }
+
+  if (count <= 1) {
+    return singularError;
+  }
+
+  return `${count} ${pluralUnit}${pluralVerb}失败`;
+}
+
+function formatEnglishToolActivityPhrase(status, category, count) {
+  const labels = {
+    browse: {
+      completedMany: 'Browsed directories',
+      completedOne: 'Browsed directory',
+      error: 'Directory browse failed',
+      running: 'Browsing directory',
+      stoppedMany: 'Stopped browsing directories',
+      stoppedOne: 'Stopped browsing directory',
+    },
+    command: {
+      completedMany: 'Ran commands',
+      completedOne: 'Ran command',
+      error: 'Command failed',
+      running: 'Running command',
+      stoppedMany: 'Stopped commands',
+      stoppedOne: 'Stopped command',
+    },
+    edit: {
+      completedMany: 'Edited files',
+      completedOne: 'Edited file',
+      error: 'File edit failed',
+      running: 'Editing file',
+      stoppedMany: 'Stopped editing files',
+      stoppedOne: 'Stopped editing file',
+    },
+    fetch: {
+      completedMany: 'Fetched webpages',
+      completedOne: 'Fetched webpage',
+      error: 'Webpage fetch failed',
+      running: 'Fetching webpage',
+      stoppedMany: 'Stopped fetching webpages',
+      stoppedOne: 'Stopped fetching webpage',
+    },
+    generic: {
+      completedMany: 'Completed actions',
+      completedOne: 'Completed action',
+      error: 'Action failed',
+      running: 'Running action',
+      stoppedMany: 'Stopped actions',
+      stoppedOne: 'Stopped action',
+    },
+    mcp: {
+      completedMany: 'Called MCP tools',
+      completedOne: 'Called MCP',
+      error: 'MCP call failed',
+      running: 'Calling MCP',
+      stoppedMany: 'Stopped MCP calls',
+      stoppedOne: 'Stopped MCP call',
+    },
+    read: {
+      completedMany: 'Read files',
+      completedOne: 'Read file',
+      error: 'File read failed',
+      running: 'Reading file',
+      stoppedMany: 'Stopped reading files',
+      stoppedOne: 'Stopped reading file',
+    },
+    search: {
+      completedMany: 'Completed searches',
+      completedOne: 'Completed search',
+      error: 'Search failed',
+      running: 'Searching',
+      stoppedMany: 'Stopped searches',
+      stoppedOne: 'Stopped search',
+    },
+    skill: {
+      completedMany: 'Used skills',
+      completedOne: 'Used skill',
+      error: 'Skill failed',
+      running: 'Using skill',
+      stoppedMany: 'Stopped skills',
+      stoppedOne: 'Stopped skill',
+    },
+    todo: {
+      completedMany: 'Updated todos',
+      completedOne: 'Updated todo',
+      error: 'Todo update failed',
+      running: 'Updating todo',
+      stoppedMany: 'Stopped todo updates',
+      stoppedOne: 'Stopped todo update',
+    },
+  };
+  const copy = labels[category] || labels.generic;
+
+  if (status === 'running') {
+    if (count <= 1) {
+      return copy.running;
+    }
+
+    return `${copy.running} (${count})`;
+  }
+
+  if (status === 'completed') {
+    return count <= 1 ? `${copy.completedOne} (1)` : `${copy.completedMany} (${count})`;
+  }
+
+  if (status === 'stopped') {
+    return count <= 1 ? copy.stoppedOne : `${copy.stoppedMany} (${count})`;
+  }
+
+  if (count <= 1) {
+    return copy.error;
+  }
+
+  return `${copy.error} (${count})`;
+}
+
+function formatToolActivityItemLabel(item, language) {
+  if (language === 'zh') {
+    return formatChineseToolActivityItemLabel(item);
+  }
+
+  return formatEnglishToolActivityItemLabel(item);
+}
+
+function formatChineseToolActivityItemLabel(item) {
+  const detail = normalizeToolActivityLabel(item.category, item.label);
+
+  if (item.category === 'read') {
+    return formatToolActivityItemText(item.status, '正在浏览文件', '已浏览文件', '已停止浏览文件', '浏览文件失败', detail);
+  }
+
+  if (item.category === 'browse') {
+    return formatToolActivityItemText(item.status, '正在浏览目录', '已浏览目录', '已停止浏览目录', '浏览目录失败', detail);
+  }
+
+  if (item.category === 'search') {
+    return formatToolActivityItemText(item.status, '正在执行搜索', '已执行搜索', '已停止执行搜索', '搜索失败', detail);
+  }
+
+  if (item.category === 'command') {
+    return formatToolActivityItemText(item.status, '正在运行命令', '已运行命令', '已停止运行命令', '命令运行失败', detail);
+  }
+
+  if (item.category === 'edit') {
+    return formatToolActivityItemText(item.status, '正在编辑文件', '已编辑文件', '已停止编辑文件', '编辑文件失败', detail);
+  }
+
+  if (item.category === 'fetch') {
+    return formatToolActivityItemText(item.status, '正在获取网页', '已获取网页', '已停止获取网页', '获取网页失败', detail);
+  }
+
+  if (item.category === 'todo') {
+    return formatToolActivityItemText(item.status, '正在更新待办', '已更新待办', '已停止更新待办', '待办更新失败', detail);
+  }
+
+  if (item.category === 'mcp') {
+    return formatToolActivityItemText(item.status, '正在调用 MCP', '已调用 MCP', '已停止调用 MCP', 'MCP 调用失败', detail);
+  }
+
+  if (item.category === 'skill') {
+    return formatToolActivityItemText(item.status, '正在使用 Skill', '已使用 Skill', '已停止使用 Skill', 'Skill 执行失败', detail);
+  }
+
+  return formatToolActivityItemText(item.status, '正在执行操作', '已执行操作', '已停止执行操作', '操作执行失败', detail);
+}
+
+function formatEnglishToolActivityItemLabel(item) {
+  const detail = normalizeToolActivityLabel(item.category, item.label);
+
+  if (item.category === 'read') {
+    return formatToolActivityItemText(item.status, 'Reading file', 'Read file', 'Stopped reading file', 'File read failed', detail);
+  }
+
+  if (item.category === 'browse') {
+    return formatToolActivityItemText(item.status, 'Browsing directory', 'Browsed directory', 'Stopped browsing directory', 'Directory browse failed', detail);
+  }
+
+  if (item.category === 'search') {
+    return formatToolActivityItemText(item.status, 'Searching', 'Completed search', 'Stopped search', 'Search failed', detail);
+  }
+
+  if (item.category === 'command') {
+    return formatToolActivityItemText(item.status, 'Running command', 'Ran command', 'Stopped command', 'Command failed', detail);
+  }
+
+  if (item.category === 'edit') {
+    return formatToolActivityItemText(item.status, 'Editing file', 'Edited file', 'Stopped editing file', 'File edit failed', detail);
+  }
+
+  if (item.category === 'fetch') {
+    return formatToolActivityItemText(item.status, 'Fetching webpage', 'Fetched webpage', 'Stopped fetching webpage', 'Webpage fetch failed', detail);
+  }
+
+  if (item.category === 'todo') {
+    return formatToolActivityItemText(item.status, 'Updating todo', 'Updated todo', 'Stopped todo update', 'Todo update failed', detail);
+  }
+
+  if (item.category === 'mcp') {
+    return formatToolActivityItemText(item.status, 'Calling MCP', 'Called MCP', 'Stopped MCP call', 'MCP call failed', detail);
+  }
+
+  if (item.category === 'skill') {
+    return formatToolActivityItemText(item.status, 'Using skill', 'Used skill', 'Stopped skill', 'Skill failed', detail);
+  }
+
+  return formatToolActivityItemText(item.status, 'Running action', 'Completed action', 'Stopped action', 'Action failed', detail);
+}
+
+function formatToolActivityItemText(status, runningPrefix, completedPrefix, stoppedPrefix, errorPrefix, detail) {
+  const prefix = status === 'running'
+    ? runningPrefix
+    : (status === 'completed'
+      ? completedPrefix
+      : (status === 'stopped' ? stoppedPrefix : errorPrefix));
+
+  return detail ? `${prefix} ${detail}` : prefix;
+}
+
+function normalizeToolActivityLabel(category, label) {
+  const value = (label || '').trim();
+  if (!value) {
+    return '';
+  }
+
+  if (category === 'read') {
+    return value === 'Read file' ? '' : value.replace(/^Read\s+/i, '').trim();
+  }
+
+  if (category === 'browse') {
+    return value === 'Browsed files' ? '' : value.replace(/^Browsed\s+/i, '').trim();
+  }
+
+  if (category === 'search') {
+    return value === 'Searched files' ? '' : value.replace(/^Searched(?:\s+for)?\s+/i, '').trim();
+  }
+
+  if (category === 'edit') {
+    return /^(Wrote|Edited|Updated)\s+file$/i.test(value) ? '' : value.replace(/^(Wrote|Edited|Updated)\s+/i, '').trim();
+  }
+
+  if (category === 'fetch') {
+    return value === 'Fetched webpage' ? '' : value.replace(/^Fetched\s+/i, '').trim();
+  }
+
+  return value;
+}
+
+function formatPendingApprovalActionLabel(approval, language) {
+  const detail = formatPendingApprovalDetail(approval);
+  const category = approval?.category || 'generic';
+
+  if (language === 'zh') {
+    const prefixMap = {
+      browse: '浏览目录',
+      command: '运行命令',
+      edit: '编辑文件',
+      fetch: '获取网页',
+      generic: '执行操作',
+      mcp: '调用 MCP',
+      read: '浏览文件',
+      search: '执行搜索',
+      skill: '使用 Skill',
+      todo: '更新待办',
+    };
+
+    return detail ? `${prefixMap[category] || prefixMap.generic} ${detail}` : (prefixMap[category] || prefixMap.generic);
+  }
+
+  const prefixMap = {
+    browse: 'Browse directory',
+    command: 'Run command',
+    edit: 'Edit file',
+    fetch: 'Fetch webpage',
+    generic: 'Run action',
+    mcp: 'Call MCP',
+    read: 'Read file',
+    search: 'Run search',
+    skill: 'Use skill',
+    todo: 'Update todo',
+  };
+
+  return detail ? `${prefixMap[category] || prefixMap.generic} ${detail}` : (prefixMap[category] || prefixMap.generic);
+}
+
+function formatPendingApprovalDetail(approval) {
+  const blockedPath = (approval?.blockedPath || '').trim();
+  if (blockedPath) {
+    return blockedPath;
+  }
+
+  const detail = normalizeToolActivityLabel(approval?.category, approval?.detail || '');
+  if (detail) {
+    return detail;
+  }
+
+  return (approval?.displayName || approval?.title || approval?.toolName || '').trim();
 }
 
 function createToolEventGroup(messages, language) {
@@ -2034,6 +3756,85 @@ function getComposerModelOptions(copy, selectedModel, currentModel, availableCla
   ];
 }
 
+function getComposerSessionModeOptions(copy) {
+  return [
+    {
+      commandValue: 'ask',
+      icon: Hand,
+      label: copy.modeOptionAskBeforeEdits,
+      summary: copy.modeSummaryAskBeforeEdits,
+      value: 'default',
+    },
+    {
+      commandValue: 'auto',
+      icon: Pencil,
+      label: copy.modeOptionEditAutomatically,
+      summary: copy.modeSummaryEditAutomatically,
+      value: 'acceptEdits',
+    },
+    {
+      commandValue: 'plan',
+      icon: BrainCircuit,
+      label: copy.modeOptionPlanMode,
+      summary: copy.modeSummaryPlanMode,
+      value: 'plan',
+    },
+  ];
+}
+
+function getSessionModeLabel(permissionMode, copy) {
+  switch (permissionMode) {
+    case 'acceptEdits':
+      return copy.modeOptionEditAutomatically;
+    case 'plan':
+      return copy.modeOptionPlanMode;
+    case 'dontAsk':
+      return 'Don\'t Ask';
+    case 'bypassPermissions':
+      return 'Bypass Permissions';
+    case 'auto':
+      return 'Auto mode';
+    case 'default':
+    default:
+      return copy.modeOptionAskBeforeEdits;
+  }
+}
+
+function getSessionModeCommandValue(permissionMode) {
+  switch (permissionMode) {
+    case 'acceptEdits':
+      return 'auto';
+    case 'plan':
+      return 'plan';
+    case 'dontAsk':
+      return 'dont-ask';
+    case 'bypassPermissions':
+      return 'bypass';
+    case 'auto':
+      return 'auto-mode';
+    case 'default':
+    default:
+      return 'ask';
+  }
+}
+
+function getSessionModeIcon(permissionMode) {
+  switch (permissionMode) {
+    case 'acceptEdits':
+      return Pencil;
+    case 'plan':
+      return BrainCircuit;
+    case 'bypassPermissions':
+      return AlertTriangle;
+    case 'dontAsk':
+    case 'auto':
+      return Wrench;
+    case 'default':
+    default:
+      return Hand;
+  }
+}
+
 function getModelDisplayName(value, availableClaudeModels = []) {
   if (typeof value !== 'string') {
     return '';
@@ -2075,6 +3876,281 @@ function getModelDisplayName(value, availableClaudeModels = []) {
   }
 
   return value.trim();
+}
+
+function getMessageAttachments(message) {
+  return normalizeComposerAttachments(message?.attachments);
+}
+
+function mergeComposerAttachments(currentAttachments, nextAttachments) {
+  return normalizeComposerAttachments([...(currentAttachments || []), ...(nextAttachments || [])]);
+}
+
+function normalizeComposerAttachments(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return [];
+  }
+
+  const normalized = [];
+  const seenPaths = new Set();
+
+  for (const attachment of attachments) {
+    const normalizedAttachment = normalizeComposerAttachment(attachment);
+    if (!normalizedAttachment || seenPaths.has(normalizedAttachment.path)) {
+      continue;
+    }
+
+    seenPaths.add(normalizedAttachment.path);
+    normalized.push(normalizedAttachment);
+  }
+
+  return normalized;
+}
+
+function normalizeComposerAttachment(attachment) {
+  if (!attachment || typeof attachment !== 'object') {
+    return null;
+  }
+
+  const attachmentPath = typeof attachment.path === 'string' ? attachment.path.trim() : '';
+  if (!attachmentPath) {
+    return null;
+  }
+
+  const attachmentName = typeof attachment.name === 'string' && attachment.name.trim()
+    ? attachment.name.trim()
+    : getFileBaseName(attachmentPath);
+
+  return {
+    kind: normalizeComposerAttachmentKind(attachment.kind, attachmentPath),
+    name: attachmentName,
+    path: attachmentPath,
+  };
+}
+
+function normalizeComposerAttachmentKind(kind, attachmentPath) {
+  if (kind === 'image' || kind === 'file') {
+    return kind;
+  }
+
+  const extension = getFileExtension(attachmentPath);
+  return IMAGE_ATTACHMENT_EXTENSIONS.has(extension) ? 'image' : 'file';
+}
+
+function getClipboardFiles(clipboardData) {
+  if (!clipboardData) {
+    return [];
+  }
+
+  const files = [];
+  const seenKeys = new Set();
+
+  const appendFile = (file) => {
+    if (!(file instanceof File)) {
+      return;
+    }
+
+    const filePath = typeof file.path === 'string' ? file.path.trim() : '';
+    const key = [file.name, file.size, file.type, filePath].join('::');
+    if (seenKeys.has(key)) {
+      return;
+    }
+
+    seenKeys.add(key);
+    files.push(file);
+  };
+
+  if (clipboardData.files && clipboardData.files.length > 0) {
+    Array.from(clipboardData.files).forEach(appendFile);
+  }
+
+  if (clipboardData.items && clipboardData.items.length > 0) {
+    Array.from(clipboardData.items).forEach((item) => {
+      if (item.kind !== 'file') {
+        return;
+      }
+
+      const file = item.getAsFile();
+      appendFile(file);
+    });
+  }
+
+  return files;
+}
+
+async function createPastedAttachmentPayload(file) {
+  const attachmentKind = typeof file.type === 'string' && file.type.toLowerCase().startsWith('image/')
+    ? 'image'
+    : normalizeComposerAttachmentKind('', file.path || file.name || '');
+  const attachmentName = file.name || '';
+  const attachmentPath = typeof file.path === 'string' ? file.path.trim() : '';
+
+  if (attachmentPath) {
+    return {
+      kind: attachmentKind,
+      mimeType: file.type || '',
+      name: attachmentName || getFileBaseName(attachmentPath),
+      path: attachmentPath,
+    };
+  }
+
+  const dataBase64 = await readFileAsBase64(file);
+  return {
+    dataBase64,
+    kind: attachmentKind,
+    mimeType: file.type || '',
+    name: attachmentName || '',
+  };
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onerror = () => {
+      reject(reader.error || new Error('Failed to read pasted file.'));
+    };
+
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const base64 = result.includes(',') ? result.split(',').pop() : result;
+      resolve(base64 || '');
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
+function getFileBaseName(filePath) {
+  const normalizedPath = String(filePath || '').replace(/\\/g, '/');
+  return normalizedPath.split('/').filter(Boolean).pop() || normalizedPath;
+}
+
+function getFileExtension(filePath) {
+  const fileName = getFileBaseName(filePath);
+  const lastDotIndex = fileName.lastIndexOf('.');
+  return lastDotIndex >= 0 ? fileName.slice(lastDotIndex + 1).toLowerCase() : '';
+}
+
+function getMarkdownCopyText(copyShell) {
+  if (!(copyShell instanceof HTMLElement)) {
+    return '';
+  }
+
+  const copyKind = copyShell.getAttribute('data-copy-kind');
+  if (copyKind === 'table') {
+    return serializeMarkdownTableForCopy(copyShell.querySelector('table'));
+  }
+
+  const codeElement = copyShell.querySelector('pre code') || copyShell.querySelector('pre');
+  return typeof codeElement?.textContent === 'string' ? codeElement.textContent : '';
+}
+
+function serializeMarkdownTableForCopy(table) {
+  if (!(table instanceof HTMLTableElement)) {
+    return '';
+  }
+
+  return Array.from(table.querySelectorAll('tr'))
+    .map((row) => Array.from(row.querySelectorAll('th, td'))
+      .map((cell) => normalizeMarkdownCopyCell(cell.textContent || ''))
+      .join('\t'))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function normalizeMarkdownCopyCell(value) {
+  return value.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+async function copyTextToClipboard(text) {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  if (typeof document === 'undefined') {
+    throw new Error('Clipboard API unavailable.');
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textarea);
+
+  if (!copied) {
+    throw new Error('Clipboard API unavailable.');
+  }
+}
+
+function flashMarkdownCopyButton(button) {
+  if (!(button instanceof HTMLElement) || typeof window === 'undefined') {
+    return;
+  }
+
+  const defaultLabel = button.getAttribute('data-copy-default-label') || '';
+  const successLabel = button.getAttribute('data-copy-success-label') || defaultLabel;
+  const currentTimer = Number(button.dataset.copyResetTimer || 0);
+  if (currentTimer) {
+    window.clearTimeout(currentTimer);
+  }
+
+  button.setAttribute('aria-label', successLabel);
+  button.setAttribute('title', successLabel);
+  button.dataset.copyActive = 'true';
+
+  const timer = window.setTimeout(() => {
+    button.setAttribute('aria-label', defaultLabel);
+    button.setAttribute('title', defaultLabel);
+    delete button.dataset.copyActive;
+    delete button.dataset.copyResetTimer;
+  }, 1600);
+
+  button.dataset.copyResetTimer = String(timer);
+}
+
+function getComposerHistoryEntries(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return [];
+  }
+
+  const entries = [];
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const value = getComposerHistoryValue(messages[index]);
+    if (!value) {
+      continue;
+    }
+
+    entries.push(value);
+  }
+
+  return entries;
+}
+
+function getComposerHistoryValue(message) {
+  if (!message || typeof message !== 'object') {
+    return '';
+  }
+
+  if (message.role === 'user') {
+    return typeof message.content === 'string' ? message.content.trim() : '';
+  }
+
+  if (message.role === 'event' && message.kind === 'command') {
+    const title = typeof message.title === 'string' ? message.title.trim() : '';
+    return title || (typeof message.content === 'string' ? message.content.trim() : '');
+  }
+
+  return '';
 }
 
 function getSlashCommandQuery(value) {
@@ -2346,13 +4422,7 @@ function getInitialLanguage() {
 
 function formatClaudeStatusLabel(claude, language) {
   const copy = COPY[language];
-  const version = normalizeClaudeVersion(claude?.version);
-
-  if (claude?.available) {
-    return version ? `${copy.claudeCode} · ${version}` : copy.claudeCode;
-  }
-
-  return version ? `${copy.claudeCodeUnavailable} · ${version}` : copy.claudeCodeUnavailable;
+  return claude?.available ? copy.claudeCode : copy.claudeCodeUnavailable;
 }
 
 function normalizeClaudeVersion(value) {
@@ -2366,7 +4436,7 @@ function normalizeClaudeVersion(value) {
     .trim();
 }
 
-function shouldRenderRunIndicator(session, isSending) {
+function shouldRenderRunIndicator(session, renderableMessages, isSending) {
   if (!session) {
     return false;
   }
@@ -2375,12 +4445,32 @@ function shouldRenderRunIndicator(session, isSending) {
     return false;
   }
 
-  const lastUserIndex = findLastMessageIndex(session.messages, 'user');
+  const messages = Array.isArray(renderableMessages) && renderableMessages.length > 0
+    ? renderableMessages
+    : session.messages;
+  const lastUserIndex = findLastMessageIndex(messages, 'user');
   if (lastUserIndex === -1) {
     return isSending;
   }
 
-  return !session.messages.some((message, index) => index > lastUserIndex && message.role === 'assistant');
+  const trailingMessages = messages.slice(lastUserIndex + 1);
+  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasText(message))) {
+    return false;
+  }
+
+  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasRunningToolActivity(message))) {
+    return false;
+  }
+
+  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasToolActivity(message))) {
+    return false;
+  }
+
+  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasPendingApproval(message))) {
+    return false;
+  }
+
+  return true;
 }
 
 function findLastMessageIndex(messages, role) {

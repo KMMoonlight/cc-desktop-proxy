@@ -3,16 +3,29 @@ const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { fileURLToPath } = require('url');
 
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 
 const CONFIG_FILE_NAME = 'claude-desktop-config.json';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const EMPTY_ASSISTANT_TEXT = '（本轮没有收到可展示的文本输出）';
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
 const SAVE_DEBOUNCE_MS = 160;
 const CLAUDE_CHECK_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
+const WORKSPACE_GIT_INFO_TTL_MS = 3_000;
+const PASTED_ATTACHMENT_DIR_NAME = 'pasted-attachments';
+const SESSION_PERMISSION_MODES = new Set([
+  'acceptEdits',
+  'auto',
+  'bypassPermissions',
+  'default',
+  'dontAsk',
+  'plan',
+]);
+
+const workspaceGitInfoCache = new Map();
 
 const BUILTIN_TOOL_NAMES = new Set([
   'Task',
@@ -36,6 +49,42 @@ const BUILTIN_TOOL_NAMES = new Set([
   'Skill',
   'Agent',
 ]);
+
+const IMAGE_FILE_EXTENSIONS = new Set([
+  '.apng',
+  '.avif',
+  '.bmp',
+  '.gif',
+  '.heic',
+  '.heif',
+  '.jpeg',
+  '.jpg',
+  '.png',
+  '.svg',
+  '.tif',
+  '.tiff',
+  '.webp',
+]);
+
+const MIME_TYPE_TO_EXTENSION = {
+  'application/json': '.json',
+  'application/pdf': '.pdf',
+  'image/apng': '.apng',
+  'image/avif': '.avif',
+  'image/bmp': '.bmp',
+  'image/gif': '.gif',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/svg+xml': '.svg',
+  'image/tiff': '.tiff',
+  'image/webp': '.webp',
+  'text/csv': '.csv',
+  'text/html': '.html',
+  'text/markdown': '.md',
+  'text/plain': '.txt',
+};
 
 class ClaudeDesktopRuntime {
   constructor() {
@@ -61,6 +110,12 @@ class ClaudeDesktopRuntime {
     }
 
     ipcMain.handle('desktop:get-app-state', () => this.getAppState());
+    ipcMain.handle('desktop:open-link', (_event, href) => this.openLink(href));
+    ipcMain.handle('desktop:prepare-pasted-attachments', (_event, payload) => this.preparePastedAttachments(payload));
+    ipcMain.handle('desktop:pick-attachments', (event) => {
+      const browserWindow = BrowserWindow.fromWebContents(event.sender);
+      return this.pickAttachments(browserWindow);
+    });
     ipcMain.handle('desktop:pick-workspace', (event) => {
       const browserWindow = BrowserWindow.fromWebContents(event.sender);
       return this.pickWorkspaceDirectory(browserWindow);
@@ -81,10 +136,14 @@ class ClaudeDesktopRuntime {
     ipcMain.handle('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId));
     ipcMain.handle('desktop:select-session', (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId));
     ipcMain.handle('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
+    ipcMain.handle('desktop:respond-to-approval', (event, payload) => this.respondToApproval(event.sender, payload));
     ipcMain.handle('desktop:send-message', (event, payload) => this.sendMessage(event.sender, payload));
     ipcMain.handle('desktop:stop-run', (event) => this.stopRun(event.sender));
     ipcMain.handle('desktop:update-session-model', (_event, payload) => (
       this.updateSessionModel(payload?.workspaceId, payload?.sessionId, payload?.model)
+    ));
+    ipcMain.handle('desktop:update-session-permission-mode', (_event, payload) => (
+      this.updateSessionPermissionMode(payload?.workspaceId, payload?.sessionId, payload?.permissionMode)
     ));
 
     this.handlersRegistered = true;
@@ -131,14 +190,95 @@ class ClaudeDesktopRuntime {
     return result.filePaths[0];
   }
 
+  async pickAttachments(browserWindow) {
+    const result = await dialog.showOpenDialog(browserWindow, {
+      buttonLabel: '选择附件',
+      defaultPath: this.getSelectedWorkspace()?.path || this.defaultPickerPath,
+      properties: ['openFile', 'multiSelections'],
+      title: '选择要附加的文件或图片',
+    });
+
+    if (result.canceled || !result.filePaths.length) {
+      return [];
+    }
+
+    return normalizeMessageAttachments(result.filePaths, { verifyExists: true });
+  }
+
+  async preparePastedAttachments(payload) {
+    const entries = Array.isArray(payload?.attachments) ? payload.attachments : [];
+    const attachments = [];
+
+    for (const entry of entries) {
+      const attachment = this.preparePastedAttachment(entry);
+      if (attachment) {
+        attachments.push(attachment);
+      }
+    }
+
+    return normalizeMessageAttachments(attachments, { verifyExists: true });
+  }
+
+  preparePastedAttachment(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return null;
+    }
+
+    if (typeof entry.path === 'string' && entry.path.trim()) {
+      return {
+        kind: normalizeAttachmentKind(entry.kind, entry.path),
+        name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : path.basename(entry.path.trim()),
+        path: entry.path.trim(),
+      };
+    }
+
+    if (typeof entry.dataBase64 !== 'string' || !entry.dataBase64.trim()) {
+      return null;
+    }
+
+    const targetDirectory = path.join(app.getPath('userData'), PASTED_ATTACHMENT_DIR_NAME);
+    fs.mkdirSync(targetDirectory, { recursive: true });
+
+    const fileName = createPastedAttachmentFileName(entry);
+    const targetPath = path.join(targetDirectory, fileName);
+    fs.writeFileSync(targetPath, Buffer.from(entry.dataBase64, 'base64'));
+
+    return {
+      kind: normalizeAttachmentKind(entry.kind, targetPath),
+      name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : fileName,
+      path: targetPath,
+    };
+  }
+
+  async openLink(rawHref) {
+    const href = typeof rawHref === 'string' ? rawHref.trim() : '';
+    if (!href || href === '#') {
+      return { ok: false };
+    }
+
+    const localPath = resolveLinkToLocalPath(href);
+    if (localPath) {
+      const errorMessage = await shell.openPath(localPath);
+      if (errorMessage) {
+        throw new Error(errorMessage);
+      }
+
+      return { ok: true, target: 'path' };
+    }
+
+    await shell.openExternal(href);
+    return { ok: true, target: 'external' };
+  }
+
   addWorkspace(rawWorkspacePath) {
     const workspacePath = this.resolveWorkspacePath(rawWorkspacePath);
     this.assertDirectory(workspacePath);
 
     const existingWorkspace = this.store.workspaces.find((workspace) => workspace.path === workspacePath);
     if (existingWorkspace) {
+      const ensuredSession = ensureWorkspaceHasVisibleSession(existingWorkspace);
       this.store.selectedWorkspaceId = existingWorkspace.id;
-      this.store.selectedSessionId = getLatestVisibleSession(existingWorkspace)?.id || null;
+      this.store.selectedSessionId = ensuredSession?.id || getLatestVisibleSession(existingWorkspace)?.id || null;
       this.touchWorkspace(existingWorkspace);
       this.scheduleSave();
       return this.getAppState();
@@ -146,6 +286,7 @@ class ClaudeDesktopRuntime {
 
     const now = new Date().toISOString();
     const workspace = {
+      approvalRules: [],
       createdAt: now,
       id: randomUUID(),
       name: path.basename(workspacePath) || workspacePath,
@@ -154,9 +295,12 @@ class ClaudeDesktopRuntime {
       updatedAt: now,
     };
 
+    const session = createWorkspaceSession(now);
+    workspace.sessions.unshift(session);
+
     this.store.workspaces.push(workspace);
     this.store.selectedWorkspaceId = workspace.id;
-    this.store.selectedSessionId = null;
+    this.store.selectedSessionId = session.id;
     this.scheduleSave();
 
     return this.getAppState();
@@ -169,18 +313,7 @@ class ClaudeDesktopRuntime {
     }
 
     const now = new Date().toISOString();
-    const session = {
-      claudeSessionId: null,
-      currentModel: '',
-      createdAt: now,
-      archived: false,
-      id: randomUUID(),
-      messages: [],
-      model: '',
-      status: 'idle',
-      title: `新对话 ${formatShortTime(now)}`,
-      updatedAt: now,
-    };
+    const session = createWorkspaceSession(now);
 
     workspace.sessions.unshift(session);
     this.touchWorkspace(workspace, now);
@@ -312,6 +445,30 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  updateSessionPermissionMode(workspaceId, sessionId, permissionMode) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const session = workspace.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+      throw new Error('找不到对应的历史对话。');
+    }
+
+    const nextPermissionMode = normalizeSessionPermissionMode(permissionMode);
+    const now = new Date().toISOString();
+
+    session.permissionMode = nextPermissionMode;
+    session.updatedAt = now;
+    this.touchWorkspace(workspace, now);
+    this.store.selectedWorkspaceId = workspace.id;
+    this.store.selectedSessionId = session.id;
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
   runMcpCommand(workspaceId, sessionId, rawArgs) {
     const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
     const args = tokenizeCliArgs(rawArgs);
@@ -420,7 +577,9 @@ class ClaudeDesktopRuntime {
     }
 
     const prompt = typeof payload?.prompt === 'string' ? payload.prompt.trim() : '';
-    if (!prompt) {
+    const attachments = normalizeMessageAttachments(payload?.attachments, { verifyExists: true });
+    const claudePrompt = buildPromptWithAttachments(prompt, attachments);
+    if (!claudePrompt) {
       throw new Error('消息内容不能为空。');
     }
     const displayPrompt = typeof payload?.displayPrompt === 'string' && payload.displayPrompt.trim()
@@ -457,22 +616,43 @@ class ClaudeDesktopRuntime {
         title: displayTitle,
       })
       : createStoredMessage({
+        attachments,
         content: displayPrompt,
         createdAt: now,
         role: 'user',
       });
     runState.assistantMessageId = null;
     runState.currentAssistantText = '';
+    runState.hasStreamedAssistantText = false;
     runState.stderrBuffer = '';
     runState.seenToolResultIds.clear();
     runState.seenToolUseIds.clear();
+    runState.toolUses.clear();
+    runState.resultIsError = false;
+    runState.resultReceived = false;
     runState.sessionId = session.id;
     runState.workspaceId = workspace.id;
 
-    const args = ['-p', '--output-format', 'stream-json', '--include-partial-messages', '--verbose'];
+    const args = [
+      '-p',
+      '--input-format',
+      'stream-json',
+      '--output-format',
+      'stream-json',
+      '--include-partial-messages',
+      '--replay-user-messages',
+      '--permission-prompt-tool',
+      'stdio',
+      '--verbose',
+    ];
+    const extraAttachmentDirs = collectAttachmentDirectories(workspace.path, attachments);
+    if (extraAttachmentDirs.length > 0) {
+      args.push('--add-dir', ...extraAttachmentDirs);
+    }
     if (session.model) {
       args.push('--model', session.model);
     }
+    args.push('--permission-mode', normalizeSessionPermissionMode(session.permissionMode));
 
     if (session.claudeSessionId) {
       args.push('--resume', session.claudeSessionId);
@@ -489,7 +669,7 @@ class ClaudeDesktopRuntime {
     session.model = session.model || '';
 
     if (isDefaultSessionTitle(session.title) && countInputMessages(session.messages) === 1) {
-      session.title = createSessionTitleFromPrompt(displayPrompt);
+      session.title = createSessionTitleFromPrompt(displayPrompt || formatAttachmentTitle(attachments));
     }
 
     runState.process = proc;
@@ -518,6 +698,8 @@ class ClaudeDesktopRuntime {
       runState.stderrBuffer = truncateText(`${runState.stderrBuffer}${text}`, STDERR_BUFFER_LIMIT);
     });
 
+    proc.stdin.on('error', () => {});
+
     proc.on('close', (code) => {
       if (buffer.trim()) {
         this.processLine(webContents, buffer);
@@ -525,8 +707,9 @@ class ClaudeDesktopRuntime {
 
       const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
       if (sessionRef) {
+        finalizeRunningToolMessages(sessionRef.session, code === 0 ? 'completed' : 'error');
         let assistant = this.getAssistantMessage(sessionRef.session, runState);
-        if (!assistant && code === 0 && !this.hasRecentErrorEvent(sessionRef.session)) {
+        if (!assistant && code === 0 && !this.hasRecentErrorEvent(sessionRef.session) && !runState.hasStreamedAssistantText) {
           assistant = this.ensureAssistantMessage(sessionRef.session, runState, new Date().toISOString());
           assistant.content = EMPTY_ASSISTANT_TEXT;
         }
@@ -547,19 +730,26 @@ class ClaudeDesktopRuntime {
           });
         }
 
-        sessionRef.session.status = code === 0 ? 'idle' : 'error';
+        sessionRef.session.status = runState.resultReceived
+          ? (runState.resultIsError ? 'error' : 'idle')
+          : (code === 0 ? 'idle' : 'error');
         sessionRef.session.updatedAt = new Date().toISOString();
         this.touchWorkspace(sessionRef.workspace, sessionRef.session.updatedAt);
       }
 
       runState.assistantMessageId = null;
       runState.currentAssistantText = '';
+      runState.hasStreamedAssistantText = false;
       runState.process = null;
       runState.sessionId = null;
       runState.workspaceId = null;
       runState.stderrBuffer = '';
       runState.seenToolResultIds.clear();
       runState.seenToolUseIds.clear();
+      runState.toolUses.clear();
+      runState.pendingApprovalRequests.clear();
+      runState.resultIsError = false;
+      runState.resultReceived = false;
 
       this.scheduleSave();
       this.emitState(webContents);
@@ -568,6 +758,7 @@ class ClaudeDesktopRuntime {
     proc.on('error', (error) => {
       const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
       if (sessionRef) {
+        finalizeRunningToolMessages(sessionRef.session, 'error');
         this.appendEventMessage(sessionRef.workspace, sessionRef.session, {
           kind: 'error',
           status: 'error',
@@ -589,21 +780,66 @@ class ClaudeDesktopRuntime {
 
       runState.assistantMessageId = null;
       runState.currentAssistantText = '';
+      runState.hasStreamedAssistantText = false;
       runState.process = null;
       runState.sessionId = null;
       runState.workspaceId = null;
       runState.stderrBuffer = '';
       runState.seenToolResultIds.clear();
       runState.seenToolUseIds.clear();
+      runState.toolUses.clear();
+      runState.pendingApprovalRequests.clear();
+      runState.resultIsError = false;
+      runState.resultReceived = false;
 
       this.scheduleSave();
       this.emitState(webContents);
     });
 
-    proc.stdin.write(prompt);
-    proc.stdin.end();
+    writeJsonLine(proc.stdin, createStreamJsonUserMessage(claudePrompt, session.claudeSessionId));
 
     return { ok: true };
+  }
+
+  respondToApproval(webContents, payload) {
+    const runState = this.getRunState(webContents.id);
+    const requestId = typeof payload?.requestId === 'string' ? payload.requestId.trim() : '';
+    const decision = typeof payload?.decision === 'string' ? payload.decision.trim().toLowerCase() : '';
+
+    if (!runState.process) {
+      throw new Error('当前没有正在运行的 Claude 任务。');
+    }
+
+    if (!requestId) {
+      throw new Error('缺少审批请求 ID。');
+    }
+
+    if (decision !== 'allow' && decision !== 'allow_always' && decision !== 'deny') {
+      throw new Error('无效的审批结果。');
+    }
+
+    const pendingApproval = runState.pendingApprovalRequests.get(requestId);
+    if (!pendingApproval) {
+      throw new Error('找不到对应的审批请求。');
+    }
+
+    if (decision === 'allow_always') {
+      const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
+      if (sessionRef) {
+        addWorkspaceApprovalRule(sessionRef.workspace, createApprovalRuleFromPendingApproval(pendingApproval));
+        this.touchWorkspace(sessionRef.workspace);
+        this.scheduleSave();
+      }
+    }
+
+    writeJsonLine(
+      runState.process.stdin,
+      createApprovalControlResponse(pendingApproval, decision === 'allow_always' ? 'allow' : decision),
+    );
+
+    runState.pendingApprovalRequests.delete(requestId);
+    this.emitState(webContents);
+    return this.getAppState();
   }
 
   stopRun(webContents) {
@@ -621,6 +857,7 @@ class ClaudeDesktopRuntime {
         assistant.content = assistant.content || '（运行已停止）';
       }
 
+      finalizeRunningToolMessages(sessionRef.session, 'stopped');
       sessionRef.session.status = 'idle';
       sessionRef.session.updatedAt = new Date().toISOString();
       this.touchWorkspace(sessionRef.workspace, sessionRef.session.updatedAt);
@@ -632,9 +869,14 @@ class ClaudeDesktopRuntime {
     runState.sessionId = null;
     runState.assistantMessageId = null;
     runState.currentAssistantText = '';
+    runState.hasStreamedAssistantText = false;
     runState.stderrBuffer = '';
     runState.seenToolUseIds.clear();
     runState.seenToolResultIds.clear();
+    runState.toolUses.clear();
+    runState.pendingApprovalRequests.clear();
+    runState.resultIsError = false;
+    runState.resultReceived = false;
 
     this.scheduleSave();
     this.emitState(webContents);
@@ -653,10 +895,14 @@ class ClaudeDesktopRuntime {
           assistant.streaming = false;
           assistant.content = assistant.content || '（应用关闭时本轮运行被终止）';
         }
+        finalizeRunningToolMessages(sessionRef.session, 'stopped');
         sessionRef.session.status = 'idle';
       }
 
       runState.process.kill('SIGTERM');
+    }
+    if (runState) {
+      runState.pendingApprovalRequests.clear();
     }
     this.windowRuns.delete(contentsId);
   }
@@ -687,12 +933,12 @@ class ClaudeDesktopRuntime {
       return;
     }
 
-    this.handleClaudeEvent(sessionRef.workspace, sessionRef.session, runState, event);
+    this.handleClaudeEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
     this.scheduleSave();
     this.emitState(webContents);
   }
 
-  handleClaudeEvent(workspace, session, runState, event) {
+  handleClaudeEvent(webContents, workspace, session, runState, event) {
     const now = new Date().toISOString();
 
     if (event.session_id && event.session_id !== session.claudeSessionId) {
@@ -706,34 +952,46 @@ class ClaudeDesktopRuntime {
     }
 
     if (event.type === 'stream_event') {
-      this.handleStreamEvent(workspace, session, runState, event.event);
+      this.handleStreamEvent(webContents, workspace, session, runState, event.event);
       return;
     }
 
     if (event.type === 'assistant') {
-      this.handleAssistantEvent(workspace, session, runState, event);
+      this.handleAssistantEvent(webContents, workspace, session, runState, event);
+      return;
+    }
+
+    if (event.type === 'control_request') {
+      this.handleControlRequest(webContents, workspace, session, runState, event);
       return;
     }
 
     if (event.type === 'user') {
-      this.handleUserEvent(workspace, session, runState, event);
+      this.handleUserEvent(webContents, workspace, session, runState, event);
       return;
     }
 
     if (event.type === 'result') {
+      const shouldUseResultText = !runState.hasStreamedAssistantText;
       const assistant = this.getAssistantMessage(session, runState)
-        || (!event.is_error
+        || (!event.is_error && shouldUseResultText && event.result
           ? this.ensureAssistantMessage(session, runState, now)
           : null);
       if (assistant) {
         assistant.streaming = false;
-        assistant.content = event.result || assistant.content || EMPTY_ASSISTANT_TEXT;
+        assistant.content = shouldUseResultText
+          ? (event.result || assistant.content)
+          : assistant.content;
         assistant.error = Boolean(event.is_error);
       }
 
-      session.status = event.is_error ? 'error' : 'idle';
+      runState.resultIsError = Boolean(event.is_error);
+      runState.resultReceived = true;
+      session.status = event.is_error ? 'error' : session.status;
       session.updatedAt = now;
       this.touchWorkspace(workspace, now);
+      runState.pendingApprovalRequests.clear();
+      closeClaudeInput(runState.process);
 
       if (event.is_error) {
         this.appendEventMessage(workspace, session, {
@@ -770,7 +1028,7 @@ class ClaudeDesktopRuntime {
     }
   }
 
-  handleStreamEvent(workspace, session, runState, streamEvent) {
+  handleStreamEvent(webContents, workspace, session, runState, streamEvent) {
     if (!streamEvent?.type) {
       return;
     }
@@ -780,10 +1038,12 @@ class ClaudeDesktopRuntime {
 
       if (block?.type === 'tool_use') {
         this.emitToolUse(workspace, session, runState, block);
+        this.emitState(webContents);
         return;
       }
 
       if (block?.type === 'text' && block.text) {
+        runState.hasStreamedAssistantText = true;
         this.updateAssistantMessage(session, runState, block.text, false);
       }
       return;
@@ -791,6 +1051,7 @@ class ClaudeDesktopRuntime {
 
     if (streamEvent.type === 'content_block_delta') {
       if (streamEvent.delta?.type === 'text_delta' && streamEvent.delta.text) {
+        runState.hasStreamedAssistantText = true;
         runState.currentAssistantText += streamEvent.delta.text;
         this.updateAssistantMessage(session, runState, runState.currentAssistantText, false);
         return;
@@ -798,22 +1059,24 @@ class ClaudeDesktopRuntime {
     }
   }
 
-  handleAssistantEvent(workspace, session, runState, event) {
+  handleAssistantEvent(webContents, workspace, session, runState, event) {
     const content = Array.isArray(event.message?.content) ? event.message.content : [];
 
     for (const block of content) {
       if (block.type === 'tool_use') {
-        this.emitToolUse(workspace, session, runState, block);
+        if (this.emitToolUse(workspace, session, runState, block)) {
+          this.emitState(webContents);
+        }
       }
     }
 
     const assistantText = extractTextBlocks(content);
-    if (assistantText) {
+    if (assistantText && !runState.hasStreamedAssistantText) {
       this.updateAssistantMessage(session, runState, assistantText, event.message?.stop_reason === 'end_turn');
     }
   }
 
-  handleUserEvent(workspace, session, runState, event) {
+  handleUserEvent(webContents, workspace, session, runState, event) {
     const content = Array.isArray(event.message?.content) ? event.message.content : [];
 
     for (const block of content) {
@@ -826,34 +1089,141 @@ class ClaudeDesktopRuntime {
       }
 
       runState.seenToolResultIds.add(block.tool_use_id);
+      const toolUse = runState.toolUses.get(block.tool_use_id) || describeToolUse('', null);
 
       this.appendEventMessage(workspace, session, {
-        kind: 'tool_result',
+        kind: toolUse.kind,
         status: block.is_error ? 'error' : 'completed',
-        title: block.is_error ? '工具执行失败' : '工具结果已返回',
-        content: summarizeToolResult(block, event.tool_use_result),
+        title: block.is_error ? toolUse.errorTitle : toolUse.completedTitle,
+        content: toolUse.detail,
+        toolCategory: toolUse.category,
+        toolLabel: toolUse.detail,
+        toolMeta: toolUse.toolMeta || null,
+        toolName: toolUse.name,
+        toolUseId: block.tool_use_id,
       });
+
+      clearPendingApprovalByToolUseId(runState, block.tool_use_id);
+      runState.toolUses.delete(block.tool_use_id);
+      this.emitState(webContents);
     }
   }
 
-  emitToolUse(workspace, session, runState, block) {
-    if (!block?.id || runState.seenToolUseIds.has(block.id)) {
+  handleControlRequest(webContents, workspace, session, runState, event) {
+    const request = event?.request;
+    if (!request || request.subtype !== 'can_use_tool') {
       return;
+    }
+
+    const requestId = typeof event.request_id === 'string' ? event.request_id.trim() : '';
+    if (!requestId) {
+      return;
+    }
+
+    const toolUse = describeToolUse(request.tool_name, request.input);
+    const now = new Date().toISOString();
+    const approvalInput = request.input && typeof request.input === 'object' ? request.input : {};
+    const approvalCategory = inferApprovalCategory({
+      category: toolUse.category,
+      display_name: typeof request.display_name === 'string' ? request.display_name : '',
+      input: approvalInput,
+      title: typeof request.title === 'string' ? request.title : '',
+      tool_name: typeof request.tool_name === 'string' ? request.tool_name : '',
+    });
+
+    const pendingApproval = {
+      blockedPath: typeof request.blocked_path === 'string' ? request.blocked_path : '',
+      category: approvalCategory,
+      createdAt: now,
+      decisionReason: typeof request.decision_reason === 'string' ? request.decision_reason : '',
+      description: typeof request.description === 'string' ? request.description : '',
+      detail: toolUse.detail,
+      displayName: typeof request.display_name === 'string' ? request.display_name : '',
+      input: approvalInput,
+      requestId,
+      title: typeof request.title === 'string' ? request.title : '',
+      toolName: typeof request.tool_name === 'string' ? request.tool_name : '',
+      toolUseId: typeof request.tool_use_id === 'string' ? request.tool_use_id : '',
+    };
+
+    if (workspaceHasMatchingApprovalRule(workspace, pendingApproval)) {
+      writeJsonLine(
+        runState.process.stdin,
+        createApprovalControlResponse(pendingApproval, 'allow'),
+      );
+      return;
+    }
+
+    runState.pendingApprovalRequests.set(requestId, pendingApproval);
+
+    session.updatedAt = now;
+    this.touchWorkspace(workspace, now);
+    this.emitState(webContents);
+  }
+
+  emitToolUse(workspace, session, runState, block) {
+    if (!block?.id) {
+      return false;
+    }
+
+    const toolUse = describeToolUse(block.name, block.input);
+    if (toolUse.kind === 'agent') {
+      return false;
+    }
+
+    if (runState.seenToolUseIds.has(block.id)) {
+      return this.refreshToolUse(session, runState, block.id, toolUse);
     }
 
     runState.seenToolUseIds.add(block.id);
-
-    const toolClassification = classifyTool(block.name);
-    if (toolClassification.kind === 'agent') {
-      return;
-    }
+    this.finalizeAssistantSegment(session, runState);
+    runState.toolUses.set(block.id, toolUse);
 
     this.appendEventMessage(workspace, session, {
-      kind: toolClassification.kind,
+      kind: toolUse.kind,
       status: 'running',
-      title: toolClassification.title,
-      content: summarizeToolInput(block.name, block.input),
+      title: toolUse.runningTitle,
+      content: toolUse.detail,
+      toolCategory: toolUse.category,
+      toolLabel: toolUse.detail,
+      toolMeta: toolUse.toolMeta || null,
+      toolName: toolUse.name,
+      toolUseId: block.id,
     });
+
+    return true;
+  }
+
+  refreshToolUse(session, runState, toolUseId, toolUse) {
+    const previousToolUse = runState.toolUses.get(toolUseId);
+    if (areToolUseSummariesEqual(previousToolUse, toolUse)) {
+      return false;
+    }
+
+    runState.toolUses.set(toolUseId, toolUse);
+
+    let updated = false;
+    for (const message of session.messages) {
+      if (message?.role !== 'event' || message.toolUseId !== toolUseId || message.status !== 'running') {
+        continue;
+      }
+
+      message.kind = toolUse.kind;
+      message.title = toolUse.runningTitle;
+      message.content = toolUse.detail;
+      message.toolCategory = toolUse.category;
+      message.toolLabel = toolUse.detail;
+      message.toolMeta = toolUse.toolMeta || null;
+      message.toolName = toolUse.name;
+      updated = true;
+    }
+
+    if (!updated) {
+      return false;
+    }
+
+    session.updatedAt = new Date().toISOString();
+    return true;
   }
 
   updateAssistantMessage(session, runState, text, isFinal) {
@@ -867,6 +1237,22 @@ class ClaudeDesktopRuntime {
     assistant.streaming = !isFinal;
     assistant.error = false;
     session.updatedAt = new Date().toISOString();
+  }
+
+  finalizeAssistantSegment(session, runState) {
+    const assistant = this.getAssistantMessage(session, runState);
+    if (!assistant) {
+      return;
+    }
+
+    if (!assistant.content) {
+      session.messages = session.messages.filter((message) => message.id !== assistant.id);
+    } else {
+      assistant.streaming = false;
+    }
+
+    runState.assistantMessageId = null;
+    runState.currentAssistantText = '';
   }
 
   getAssistantMessage(session, runState) {
@@ -900,6 +1286,7 @@ class ClaudeDesktopRuntime {
     const lastMessage = session.messages[session.messages.length - 1];
 
     if (
+      !partial.toolUseId &&
       lastMessage &&
       lastMessage.role === 'event' &&
       lastMessage.kind === partial.kind &&
@@ -922,11 +1309,16 @@ class ClaudeDesktopRuntime {
       this.windowRuns.set(contentsId, {
         assistantMessageId: null,
         currentAssistantText: '',
+        hasStreamedAssistantText: false,
         process: null,
         seenToolResultIds: new Set(),
         seenToolUseIds: new Set(),
         sessionId: null,
         stderrBuffer: '',
+        toolUses: new Map(),
+        pendingApprovalRequests: new Map(),
+        resultIsError: false,
+        resultReceived: false,
         workspaceId: null,
       });
     }
@@ -1038,7 +1430,8 @@ class ClaudeDesktopRuntime {
 
       if (parsed?.workspaceDir) {
         const migratedPath = this.resolveWorkspacePath(parsed.workspaceDir);
-        const migratedWorkspace = {
+      const migratedWorkspace = {
+          approvalRules: [],
           createdAt: new Date().toISOString(),
           id: randomUUID(),
           name: path.basename(migratedPath) || migratedPath,
@@ -1149,6 +1542,7 @@ function normalizeWorkspace(workspace) {
   const updatedAt = workspace.updatedAt || createdAt;
 
   return {
+    approvalRules: normalizeWorkspaceApprovalRules(workspace.approvalRules),
     createdAt,
     id: workspace.id || randomUUID(),
     name: workspace.name || path.basename(workspace.path || '') || '未命名目录',
@@ -1167,6 +1561,10 @@ function normalizeSession(session) {
 
   const createdAt = session.createdAt || new Date().toISOString();
   const updatedAt = session.updatedAt || createdAt;
+  const normalizedMessages = Array.isArray(session.messages)
+    ? session.messages.map((message) => normalizeMessage(message)).filter(Boolean)
+    : [];
+  const normalizedStatus = session.status === 'running' ? 'idle' : (session.status || 'idle');
 
   return {
     archived: Boolean(session.archived),
@@ -1174,13 +1572,58 @@ function normalizeSession(session) {
     currentModel: session.currentModel || session.model || '',
     createdAt,
     id: session.id || randomUUID(),
-    messages: Array.isArray(session.messages)
-      ? session.messages.map((message) => normalizeMessage(message)).filter(Boolean)
-      : [],
+    messages: normalizeStaleRunningEventMessages(normalizedMessages),
     model: session.model || '',
-    status: session.status === 'running' ? 'idle' : (session.status || 'idle'),
+    permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    status: normalizedStatus,
     title: session.title || `新对话 ${formatShortTime(createdAt)}`,
     updatedAt,
+  };
+}
+
+function normalizeWorkspaceApprovalRules(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return [];
+  }
+
+  const rules = [];
+  const seenKeys = new Set();
+
+  for (const entry of value) {
+    const rule = normalizeWorkspaceApprovalRule(entry);
+    if (!rule || seenKeys.has(rule.key)) {
+      continue;
+    }
+
+    seenKeys.add(rule.key);
+    rules.push(rule);
+  }
+
+  return rules;
+}
+
+function normalizeWorkspaceApprovalRule(rule) {
+  if (!rule || typeof rule !== 'object') {
+    return null;
+  }
+
+  const kind = typeof rule.kind === 'string' ? rule.kind.trim() : '';
+  if (kind !== 'command') {
+    return null;
+  }
+
+  const command = normalizeApprovalCommand(getToolInputString(rule.input, ['command', 'cmd']) || rule.command);
+  if (!command) {
+    return null;
+  }
+
+  return {
+    command,
+    createdAt: rule.createdAt || new Date().toISOString(),
+    input: rule.input && typeof rule.input === 'object' ? rule.input : { command },
+    key: `command:${command}`,
+    kind: 'command',
+    toolName: typeof rule.toolName === 'string' && rule.toolName.trim() ? rule.toolName.trim() : 'Bash',
   };
 }
 
@@ -1190,6 +1633,7 @@ function normalizeMessage(message) {
   }
 
   return {
+    attachments: normalizeMessageAttachments(message.attachments),
     content: typeof message.content === 'string' ? message.content : '',
     createdAt: message.createdAt || new Date().toISOString(),
     error: Boolean(message.error),
@@ -1199,10 +1643,165 @@ function normalizeMessage(message) {
     status: message.status || null,
     streaming: false,
     title: message.title || '',
+    toolCategory: typeof message.toolCategory === 'string' ? message.toolCategory : '',
+    toolLabel: typeof message.toolLabel === 'string' ? message.toolLabel : '',
+    toolMeta: normalizeToolMeta(message.toolMeta),
+    toolName: typeof message.toolName === 'string' ? message.toolName : '',
+    toolUseId: typeof message.toolUseId === 'string' ? message.toolUseId : '',
   };
 }
 
+function normalizeStaleRunningEventMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return [];
+  }
+
+  return messages.map((message) => {
+    if (message?.role !== 'event' || message.status !== 'running') {
+      return message;
+    }
+
+    return {
+      ...message,
+      status: 'stopped',
+      title: getStoppedToolTitle(message),
+    };
+  });
+}
+
+function normalizeToolMeta(toolMeta) {
+  if (!toolMeta || typeof toolMeta !== 'object') {
+    return null;
+  }
+
+  if (toolMeta.type === 'edit') {
+    const filePath = typeof toolMeta.filePath === 'string' ? toolMeta.filePath : '';
+    const fileNameSource = typeof toolMeta.fileName === 'string' ? toolMeta.fileName : '';
+    const fileName = fileNameSource || (filePath ? path.basename(filePath) : '');
+
+    return {
+      addedLines: normalizeLineCount(toolMeta.addedLines),
+      deletedLines: normalizeLineCount(toolMeta.deletedLines),
+      fileName,
+      filePath,
+      type: 'edit',
+    };
+  }
+
+  return null;
+}
+
+function normalizeSessionPermissionMode(value) {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  return SESSION_PERMISSION_MODES.has(normalized) ? normalized : 'default';
+}
+
+function normalizeLineCount(value) {
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+}
+
+function normalizeMessageAttachments(value, options = {}) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return [];
+  }
+
+  const normalized = [];
+  const seenPaths = new Set();
+
+  for (const entry of value) {
+    const attachment = normalizeMessageAttachment(entry, options);
+    if (!attachment || seenPaths.has(attachment.path)) {
+      continue;
+    }
+
+    seenPaths.add(attachment.path);
+    normalized.push(attachment);
+  }
+
+  return normalized;
+}
+
+function normalizeMessageAttachment(entry, options = {}) {
+  const verifyExists = Boolean(options.verifyExists);
+  const rawPath = typeof entry === 'string'
+    ? entry
+    : (typeof entry?.path === 'string' ? entry.path : '');
+
+  const trimmedPath = rawPath.trim();
+  if (!trimmedPath) {
+    return null;
+  }
+
+  const resolvedPath = path.resolve(trimmedPath);
+  if (verifyExists) {
+    try {
+      const stats = fs.statSync(resolvedPath);
+      if (!stats.isFile()) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const name = typeof entry?.name === 'string' && entry.name.trim()
+    ? entry.name.trim()
+    : path.basename(resolvedPath);
+  const kind = normalizeAttachmentKind(entry?.kind, resolvedPath);
+
+  return {
+    kind,
+    name,
+    path: resolvedPath,
+  };
+}
+
+function normalizeAttachmentKind(kind, filePath) {
+  if (kind === 'image' || kind === 'file') {
+    return kind;
+  }
+
+  const extension = path.extname(filePath || '').toLowerCase();
+  return IMAGE_FILE_EXTENSIONS.has(extension) ? 'image' : 'file';
+}
+
+function createPastedAttachmentFileName(entry) {
+  const extension = getPastedAttachmentExtension(entry);
+  const rawName = typeof entry?.name === 'string' ? entry.name.trim() : '';
+  const nameWithoutExtension = rawName
+    ? path.basename(rawName, path.extname(rawName))
+    : (entry?.kind === 'image' ? 'pasted-image' : 'pasted-file');
+  const safeBaseName = sanitizeAttachmentBaseName(nameWithoutExtension) || (entry?.kind === 'image' ? 'pasted-image' : 'pasted-file');
+  return `${safeBaseName}-${Date.now()}-${randomUUID().slice(0, 8)}${extension}`;
+}
+
+function getPastedAttachmentExtension(entry) {
+  const rawName = typeof entry?.name === 'string' ? entry.name.trim() : '';
+  const nameExtension = path.extname(rawName || '');
+  if (nameExtension) {
+    return nameExtension.toLowerCase();
+  }
+
+  const mimeType = typeof entry?.mimeType === 'string' ? entry.mimeType.trim().toLowerCase() : '';
+  const extensionFromMime = MIME_TYPE_TO_EXTENSION[mimeType];
+  if (extensionFromMime) {
+    return extensionFromMime;
+  }
+
+  return entry?.kind === 'image' ? '.png' : '.bin';
+}
+
+function sanitizeAttachmentBaseName(value) {
+  return String(value || '')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 48);
+}
+
 function serializeWorkspace(workspace, activeRun) {
+  const gitInfo = getWorkspaceGitInfo(workspace.path);
   const sessionMetas = workspace.sessions
     .filter((session) => !session.archived)
     .slice()
@@ -1212,6 +1811,8 @@ function serializeWorkspace(workspace, activeRun) {
   return {
     createdAt: workspace.createdAt,
     exists: directoryExists(workspace.path),
+    gitBranch: gitInfo?.branch || '',
+    gitRoot: gitInfo?.root || '',
     id: workspace.id,
     name: workspace.name,
     path: workspace.path,
@@ -1221,6 +1822,14 @@ function serializeWorkspace(workspace, activeRun) {
 }
 
 function serializeSession(workspace, session, activeRun) {
+  const pendingApprovals = activeRun
+    && activeRun.workspaceId === workspace.id
+    && activeRun.sessionId === session.id
+      ? Array.from(activeRun.pendingApprovalRequests.values())
+        .map((approval) => serializePendingApproval(approval))
+        .filter(Boolean)
+      : [];
+
   return {
     archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId,
@@ -1235,7 +1844,9 @@ function serializeSession(workspace, session, activeRun) {
     ),
     messages: session.messages,
     model: session.model,
+    pendingApprovals,
     path: workspace.path,
+    permissionMode: normalizeSessionPermissionMode(session.permissionMode),
     status: session.status,
     title: session.title,
     updatedAt: session.updatedAt,
@@ -1259,7 +1870,8 @@ function serializeSessionMeta(workspace, session, activeRun) {
       activeRun.process,
     ),
     messageCount: session.messages.filter((message) => message.role !== 'event').length,
-    preview: previewSource ? truncateText(previewSource.content, 80) : '还没有消息',
+    permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    preview: previewSource ? (truncateText(getMessagePreviewText(previewSource), 80) || '还没有消息') : '还没有消息',
     status: session.status,
     title: session.title,
     updatedAt: session.updatedAt,
@@ -1275,6 +1887,153 @@ function createStoredMessage(partial) {
     role: 'assistant',
     streaming: false,
     ...partial,
+  };
+}
+
+function createWorkspaceSession(createdAt = new Date().toISOString()) {
+  return {
+    claudeSessionId: null,
+    currentModel: '',
+    createdAt,
+    archived: false,
+    id: randomUUID(),
+    messages: [],
+    model: '',
+    permissionMode: 'default',
+    status: 'idle',
+    title: `新对话 ${formatShortTime(createdAt)}`,
+    updatedAt: createdAt,
+  };
+}
+
+function ensureWorkspaceHasVisibleSession(workspace) {
+  if (!workspace || !Array.isArray(workspace.sessions)) {
+    return null;
+  }
+
+  const latestVisibleSession = getLatestVisibleSession(workspace);
+  if (latestVisibleSession) {
+    return latestVisibleSession;
+  }
+
+  const session = createWorkspaceSession();
+  workspace.sessions.unshift(session);
+  return session;
+}
+
+function createApprovalRuleFromPendingApproval(approval) {
+  if (!approval || inferApprovalCategory(approval) !== 'command') {
+    return null;
+  }
+
+  const command = normalizeApprovalCommand(getToolInputString(approval.input, ['command', 'cmd']));
+  if (!command) {
+    return null;
+  }
+
+  return {
+    command,
+    createdAt: new Date().toISOString(),
+    input: approval.input && typeof approval.input === 'object' ? approval.input : { command },
+    key: `command:${command}`,
+    kind: 'command',
+    toolName: typeof approval.toolName === 'string' && approval.toolName.trim() ? approval.toolName.trim() : 'Bash',
+  };
+}
+
+function addWorkspaceApprovalRule(workspace, rule) {
+  if (!workspace || !rule) {
+    return false;
+  }
+
+  const existingRules = normalizeWorkspaceApprovalRules(workspace.approvalRules);
+  if (existingRules.some((entry) => entry.key === rule.key)) {
+    workspace.approvalRules = existingRules;
+    return false;
+  }
+
+  workspace.approvalRules = [...existingRules, rule];
+  return true;
+}
+
+function workspaceHasMatchingApprovalRule(workspace, approval) {
+  if (!workspace || !approval || inferApprovalCategory(approval) !== 'command') {
+    return false;
+  }
+
+  const command = normalizeApprovalCommand(getToolInputString(approval.input, ['command', 'cmd']));
+  if (!command) {
+    return false;
+  }
+
+  const targetKey = `command:${command}`;
+  const rules = normalizeWorkspaceApprovalRules(workspace.approvalRules);
+  if (rules.length !== (Array.isArray(workspace.approvalRules) ? workspace.approvalRules.length : 0)) {
+    workspace.approvalRules = rules;
+  }
+
+  return rules.some((rule) => rule.key === targetKey);
+}
+
+function normalizeApprovalCommand(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function inferApprovalCategory(approval) {
+  if (!approval || typeof approval !== 'object') {
+    return 'generic';
+  }
+
+  const explicitCategory = typeof approval.category === 'string'
+    ? approval.category.trim().toLowerCase()
+    : '';
+
+  if (explicitCategory && explicitCategory !== 'generic') {
+    return explicitCategory;
+  }
+
+  const command = normalizeApprovalCommand(getToolInputString(approval.input, ['command', 'cmd']));
+  if (command) {
+    return 'command';
+  }
+
+  const text = [
+    approval.toolName,
+    approval.tool_name,
+    approval.displayName,
+    approval.display_name,
+    approval.title,
+  ]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join(' ')
+    .toLowerCase();
+
+  if (/\bbash\b|\bshell\b|\bcommand\b/.test(text)) {
+    return 'command';
+  }
+
+  return explicitCategory || 'generic';
+}
+
+function serializePendingApproval(approval) {
+  if (!approval || typeof approval !== 'object') {
+    return null;
+  }
+
+  return {
+    blockedPath: typeof approval.blockedPath === 'string' ? approval.blockedPath : '',
+    category: inferApprovalCategory(approval),
+    createdAt: approval.createdAt || new Date().toISOString(),
+    decisionReason: typeof approval.decisionReason === 'string' ? approval.decisionReason : '',
+    description: typeof approval.description === 'string' ? approval.description : '',
+    detail: typeof approval.detail === 'string' ? approval.detail : '',
+    displayName: typeof approval.displayName === 'string' ? approval.displayName : '',
+    requestId: typeof approval.requestId === 'string' ? approval.requestId : '',
+    title: typeof approval.title === 'string' ? approval.title : '',
+    toolName: typeof approval.toolName === 'string' ? approval.toolName : '',
+    toolUseId: typeof approval.toolUseId === 'string' ? approval.toolUseId : '',
   };
 }
 
@@ -1296,6 +2055,252 @@ function createSessionTitleFromPrompt(prompt) {
   return truncateText(sanitized, 26) || `新对话 ${formatShortTime(new Date().toISOString())}`;
 }
 
+function formatAttachmentTitle(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return '';
+  }
+
+  const names = attachments
+    .map((attachment) => attachment?.name || path.basename(attachment?.path || ''))
+    .filter(Boolean)
+    .slice(0, 2);
+
+  if (names.length === 0) {
+    return '';
+  }
+
+  if (attachments.length > names.length) {
+    names.push(`+${attachments.length - names.length}`);
+  }
+
+  return names.join(' ');
+}
+
+function collectAttachmentDirectories(workspacePath, attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return [];
+  }
+
+  const directories = new Set();
+  for (const attachment of attachments) {
+    if (!attachment?.path) {
+      continue;
+    }
+
+    if (isPathWithin(workspacePath, attachment.path)) {
+      continue;
+    }
+
+    directories.add(path.dirname(attachment.path));
+  }
+
+  return Array.from(directories);
+}
+
+function isPathWithin(basePath, candidatePath) {
+  const relativePath = path.relative(path.resolve(basePath), path.resolve(candidatePath));
+  return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function resolveLinkToLocalPath(href) {
+  if (typeof href !== 'string' || !href) {
+    return '';
+  }
+
+  if (href.startsWith('file://')) {
+    try {
+      return fileURLToPath(href);
+    } catch {
+      return '';
+    }
+  }
+
+  if (!path.isAbsolute(href)) {
+    return '';
+  }
+
+  return stripPathHashAndQuery(href);
+}
+
+function stripPathHashAndQuery(value) {
+  const hashIndex = value.indexOf('#');
+  const queryIndex = value.indexOf('?');
+  const endIndexCandidates = [hashIndex, queryIndex].filter((index) => index >= 0);
+  const endIndex = endIndexCandidates.length > 0 ? Math.min(...endIndexCandidates) : value.length;
+  return value.slice(0, endIndex);
+}
+
+function buildPromptWithAttachments(prompt, attachments) {
+  const trimmedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return trimmedPrompt;
+  }
+
+  const fileReferences = attachments
+    .filter((attachment) => attachment.kind !== 'image')
+    .map((attachment) => `@${attachment.path}`);
+  const imageReferences = attachments
+    .filter((attachment) => attachment.kind === 'image')
+    .map((attachment) => attachment.path);
+  const sections = [];
+
+  if (fileReferences.length > 0) {
+    sections.push(`Attached files:\n${fileReferences.join('\n')}`);
+  }
+
+  if (imageReferences.length > 0) {
+    sections.push(`Attached images:\n${imageReferences.join('\n')}`);
+  }
+
+  sections.push(`User request:\n${trimmedPrompt || 'Please inspect the attached files and images and help me with them.'}`);
+  return sections.join('\n\n').trim();
+}
+
+function createStreamJsonUserMessage(prompt, sessionId) {
+  return {
+    message: {
+      content: prompt,
+      role: 'user',
+    },
+    parent_tool_use_id: null,
+    session_id: typeof sessionId === 'string' ? sessionId : '',
+    type: 'user',
+  };
+}
+
+function createApprovalControlResponse(approval, decision) {
+  const toolUseId = typeof approval?.toolUseId === 'string' && approval.toolUseId
+    ? approval.toolUseId
+    : undefined;
+
+  const response = decision === 'allow'
+    ? {
+      behavior: 'allow',
+      ...(toolUseId ? { toolUseID: toolUseId } : {}),
+      updatedInput: approval?.input && typeof approval.input === 'object' ? approval.input : {},
+    }
+    : {
+      behavior: 'deny',
+      message: 'User denied approval.',
+      ...(toolUseId ? { toolUseID: toolUseId } : {}),
+    };
+
+  return {
+    response: {
+      request_id: approval?.requestId || '',
+      response,
+      subtype: 'success',
+    },
+    type: 'control_response',
+  };
+}
+
+function writeJsonLine(stream, payload) {
+  if (!stream || stream.destroyed || typeof stream.write !== 'function' || stream.writableEnded) {
+    throw new Error('Claude 输入流已关闭。');
+  }
+
+  stream.write(`${JSON.stringify(payload)}\n`);
+}
+
+function closeClaudeInput(proc) {
+  const input = proc?.stdin;
+  if (!input || input.destroyed || input.writableEnded || typeof input.end !== 'function') {
+    return;
+  }
+
+  try {
+    input.end();
+  } catch {
+    // Ignore teardown races when Claude exits on its own.
+  }
+}
+
+function finalizeRunningToolMessages(session, finalStatus = 'stopped') {
+  if (!session || !Array.isArray(session.messages)) {
+    return false;
+  }
+
+  let updated = false;
+  for (const message of session.messages) {
+    if (message?.role !== 'event' || message.status !== 'running') {
+      continue;
+    }
+
+    message.status = finalStatus;
+    if (finalStatus === 'stopped') {
+      message.title = getStoppedToolTitle(message);
+    }
+    updated = true;
+  }
+
+  if (updated) {
+    session.updatedAt = new Date().toISOString();
+  }
+
+  return updated;
+}
+
+function getStoppedToolTitle(message) {
+  const category = message?.toolCategory || inferLegacyToolCategory(message);
+
+  if (category === 'read') {
+    return '已停止浏览文件';
+  }
+
+  if (category === 'browse') {
+    return '已停止浏览目录';
+  }
+
+  if (category === 'search') {
+    return '已停止执行搜索';
+  }
+
+  if (category === 'command') {
+    return '已停止运行命令';
+  }
+
+  if (category === 'edit') {
+    return '已停止编辑文件';
+  }
+
+  if (category === 'fetch') {
+    return '已停止获取网页';
+  }
+
+  if (category === 'todo') {
+    return '已停止更新待办';
+  }
+
+  if (category === 'mcp') {
+    return '已停止调用 MCP';
+  }
+
+  if (category === 'skill') {
+    return '已停止使用 Skill';
+  }
+
+  return '已停止执行操作';
+}
+
+function clearPendingApprovalByToolUseId(runState, toolUseId) {
+  if (!runState?.pendingApprovalRequests || !toolUseId) {
+    return false;
+  }
+
+  let deleted = false;
+  for (const [requestId, approval] of runState.pendingApprovalRequests.entries()) {
+    if (approval?.toolUseId !== toolUseId) {
+      continue;
+    }
+
+    runState.pendingApprovalRequests.delete(requestId);
+    deleted = true;
+  }
+
+  return deleted;
+}
+
 function isDefaultSessionTitle(title) {
   return typeof title === 'string' && title.startsWith('新对话 ');
 }
@@ -1315,27 +2320,23 @@ function classifyTool(name) {
   if (name === 'Skill') {
     return {
       kind: 'skill',
-      title: '正在使用 Skill',
     };
   }
 
   if (name === 'Agent' || name === 'Task') {
     return {
       kind: 'agent',
-      title: '正在启动子代理',
     };
   }
 
   if (typeof name === 'string' && (name.startsWith('mcp__') || (!BUILTIN_TOOL_NAMES.has(name) && name.includes('__')))) {
     return {
       kind: 'mcp',
-      title: `正在调用 MCP ${name}`,
     };
   }
 
   return {
     kind: 'tool',
-    title: `正在调用 ${name}`,
   };
 }
 
@@ -1346,47 +2347,342 @@ function extractTextBlocks(content) {
     .join('');
 }
 
-function summarizeToolInput(name, input) {
-  if (!input) {
-    return 'Claude 已发起工具调用。';
+function describeToolUse(name, input) {
+  const classification = classifyTool(name);
+
+  if (name === 'Read') {
+    return {
+      category: 'read',
+      completedTitle: '已浏览文件',
+      detail: formatReadToolDetail(input),
+      errorTitle: '浏览文件失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在浏览文件',
+    };
   }
 
-  if (name === 'Bash' && input.command) {
-    return truncateText(input.command, 1200);
+  if (name === 'Glob' || name === 'LS') {
+    return {
+      category: 'browse',
+      completedTitle: '已浏览目录',
+      detail: formatBrowseToolDetail(input),
+      errorTitle: '浏览目录失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在浏览目录',
+    };
   }
 
-  if ((name === 'Agent' || name === 'Task') && (input.description || input.prompt)) {
-    return truncateText(input.description || input.prompt, 800);
+  if (name === 'Grep' || name === 'WebSearch') {
+    return {
+      category: 'search',
+      completedTitle: '已执行搜索',
+      detail: name === 'WebSearch' ? formatWebSearchToolDetail(input) : formatSearchToolDetail(input),
+      errorTitle: '搜索失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在执行搜索',
+    };
   }
 
-  if (name === 'Skill') {
-    return truncateText(input.skill_name || input.command || stringifyValue(input), 800);
+  if (name === 'Bash') {
+    return {
+      category: 'command',
+      completedTitle: '已运行命令',
+      detail: formatCommandToolDetail(input),
+      errorTitle: '命令运行失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在运行命令',
+    };
   }
 
-  return truncateText(stringifyValue(input), 1200);
+  if (name === 'Edit' || name === 'Write' || name === 'NotebookEdit') {
+    return {
+      category: 'edit',
+      completedTitle: '已编辑文件',
+      detail: formatEditToolDetail(name, input),
+      errorTitle: '编辑文件失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在编辑文件',
+      toolMeta: createEditToolMeta(name, input),
+    };
+  }
+
+  if (name === 'WebFetch') {
+    return {
+      category: 'fetch',
+      completedTitle: '已获取网页',
+      detail: formatWebFetchToolDetail(input),
+      errorTitle: '获取网页失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在获取网页',
+    };
+  }
+
+  if (name === 'TodoWrite') {
+    return {
+      category: 'todo',
+      completedTitle: '已更新待办',
+      detail: 'Updated todo list',
+      errorTitle: '更新待办失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在更新待办',
+    };
+  }
+
+  if (classification.kind === 'skill') {
+    return {
+      category: 'skill',
+      completedTitle: '已使用 Skill',
+      detail: formatSkillToolDetail(input),
+      errorTitle: 'Skill 执行失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在使用 Skill',
+    };
+  }
+
+  if (classification.kind === 'mcp') {
+    return {
+      category: 'mcp',
+      completedTitle: '已调用 MCP',
+      detail: formatMcpToolDetail(name, input),
+      errorTitle: 'MCP 调用失败',
+      kind: classification.kind,
+      name,
+      runningTitle: '正在调用 MCP',
+    };
+  }
+
+  return {
+    category: 'generic',
+    completedTitle: '已执行操作',
+    detail: formatGenericToolDetail(name, input),
+    errorTitle: '操作执行失败',
+    kind: classification.kind,
+    name,
+    runningTitle: '正在执行操作',
+  };
 }
 
-function summarizeToolResult(block, toolUseResult) {
-  if (toolUseResult?.stdout) {
-    return truncateText(toolUseResult.stdout, 1600);
+function formatReadToolDetail(input) {
+  const filePath = getToolInputString(input, ['file_path', 'path']);
+  return filePath ? `Read ${truncateText(filePath, 180)}` : 'Read file';
+}
+
+function formatBrowseToolDetail(input) {
+  const pattern = getToolInputString(input, ['pattern', 'glob']);
+  const directory = getToolInputString(input, ['path']);
+
+  if (pattern && directory) {
+    return `Browsed ${truncateText(`${directory}/${pattern}`, 180)}`;
   }
 
-  if (toolUseResult?.stderr) {
-    return truncateText(toolUseResult.stderr, 1600);
+  if (pattern) {
+    return `Browsed ${truncateText(pattern, 180)}`;
   }
 
-  if (Array.isArray(block.content)) {
-    const firstText = block.content.find((item) => item.type === 'text' && item.text);
-    if (firstText?.text) {
-      return truncateText(firstText.text, 1600);
+  if (directory) {
+    return `Browsed ${truncateText(directory, 180)}`;
+  }
+
+  return 'Browsed files';
+}
+
+function formatSearchToolDetail(input) {
+  const pattern = getToolInputString(input, ['pattern', 'query']);
+  const target = getToolInputString(input, ['include', 'glob', 'path']);
+
+  if (pattern && target) {
+    return `Searched for ${truncateText(pattern, 96)} in ${truncateText(target, 96)}`;
+  }
+
+  if (pattern) {
+    return `Searched for ${truncateText(pattern, 160)}`;
+  }
+
+  if (target) {
+    return `Searched ${truncateText(target, 160)}`;
+  }
+
+  return 'Searched files';
+}
+
+function formatCommandToolDetail(input) {
+  const command = getToolInputString(input, ['command', 'cmd']);
+  if (command) {
+    return truncateText(command, 220);
+  }
+
+  const description = getToolInputString(input, ['description', 'prompt']);
+  return description ? truncateText(description, 220) : 'Run command';
+}
+
+function formatEditToolDetail(name, input) {
+  const filePath = getToolInputString(input, ['file_path', 'path']);
+  const verb = name === 'Write' ? 'Wrote' : (name === 'NotebookEdit' ? 'Updated' : 'Edited');
+  return filePath ? `${verb} ${truncateText(filePath, 180)}` : `${verb} file`;
+}
+
+function createEditToolMeta(name, input) {
+  const filePath = getToolInputString(input, ['file_path', 'path']);
+  const fileName = filePath ? path.basename(filePath) : '';
+
+  if (!filePath) {
+    return null;
+  }
+
+  if (name === 'Write') {
+    const content = getToolInputText(input, ['content']);
+    return {
+      addedLines: countTextLines(content),
+      deletedLines: 0,
+      fileName,
+      filePath,
+      type: 'edit',
+    };
+  }
+
+  const oldText = getToolInputText(input, ['old_string', 'old_content', 'old_source', 'old_text']);
+  const newText = getToolInputText(input, ['new_string', 'new_content', 'new_source', 'new_text', 'content']);
+  const addedLines = countTextLines(newText);
+  const deletedLines = countTextLines(oldText);
+
+  return {
+    addedLines,
+    deletedLines,
+    fileName,
+    filePath,
+    type: 'edit',
+  };
+}
+
+function formatWebFetchToolDetail(input) {
+  const url = getToolInputString(input, ['url']);
+  return url ? `Fetched ${truncateText(url, 180)}` : 'Fetched webpage';
+}
+
+function formatWebSearchToolDetail(input) {
+  const query = getToolInputString(input, ['query', 'prompt']);
+  return query ? `Searched web for ${truncateText(query, 180)}` : 'Searched the web';
+}
+
+function formatSkillToolDetail(input) {
+  const skillName = getToolInputString(input, ['skill', 'skill_name', 'command', 'name']);
+  return skillName ? truncateText(skillName, 180) : 'Skill';
+}
+
+function areToolUseSummariesEqual(previousToolUse, nextToolUse) {
+  if (!previousToolUse || !nextToolUse) {
+    return false;
+  }
+
+  return previousToolUse.category === nextToolUse.category
+    && previousToolUse.completedTitle === nextToolUse.completedTitle
+    && previousToolUse.detail === nextToolUse.detail
+    && previousToolUse.errorTitle === nextToolUse.errorTitle
+    && previousToolUse.kind === nextToolUse.kind
+    && previousToolUse.name === nextToolUse.name
+    && previousToolUse.runningTitle === nextToolUse.runningTitle
+    && areToolMetaEqual(previousToolUse.toolMeta, nextToolUse.toolMeta);
+}
+
+function areToolMetaEqual(previousToolMeta, nextToolMeta) {
+  if (!previousToolMeta && !nextToolMeta) {
+    return true;
+  }
+
+  if (!previousToolMeta || !nextToolMeta) {
+    return false;
+  }
+
+  return previousToolMeta.type === nextToolMeta.type
+    && previousToolMeta.fileName === nextToolMeta.fileName
+    && previousToolMeta.filePath === nextToolMeta.filePath
+    && previousToolMeta.addedLines === nextToolMeta.addedLines
+    && previousToolMeta.deletedLines === nextToolMeta.deletedLines;
+}
+
+function formatMcpToolDetail(name, input) {
+  const detail = summarizeGenericToolLabel(input, 180);
+  const prefix = name || 'MCP tool';
+  return detail ? truncateText(`${prefix} ${detail}`, 220) : truncateText(prefix, 220);
+}
+
+function formatGenericToolDetail(name, input) {
+  const detail = summarizeGenericToolLabel(input, 180);
+  return detail ? truncateText(`${name || 'Tool'} ${detail}`, 220) : (name || 'Tool');
+}
+
+function summarizeGenericToolLabel(input, maxLength) {
+  if (input == null) {
+    return '';
+  }
+
+  const value = getToolInputString(input, [
+    'file_path',
+    'path',
+    'pattern',
+    'query',
+    'url',
+    'command',
+    'description',
+    'prompt',
+  ]);
+
+  if (value) {
+    return truncateText(value, maxLength);
+  }
+
+  const serialized = truncateText(stringifyValue(input), maxLength);
+  return serialized === '{}' ? '' : serialized;
+}
+
+function getToolInputString(input, keys) {
+  if (!input || typeof input !== 'object') {
+    return '';
+  }
+
+  for (const key of keys) {
+    if (typeof input[key] === 'string' && input[key].trim()) {
+      return input[key].trim();
     }
   }
 
-  if (typeof block.content === 'string') {
-    return truncateText(block.content, 1600);
+  return '';
+}
+
+function getToolInputText(input, keys) {
+  if (!input || typeof input !== 'object') {
+    return '';
   }
 
-  return block.is_error ? '工具返回了错误。' : '工具执行完成。';
+  for (const key of keys) {
+    if (typeof input[key] === 'string' && input[key].length > 0) {
+      return input[key];
+    }
+  }
+
+  return '';
+}
+
+function countTextLines(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return 0;
+  }
+
+  const normalized = value.replace(/\r\n/g, '\n');
+  const segments = normalized.split('\n');
+  while (segments.length > 1 && segments[segments.length - 1] === '') {
+    segments.pop();
+  }
+
+  return segments.length;
 }
 
 function formatTaskUsage(usage) {
@@ -1441,6 +2737,19 @@ function getLatestPreviewMessage(messages) {
   return null;
 }
 
+function getMessagePreviewText(message) {
+  if (!message || typeof message !== 'object') {
+    return '';
+  }
+
+  const content = typeof message.content === 'string' ? message.content.trim() : '';
+  if (content) {
+    return content;
+  }
+
+  return formatAttachmentTitle(message.attachments);
+}
+
 function getLatestVisibleSession(workspace) {
   return workspace.sessions
     .filter((session) => !session.archived)
@@ -1460,6 +2769,60 @@ function directoryExists(directoryPath) {
     return fs.existsSync(directoryPath) && fs.statSync(directoryPath).isDirectory();
   } catch {
     return false;
+  }
+}
+
+function getWorkspaceGitInfo(workspacePath) {
+  if (!directoryExists(workspacePath)) {
+    return null;
+  }
+
+  const cached = workspaceGitInfoCache.get(workspacePath);
+  const now = Date.now();
+  if (cached && now - cached.checkedAt < WORKSPACE_GIT_INFO_TTL_MS) {
+    return cached.value;
+  }
+
+  const value = resolveWorkspaceGitInfo(workspacePath);
+  workspaceGitInfoCache.set(workspacePath, {
+    checkedAt: now,
+    value,
+  });
+  return value;
+}
+
+function resolveWorkspaceGitInfo(workspacePath) {
+  try {
+    const options = {
+      cwd: workspacePath,
+      encoding: 'utf8',
+      timeout: 1500,
+    };
+    const insideWorkTree = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], options);
+    if (insideWorkTree.status !== 0 || insideWorkTree.stdout.trim() !== 'true') {
+      return null;
+    }
+
+    const rootResult = spawnSync('git', ['rev-parse', '--show-toplevel'], options);
+    const branchResult = spawnSync('git', ['branch', '--show-current'], options);
+    let branch = branchResult.status === 0 ? branchResult.stdout.trim() : '';
+
+    if (!branch) {
+      const detachedHeadResult = spawnSync('git', ['rev-parse', '--short', 'HEAD'], options);
+      const commitSha = detachedHeadResult.status === 0 ? detachedHeadResult.stdout.trim() : '';
+      branch = commitSha ? `detached@${commitSha}` : '';
+    }
+
+    if (!branch) {
+      return null;
+    }
+
+    return {
+      branch,
+      root: rootResult.status === 0 ? rootResult.stdout.trim() : workspacePath,
+    };
+  } catch {
+    return null;
   }
 }
 

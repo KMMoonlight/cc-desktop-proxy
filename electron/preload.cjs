@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('claudeDesktop', {
   listSkills: (payload) => ipcRenderer.invoke('desktop:list-skills', payload),
   openLink: (href) => ipcRenderer.invoke('desktop:open-link', href),
   openGitDiffWindow: (payload) => ipcRenderer.invoke('desktop:open-git-diff-window', payload),
+  openWorkspaceInFinder: (workspaceId) => ipcRenderer.invoke('desktop:open-workspace-in-finder', workspaceId),
   onStateChange: (callback) => {
     if (typeof callback !== 'function') {
       return () => {};
@@ -32,10 +33,13 @@ contextBridge.exposeInMainWorld('claudeDesktop', {
   removeWorkspace: (workspaceId) => ipcRenderer.invoke('desktop:remove-workspace', workspaceId),
   respondToApproval: (payload) => ipcRenderer.invoke('desktop:respond-to-approval', payload),
   setExpandedWorkspaces: (workspaceIds) => ipcRenderer.invoke('desktop:set-expanded-workspaces', workspaceIds),
+  setPaneLayout: (paneLayout) => ipcRenderer.invoke('desktop:set-pane-layout', paneLayout),
   selectSession: (payload) => ipcRenderer.invoke('desktop:select-session', payload),
   selectWorkspace: (workspaceId) => ipcRenderer.invoke('desktop:select-workspace', workspaceId),
   sendMessage: (payload) => ipcRenderer.invoke('desktop:send-message', payload),
+  setProviderEnabled: (payload) => ipcRenderer.invoke('desktop:set-provider-enabled', payload),
   stopRun: (payload) => ipcRenderer.invoke('desktop:stop-run', payload),
+  updateSessionProvider: (payload) => ipcRenderer.invoke('desktop:update-session-provider', payload),
   runMcpCommand: (payload) => ipcRenderer.invoke('desktop:run-mcp-command', payload),
   updateSessionModel: (payload) => ipcRenderer.invoke('desktop:update-session-model', payload),
   updateSessionPermissionMode: (payload) => ipcRenderer.invoke('desktop:update-session-permission-mode', payload),

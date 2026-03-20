@@ -9,9 +9,11 @@ const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 
 const CONFIG_FILE_NAME = 'claude-desktop-config.json';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+const CODEX_BIN = process.env.CODEX_BIN || 'codex';
+const DEFAULT_PROVIDER = 'claude';
 const EMPTY_ASSISTANT_TEXT = '（本轮没有收到可展示的文本输出）';
 const EMPTY_TREE_HASH = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const SAVE_DEBOUNCE_MS = 160;
 const CLAUDE_CHECK_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
@@ -25,8 +27,14 @@ const SESSION_PERMISSION_MODES = new Set([
   'dontAsk',
   'plan',
 ]);
+const SESSION_PROVIDER_KEYS = ['claude', 'codex'];
+const SESSION_PROVIDERS = new Set(SESSION_PROVIDER_KEYS);
 
 const workspaceGitInfoCache = new Map();
+let shellPathCache = {
+  checkedAt: 0,
+  value: '',
+};
 
 const BUILTIN_TOOL_NAMES = new Set([
   'Task',
@@ -96,6 +104,14 @@ class ClaudeDesktopRuntime {
     this.claudeInfo = {
       available: null,
       checkedAt: 0,
+      executablePath: '',
+      models: [],
+      version: '',
+    };
+    this.codexInfo = {
+      available: null,
+      checkedAt: 0,
+      executablePath: '',
       models: [],
       version: '',
     };
@@ -103,7 +119,7 @@ class ClaudeDesktopRuntime {
     this.store = this.loadStore();
     this.gitDiffWindows = new Map();
     this.windowRuns = new Map();
-    this.refreshClaudeInfo(true);
+    this.refreshProviderInfo(true);
   }
 
   registerIpc() {
@@ -119,6 +135,7 @@ class ClaudeDesktopRuntime {
       const browserWindow = BrowserWindow.fromWebContents(event.sender);
       return this.openGitDiffWindow(browserWindow, payload?.workspaceId);
     });
+    ipcMain.handle('desktop:open-workspace-in-finder', (_event, workspaceId) => this.openWorkspaceInFinder(workspaceId));
     ipcMain.handle('desktop:prepare-pasted-attachments', (_event, payload) => this.preparePastedAttachments(payload));
     ipcMain.handle('desktop:pick-attachments', (event) => {
       const browserWindow = BrowserWindow.fromWebContents(event.sender);
@@ -144,9 +161,16 @@ class ClaudeDesktopRuntime {
     ipcMain.handle('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId));
     ipcMain.handle('desktop:select-session', (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId));
     ipcMain.handle('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
+    ipcMain.handle('desktop:set-pane-layout', (_event, paneLayout) => this.setPaneLayout(paneLayout));
     ipcMain.handle('desktop:respond-to-approval', (event, payload) => this.respondToApproval(event.sender, payload));
     ipcMain.handle('desktop:send-message', (event, payload) => this.sendMessage(event.sender, payload));
     ipcMain.handle('desktop:stop-run', (event, payload) => this.stopRun(event.sender, payload));
+    ipcMain.handle('desktop:update-session-provider', (_event, payload) => (
+      this.updateSessionProvider(payload?.workspaceId, payload?.sessionId, payload?.provider)
+    ));
+    ipcMain.handle('desktop:set-provider-enabled', (_event, payload) => (
+      this.setProviderEnabled(payload?.provider, payload?.enabled)
+    ));
     ipcMain.handle('desktop:update-session-model', (_event, payload) => (
       this.updateSessionModel(payload?.workspaceId, payload?.sessionId, payload?.model)
     ));
@@ -158,23 +182,32 @@ class ClaudeDesktopRuntime {
   }
 
   getAppState() {
-    this.refreshClaudeInfo();
+    this.refreshProviderInfo();
+    if (this.reconcileUnlockedSessionProviders()) {
+      this.scheduleSave();
+    }
 
     const selectedWorkspace = this.getSelectedWorkspace();
     const selectedSession = this.getSelectedSession();
     const activeRunLookup = this.getActiveRunLookup();
     const hasActiveRun = activeRunLookup.size > 0;
+    const selectedWorkspacePath = selectedWorkspace?.path || '';
+    const enabledProviders = new Set(this.getEnabledProviders());
+    const providers = {
+      claude: serializeProviderInfo('claude', this.claudeInfo, collectInstalledSkills(selectedWorkspacePath, 'claude'), enabledProviders.has('claude')),
+      codex: serializeProviderInfo('codex', this.codexInfo, collectInstalledSkills(selectedWorkspacePath, 'codex'), enabledProviders.has('codex')),
+    };
 
     return {
       claude: {
-        available: Boolean(this.claudeInfo.available),
+        ...providers.claude,
         busy: hasActiveRun,
-        models: this.claudeInfo.models,
-        skills: collectInstalledSkills(selectedWorkspace?.path || ''),
-        version: this.claudeInfo.version,
       },
+      defaultProvider: this.getDefaultProvider(),
       expandedWorkspaceIds: this.store.expandedWorkspaceIds,
+      paneLayout: this.store.paneLayout,
       platform: process.platform,
+      providers,
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
       workspaces: this.store.workspaces.map((workspace) => (
@@ -191,7 +224,7 @@ class ClaudeDesktopRuntime {
       buttonLabel: '选择工作目录',
       defaultPath: this.getSelectedWorkspace()?.path || this.defaultPickerPath,
       properties: ['openDirectory', 'createDirectory'],
-      title: '添加 Claude Code 工作目录',
+      title: '添加本地工作目录',
     });
 
     if (result.canceled || !result.filePaths.length) {
@@ -291,6 +324,21 @@ class ClaudeDesktopRuntime {
     return serializeWorkspaceGitDiffView(workspace);
   }
 
+  async openWorkspaceInFinder(workspaceId) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    this.assertDirectory(workspace.path);
+    const errorMessage = await shell.openPath(workspace.path);
+    if (errorMessage) {
+      throw new Error(errorMessage);
+    }
+
+    return { ok: true };
+  }
+
   getSession(workspaceId, sessionId) {
     const sessionRef = this.findSessionByIds(workspaceId, sessionId);
     if (!sessionRef || sessionRef.session.archived) {
@@ -384,7 +432,7 @@ class ClaudeDesktopRuntime {
       updatedAt: now,
     };
 
-    const session = createWorkspaceSession(now);
+    const session = createWorkspaceSession(now, this.getDefaultProvider());
     workspace.sessions.unshift(session);
 
     this.store.workspaces.push(workspace);
@@ -402,7 +450,7 @@ class ClaudeDesktopRuntime {
     }
 
     const now = new Date().toISOString();
-    const session = createWorkspaceSession(now);
+    const session = createWorkspaceSession(now, this.getDefaultProvider());
 
     workspace.sessions.unshift(session);
     this.touchWorkspace(workspace, now);
@@ -509,6 +557,12 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  setPaneLayout(paneLayout) {
+    this.store.paneLayout = normalizePaneLayoutState(paneLayout);
+    this.scheduleSave();
+    return this.store.paneLayout;
+  }
+
   updateSessionModel(workspaceId, sessionId, model) {
     const workspace = this.findWorkspace(workspaceId);
     if (!workspace) {
@@ -531,6 +585,65 @@ class ClaudeDesktopRuntime {
     this.store.selectedSessionId = session.id;
     this.scheduleSave();
 
+    return this.getAppState();
+  }
+
+  updateSessionProvider(workspaceId, sessionId, provider) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const session = workspace.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+      throw new Error('找不到对应的历史对话。');
+    }
+
+    const nextProvider = normalizeSessionProvider(provider);
+    if (session.provider === nextProvider) {
+      return this.getAppState();
+    }
+
+    if (!this.isProviderEnabled(nextProvider)) {
+      throw new Error(`${getProviderLabel(nextProvider)} 已在设置中关闭。`);
+    }
+
+    if (!this.getProviderInfo(nextProvider).available) {
+      throw new Error(`未检测到可用的 ${getProviderLabel(nextProvider)} CLI。`);
+    }
+
+    const activeRun = this.findActiveRunState(workspace.id, session.id);
+    if (activeRun) {
+      throw new Error('运行中的对话暂时不能切换 provider。');
+    }
+
+    if (isSessionProviderLocked(session)) {
+      throw new Error('这个会话已经开始对话，不能再切换 provider。');
+    }
+
+    const now = new Date().toISOString();
+    const previousProvider = normalizeSessionProvider(session.provider);
+    session.provider = nextProvider;
+    session.claudeSessionId = null;
+    session.currentModel = '';
+    session.model = '';
+    session.permissionMode = nextProvider === 'claude' ? session.permissionMode : 'default';
+    session.updatedAt = now;
+    this.touchWorkspace(workspace, now);
+    this.store.selectedWorkspaceId = workspace.id;
+    this.store.selectedSessionId = session.id;
+
+    if (session.messages.length > 0) {
+      this.appendEventMessage(workspace, session, {
+        kind: 'command',
+        status: 'info',
+        title: `切换到 ${getProviderLabel(nextProvider)}`,
+        content: `${getProviderLabel(previousProvider)} 的远端线程不会继续复用。下一条消息会从新的 ${getProviderLabel(nextProvider)} 本地线程开始。`,
+        createdAt: now,
+      });
+    }
+
+    this.scheduleSave();
     return this.getAppState();
   }
 
@@ -558,16 +671,127 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  getProviderInfo(provider) {
+    return normalizeSessionProvider(provider) === 'codex' ? this.codexInfo : this.claudeInfo;
+  }
+
+  getEnabledProviders() {
+    return normalizeEnabledProviders(this.store.enabledProviders);
+  }
+
+  isProviderEnabled(provider) {
+    return this.getEnabledProviders().includes(normalizeSessionProvider(provider));
+  }
+
+  assertProviderEnabled(provider) {
+    const normalizedProvider = normalizeSessionProvider(provider);
+    if (this.isProviderEnabled(normalizedProvider)) {
+      return normalizedProvider;
+    }
+
+    throw new Error(`${getProviderLabel(normalizedProvider)} 已在设置中关闭，请先重新启用后再继续这个会话。`);
+  }
+
+  getDefaultProvider() {
+    const enabledProviders = this.getEnabledProviders();
+    const availableEnabledProviders = enabledProviders.filter((provider) => this.getProviderInfo(provider).available);
+
+    if (availableEnabledProviders.length > 0) {
+      return availableEnabledProviders[0];
+    }
+
+    return enabledProviders[0] || DEFAULT_PROVIDER;
+  }
+
+  reconcileUnlockedSessionProviders() {
+    const enabledProviders = this.getEnabledProviders();
+    const nextDefaultProvider = this.getDefaultProvider();
+    const hasAvailableEnabledProvider = enabledProviders.some((provider) => this.getProviderInfo(provider).available);
+    const enabledProviderSet = new Set(enabledProviders);
+    let changed = false;
+
+    for (const workspace of this.store.workspaces) {
+      let workspaceTouched = false;
+
+      for (const session of workspace.sessions) {
+        if (!session || isSessionProviderLocked(session) || this.findActiveRunState(workspace.id, session.id)) {
+          continue;
+        }
+
+        const currentProvider = normalizeSessionProvider(session.provider);
+        const shouldSwitch = (
+          !enabledProviderSet.has(currentProvider)
+          || (hasAvailableEnabledProvider && !this.getProviderInfo(currentProvider).available)
+        );
+
+        if (!shouldSwitch || currentProvider === nextDefaultProvider) {
+          continue;
+        }
+
+        const now = new Date().toISOString();
+        session.provider = nextDefaultProvider;
+        session.claudeSessionId = null;
+        session.currentModel = '';
+        session.model = '';
+        session.permissionMode = nextDefaultProvider === 'claude'
+          ? normalizeSessionPermissionMode(session.permissionMode)
+          : 'default';
+        session.updatedAt = now;
+        workspaceTouched = true;
+        changed = true;
+      }
+
+      if (workspaceTouched) {
+        this.touchWorkspace(workspace);
+      }
+    }
+
+    return changed;
+  }
+
+  setProviderEnabled(provider, enabled) {
+    const nextProvider = normalizeSessionProvider(provider);
+    const nextEnabled = Boolean(enabled);
+    const currentEnabledProviders = this.getEnabledProviders();
+    const providerEnabled = currentEnabledProviders.includes(nextProvider);
+
+    if (providerEnabled === nextEnabled) {
+      return this.getAppState();
+    }
+
+    const nextEnabledProviders = nextEnabled
+      ? SESSION_PROVIDER_KEYS.filter((key) => currentEnabledProviders.includes(key) || key === nextProvider)
+      : currentEnabledProviders.filter((key) => key !== nextProvider);
+
+    if (nextEnabledProviders.length === 0) {
+      throw new Error('至少保留一个启用的 Provider。');
+    }
+
+    this.store.enabledProviders = nextEnabledProviders;
+    this.reconcileUnlockedSessionProviders();
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
   runMcpCommand(workspaceId, sessionId, rawArgs) {
     const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
+    const provider = this.assertProviderEnabled(session.provider);
     const args = tokenizeCliArgs(rawArgs);
     if (args.length === 0) {
       throw new Error('请使用 /mcp list、/mcp get <name>、/mcp add ... 或 /mcp remove <name>。');
     }
 
-    const result = spawnSync(CLAUDE_BIN, ['mcp', ...args], {
+    const cliEnv = getCliProcessEnv();
+    const executablePath = this.getProviderInfo(provider).executablePath || resolveProviderExecutablePath(provider, cliEnv);
+    if (!executablePath) {
+      throw new Error(`未检测到可用的 ${getProviderLabel(provider)} CLI。`);
+    }
+
+    const result = spawnSync(executablePath, ['mcp', ...args], {
       cwd: workspace.path,
       encoding: 'utf8',
+      env: cliEnv,
     });
 
     const content = [result.stdout, result.stderr].filter(Boolean).join('\n').trim() || '命令已执行，但没有返回内容。';
@@ -584,7 +808,8 @@ class ClaudeDesktopRuntime {
 
   listSkills(workspaceId, sessionId) {
     const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
-    const entries = collectInstalledSkills(workspace.path);
+    this.assertProviderEnabled(session.provider);
+    const entries = collectInstalledSkills(workspace.path, normalizeSessionProvider(session.provider));
     const content = entries.length > 0
       ? entries.map((entry, index) => (
         `${index + 1}. [${entry.scope}] ${entry.name}`
@@ -606,6 +831,7 @@ class ClaudeDesktopRuntime {
 
   installSkill(workspaceId, sessionId, rawArgs) {
     const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
+    const provider = this.assertProviderEnabled(session.provider);
     const args = tokenizeCliArgs(rawArgs);
     if (args.length === 0) {
       throw new Error('请使用 /skills install <本地路径> [--scope user|project]。');
@@ -632,8 +858,8 @@ class ClaudeDesktopRuntime {
     }
 
     const targetRoot = scope === 'project'
-      ? path.join(workspace.path, '.claude', 'skills')
-      : path.join(getClaudeHome(), 'skills');
+      ? path.join(workspace.path, getProjectProviderDirectoryName(provider), 'skills')
+      : path.join(getProviderHome(provider), 'skills');
     const targetPath = path.join(targetRoot, path.basename(sourcePath));
 
     fs.mkdirSync(targetRoot, { recursive: true });
@@ -667,8 +893,10 @@ class ClaudeDesktopRuntime {
 
     const prompt = typeof payload?.prompt === 'string' ? payload.prompt.trim() : '';
     const attachments = normalizeMessageAttachments(payload?.attachments, { verifyExists: true });
-    const claudePrompt = buildPromptWithAttachments(prompt, attachments);
-    if (!claudePrompt) {
+    const provider = this.assertProviderEnabled(session.provider || this.getDefaultProvider());
+    const providerLabel = getProviderLabel(provider);
+    const providerPrompt = buildPromptWithAttachments(prompt, attachments);
+    if (!providerPrompt) {
       throw new Error('消息内容不能为空。');
     }
     const displayPrompt = typeof payload?.displayPrompt === 'string' && payload.displayPrompt.trim()
@@ -679,14 +907,15 @@ class ClaudeDesktopRuntime {
       ? payload.displayTitle.trim()
       : displayPrompt;
 
-    this.refreshClaudeInfo(true);
-    if (!this.claudeInfo.available) {
-      throw new Error('未检测到可用的 Claude Code CLI。');
+    this.refreshProviderInfo(true);
+    const providerInfo = this.getProviderInfo(provider);
+    if (!providerInfo.available) {
+      throw new Error(`未检测到可用的 ${providerLabel} CLI。`);
     }
 
     const existingRun = this.findActiveRunState(workspace.id, session.id);
     if (existingRun) {
-      throw new Error('当前已有正在运行的 Claude 任务，请等待完成或先停止。');
+      throw new Error(`当前已有正在运行的 ${providerLabel} 任务，请等待完成或先停止。`);
     }
     const runState = this.getRunState(webContents.id, workspace.id, session.id);
 
@@ -720,39 +949,37 @@ class ClaudeDesktopRuntime {
     runState.toolUses.clear();
     runState.resultIsError = false;
     runState.resultReceived = false;
+    runState.provider = provider;
     runState.sessionId = session.id;
     runState.workspaceId = workspace.id;
     runState.runToken = randomUUID();
     const runToken = runState.runToken;
 
-    const args = [
-      '-p',
-      '--input-format',
-      'stream-json',
-      '--output-format',
-      'stream-json',
-      '--include-partial-messages',
-      '--replay-user-messages',
-      '--permission-prompt-tool',
-      'stdio',
-      '--verbose',
-    ];
     const extraAttachmentDirs = collectAttachmentDirectories(workspace.path, attachments);
-    if (extraAttachmentDirs.length > 0) {
-      args.push('--add-dir', ...extraAttachmentDirs);
-    }
-    if (session.model) {
-      args.push('--model', session.model);
-    }
-    args.push('--permission-mode', normalizeSessionPermissionMode(session.permissionMode));
-
-    if (session.claudeSessionId) {
-      args.push('--resume', session.claudeSessionId);
+    const cliEnv = getCliProcessEnv();
+    const executablePath = providerInfo.executablePath || resolveProviderExecutablePath(provider, cliEnv);
+    if (!executablePath) {
+      throw new Error(`未检测到可用的 ${providerLabel} CLI。`);
     }
 
-    const proc = spawn(CLAUDE_BIN, args, {
+    const args = provider === 'codex'
+      ? buildCodexExecArgs({
+        attachments,
+        extraAttachmentDirs,
+        model: session.model,
+        prompt: providerPrompt,
+        sessionId: session.claudeSessionId,
+      })
+      : buildClaudeExecArgs({
+        extraAttachmentDirs,
+        model: session.model,
+        permissionMode: session.permissionMode,
+        sessionId: session.claudeSessionId,
+      });
+
+    const proc = spawn(executablePath, args, {
       cwd: workspace.path,
-      env: { ...process.env },
+      env: cliEnv,
     });
 
     session.messages.push(userMessage);
@@ -798,7 +1025,9 @@ class ClaudeDesktopRuntime {
       runState.stderrBuffer = truncateText(`${runState.stderrBuffer}${text}`, STDERR_BUFFER_LIMIT);
     });
 
-    proc.stdin.on('error', () => {});
+    if (provider !== 'codex') {
+      proc.stdin.on('error', () => {});
+    }
 
     proc.on('close', (code) => {
       if (runState.runToken !== runToken) {
@@ -813,7 +1042,7 @@ class ClaudeDesktopRuntime {
       if (sessionRef) {
         finalizeRunningToolMessages(sessionRef.session, code === 0 ? 'completed' : 'error');
         let assistant = this.getAssistantMessage(sessionRef.session, runState);
-        if (!assistant && code === 0 && !this.hasRecentErrorEvent(sessionRef.session) && !runState.hasStreamedAssistantText) {
+        if (!assistant && code === 0 && !hasRecentErrorEvent(sessionRef.session) && !runState.hasStreamedAssistantText) {
           assistant = this.ensureAssistantMessage(sessionRef.session, runState, new Date().toISOString());
           assistant.content = EMPTY_ASSISTANT_TEXT;
         }
@@ -825,12 +1054,12 @@ class ClaudeDesktopRuntime {
           assistant.error = code !== 0 && !hadContent;
         }
 
-        if (code !== 0 && !this.hasRecentErrorEvent(sessionRef.session)) {
+        if (code !== 0 && !hasRecentErrorEvent(sessionRef.session)) {
           this.appendEventMessage(sessionRef.workspace, sessionRef.session, {
             kind: 'error',
             status: 'error',
-            title: 'Claude 运行失败',
-            content: formatProcessFailure(code, runState.stderrBuffer),
+            title: `${providerLabel} 运行失败`,
+            content: formatProcessFailure(providerLabel, code, runState.stderrBuffer),
           });
         }
 
@@ -859,8 +1088,8 @@ class ClaudeDesktopRuntime {
         this.appendEventMessage(sessionRef.workspace, sessionRef.session, {
           kind: 'error',
           status: 'error',
-          title: 'Claude 启动失败',
-          content: formatProcessFailure(null, `${error.message}\n${runState.stderrBuffer}`),
+          title: `${providerLabel} 启动失败`,
+          content: formatProcessFailure(providerLabel, null, `${error.message}\n${runState.stderrBuffer}`),
         });
 
         const assistant = this.getAssistantMessage(sessionRef.session, runState);
@@ -882,7 +1111,9 @@ class ClaudeDesktopRuntime {
       this.emitState(webContents);
     });
 
-    writeJsonLine(proc.stdin, createStreamJsonUserMessage(claudePrompt, session.claudeSessionId));
+    if (provider !== 'codex') {
+      writeJsonLine(proc.stdin, createStreamJsonUserMessage(providerPrompt, session.claudeSessionId, providerLabel));
+    }
 
     return { ok: true };
   }
@@ -898,7 +1129,7 @@ class ClaudeDesktopRuntime {
     );
 
     if (!runState?.process) {
-      throw new Error('当前没有正在运行的 Claude 任务。');
+      throw new Error('当前没有正在运行的任务。');
     }
 
     if (!requestId) {
@@ -1025,7 +1256,11 @@ class ClaudeDesktopRuntime {
       return;
     }
 
-    this.handleClaudeEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
+    if (normalizeSessionProvider(runState.provider || sessionRef.session.provider) === 'codex') {
+      this.handleCodexEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
+    } else {
+      this.handleClaudeEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
+    }
     this.scheduleSave();
     this.emitState(webContents);
   }
@@ -1094,6 +1329,196 @@ class ClaudeDesktopRuntime {
         });
       }
     }
+  }
+
+  handleCodexEvent(_webContents, workspace, session, runState, event) {
+    const now = new Date().toISOString();
+
+    if (event.type === 'thread.started') {
+      if (event.thread_id && event.thread_id !== session.claudeSessionId) {
+        session.claudeSessionId = event.thread_id;
+        session.updatedAt = now;
+        this.touchWorkspace(workspace, now);
+      }
+      return;
+    }
+
+    if (event.type === 'turn.started') {
+      session.status = 'running';
+      session.updatedAt = now;
+      this.touchWorkspace(workspace, now);
+      return;
+    }
+
+    if (event.type === 'turn.completed') {
+      runState.resultReceived = true;
+      session.status = runState.resultIsError ? 'error' : 'idle';
+      session.updatedAt = now;
+      this.touchWorkspace(workspace, now);
+      return;
+    }
+
+    if (event.type === 'turn.failed') {
+      runState.resultIsError = true;
+      runState.resultReceived = true;
+      session.status = 'error';
+      session.updatedAt = now;
+      this.touchWorkspace(workspace, now);
+      this.appendEventMessage(workspace, session, {
+        kind: 'error',
+        status: 'error',
+        title: 'Codex 返回错误',
+        content: formatCodexTurnFailure(event, runState.stderrBuffer),
+      });
+      return;
+    }
+
+    if (event.type === 'error') {
+      runState.resultIsError = true;
+      session.status = 'error';
+      session.updatedAt = now;
+      this.touchWorkspace(workspace, now);
+      this.appendEventMessage(workspace, session, {
+        kind: 'error',
+        status: 'error',
+        title: 'Codex 返回错误',
+        content: formatCodexTurnFailure(event, runState.stderrBuffer),
+      });
+      return;
+    }
+
+    if (event.type === 'agent_message_delta') {
+      const textDelta = extractCodexAssistantText(event);
+      if (textDelta) {
+        runState.hasStreamedAssistantText = true;
+        runState.currentAssistantText += textDelta;
+        this.updateAssistantMessage(session, runState, runState.currentAssistantText, false);
+      }
+      return;
+    }
+
+    if (event.type === 'agent_message') {
+      const text = extractCodexAssistantText(event);
+      if (text) {
+        runState.hasStreamedAssistantText = true;
+        this.updateAssistantMessage(session, runState, text, true);
+      }
+      return;
+    }
+
+    if (event.type === 'item.started') {
+      this.handleCodexItemStarted(workspace, session, runState, event.item);
+      return;
+    }
+
+    if (event.type === 'item.completed') {
+      this.handleCodexItemCompleted(workspace, session, runState, event.item);
+    }
+  }
+
+  handleCodexItemStarted(workspace, session, runState, item) {
+    const itemSummary = describeCodexItem(item);
+    if (!itemSummary?.toolUseId) {
+      return;
+    }
+
+    if (runState.seenToolUseIds.has(itemSummary.toolUseId)) {
+      this.refreshCodexItemMessage(session, itemSummary.toolUseId, itemSummary, 'running');
+      return;
+    }
+
+    runState.seenToolUseIds.add(itemSummary.toolUseId);
+    runState.toolUses.set(itemSummary.toolUseId, itemSummary);
+    this.finalizeAssistantSegment(session, runState);
+
+    this.appendEventMessage(workspace, session, {
+      kind: itemSummary.kind,
+      status: 'running',
+      title: itemSummary.runningTitle,
+      content: itemSummary.detail,
+      toolCategory: itemSummary.category,
+      toolLabel: itemSummary.detail,
+      toolMeta: itemSummary.toolMeta || null,
+      toolName: itemSummary.name,
+      toolUseId: itemSummary.toolUseId,
+    });
+  }
+
+  handleCodexItemCompleted(workspace, session, runState, item) {
+    const assistantText = extractCodexAssistantText(item);
+    if (assistantText) {
+      runState.hasStreamedAssistantText = true;
+      this.updateAssistantMessage(session, runState, assistantText, true);
+      return;
+    }
+
+    const itemSummary = describeCodexItem(item);
+    if (!itemSummary) {
+      return;
+    }
+
+    const nextStatus = itemSummary.status || 'completed';
+    if (itemSummary.toolUseId) {
+      runState.toolUses.set(itemSummary.toolUseId, itemSummary);
+      const updated = this.refreshCodexItemMessage(session, itemSummary.toolUseId, itemSummary, nextStatus);
+      if (!updated) {
+        this.appendEventMessage(workspace, session, {
+          kind: itemSummary.kind,
+          status: nextStatus,
+          title: nextStatus === 'error' ? itemSummary.errorTitle : itemSummary.completedTitle,
+          content: itemSummary.completedDetail || itemSummary.detail,
+          toolCategory: itemSummary.category,
+          toolLabel: itemSummary.completedDetail || itemSummary.detail,
+          toolMeta: itemSummary.toolMeta || null,
+          toolName: itemSummary.name,
+          toolUseId: itemSummary.toolUseId,
+        });
+      }
+      runState.toolUses.delete(itemSummary.toolUseId);
+      return;
+    }
+
+    this.appendEventMessage(workspace, session, {
+      kind: itemSummary.kind,
+      status: nextStatus,
+      title: nextStatus === 'error' ? itemSummary.errorTitle : itemSummary.completedTitle,
+      content: itemSummary.completedDetail || itemSummary.detail,
+      toolCategory: itemSummary.category,
+      toolLabel: itemSummary.completedDetail || itemSummary.detail,
+      toolMeta: itemSummary.toolMeta || null,
+      toolName: itemSummary.name,
+    });
+  }
+
+  refreshCodexItemMessage(session, toolUseId, itemSummary, status) {
+    if (!toolUseId) {
+      return false;
+    }
+
+    let updated = false;
+    for (const message of session.messages) {
+      if (message?.role !== 'event' || message.toolUseId !== toolUseId) {
+        continue;
+      }
+
+      message.kind = itemSummary.kind;
+      message.status = status;
+      message.title = status === 'error' ? itemSummary.errorTitle : (status === 'running' ? itemSummary.runningTitle : itemSummary.completedTitle);
+      message.content = status === 'running'
+        ? itemSummary.detail
+        : (itemSummary.completedDetail || itemSummary.detail);
+      message.toolCategory = itemSummary.category;
+      message.toolLabel = message.content;
+      message.toolMeta = itemSummary.toolMeta || null;
+      message.toolName = itemSummary.name;
+      updated = true;
+    }
+
+    if (updated) {
+      session.updatedAt = new Date().toISOString();
+    }
+
+    return updated;
   }
 
   handleSystemEvent(workspace, session, event) {
@@ -1493,6 +1918,7 @@ class ClaudeDesktopRuntime {
     runState.currentAssistantText = '';
     runState.hasStreamedAssistantText = false;
     runState.process = null;
+    runState.provider = DEFAULT_PROVIDER;
     runState.runToken = null;
     runState.sessionId = null;
     runState.workspaceId = null;
@@ -1576,39 +2002,22 @@ class ClaudeDesktopRuntime {
     workspace.updatedAt = timestamp;
   }
 
-  refreshClaudeInfo(force = false) {
-    const now = Date.now();
-    if (!force && this.claudeInfo.checkedAt && now - this.claudeInfo.checkedAt < CLAUDE_CHECK_TTL_MS) {
-      return this.claudeInfo;
-    }
+  refreshProviderInfo(force = false) {
+    const cliEnv = getCliProcessEnv(force);
+    this.claudeInfo = inspectProvider('claude', cliEnv, force, this.claudeInfo);
+    this.codexInfo = inspectProvider('codex', cliEnv, force, this.codexInfo);
 
-    try {
-      const result = spawnSync(CLAUDE_BIN, ['--version'], {
-        encoding: 'utf8',
-      });
-
-      const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
-      this.claudeInfo = {
-        available: result.status === 0,
-        checkedAt: now,
-        models: result.status === 0 ? extractClaudeModelCatalog(CLAUDE_BIN) : [],
-        version: output || 'unknown',
-      };
-    } catch {
-      this.claudeInfo = {
-        available: false,
-        checkedAt: now,
-        models: [],
-        version: '',
-      };
-    }
-
-    return this.claudeInfo;
+    return {
+      claude: this.claudeInfo,
+      codex: this.codexInfo,
+    };
   }
 
   loadStore() {
     const emptyStore = {
+      enabledProviders: SESSION_PROVIDER_KEYS.slice(),
       expandedWorkspaceIds: [],
+      paneLayout: null,
       schemaVersion: SCHEMA_VERSION,
       selectedSessionId: null,
       selectedWorkspaceId: null,
@@ -1636,7 +2045,9 @@ class ClaudeDesktopRuntime {
         };
 
         return {
+          enabledProviders: SESSION_PROVIDER_KEYS.slice(),
           expandedWorkspaceIds: [migratedWorkspace.id],
+          paneLayout: null,
           schemaVersion: SCHEMA_VERSION,
           selectedSessionId: null,
           selectedWorkspaceId: migratedWorkspace.id,
@@ -1669,7 +2080,9 @@ class ClaudeDesktopRuntime {
         : [];
 
       return {
+        enabledProviders: normalizeEnabledProviders(parsed.enabledProviders),
         expandedWorkspaceIds,
+        paneLayout: normalizePaneLayoutState(parsed.paneLayout),
         schemaVersion: SCHEMA_VERSION,
         selectedSessionId,
         selectedWorkspaceId,
@@ -1693,7 +2106,9 @@ class ClaudeDesktopRuntime {
     this.saveTimer = null;
 
     const payload = {
+      enabledProviders: this.getEnabledProviders(),
       expandedWorkspaceIds: this.store.expandedWorkspaceIds,
+      paneLayout: normalizePaneLayoutState(this.store.paneLayout),
       schemaVersion: SCHEMA_VERSION,
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
@@ -1756,6 +2171,7 @@ function normalizeSession(session) {
 
   const createdAt = session.createdAt || new Date().toISOString();
   const updatedAt = session.updatedAt || createdAt;
+  const provider = normalizeSessionProvider(session.provider);
   const normalizedMessages = Array.isArray(session.messages)
     ? session.messages.map((message) => normalizeMessage(message)).filter(Boolean)
     : [];
@@ -1770,9 +2186,57 @@ function normalizeSession(session) {
     messages: normalizeStaleRunningEventMessages(normalizedMessages),
     model: session.model || '',
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    provider,
     status: normalizedStatus,
     title: session.title || `新对话 ${formatShortTime(createdAt)}`,
     updatedAt,
+  };
+}
+
+function normalizePaneLayoutState(paneLayout) {
+  if (!paneLayout || typeof paneLayout !== 'object') {
+    return null;
+  }
+
+  const normalizedPanes = Array.isArray(paneLayout.panes)
+    ? paneLayout.panes
+      .map((pane, index) => {
+        if (!pane || typeof pane !== 'object') {
+          return null;
+        }
+
+        const sessionId = typeof pane.sessionId === 'string' && pane.sessionId.trim() ? pane.sessionId.trim() : null;
+        const workspaceId = typeof pane.workspaceId === 'string' && pane.workspaceId.trim() ? pane.workspaceId.trim() : null;
+
+        return {
+          id: typeof pane.id === 'string' && pane.id.trim() ? pane.id.trim() : `pane-${index + 1}`,
+          sessionId,
+          workspaceId,
+        };
+      })
+      .filter(Boolean)
+    : [];
+
+  if (normalizedPanes.length === 0) {
+    return null;
+  }
+
+  const focusedPaneId = normalizedPanes.some((pane) => pane.id === paneLayout.focusedPaneId)
+    ? paneLayout.focusedPaneId
+    : normalizedPanes[0].id;
+  const recentPaneIds = Array.isArray(paneLayout.recentPaneIds)
+    ? paneLayout.recentPaneIds
+      .filter((paneId, index, items) => (
+        typeof paneId === 'string'
+        && normalizedPanes.some((pane) => pane.id === paneId)
+        && items.indexOf(paneId) === index
+      ))
+    : [];
+
+  return {
+    focusedPaneId,
+    panes: normalizedPanes,
+    recentPaneIds,
   };
 }
 
@@ -1891,6 +2355,27 @@ function normalizeSessionPermissionMode(value) {
   return SESSION_PERMISSION_MODES.has(normalized) ? normalized : 'default';
 }
 
+function normalizeSessionProvider(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return SESSION_PROVIDERS.has(normalized) ? normalized : DEFAULT_PROVIDER;
+}
+
+function normalizeEnabledProviders(value) {
+  if (!Array.isArray(value)) {
+    return SESSION_PROVIDER_KEYS.slice();
+  }
+
+  const requestedProviders = new Set(
+    value
+      .filter((entry) => typeof entry === 'string')
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => SESSION_PROVIDERS.has(entry)),
+  );
+  const normalizedProviders = SESSION_PROVIDER_KEYS.filter((provider) => requestedProviders.has(provider));
+
+  return normalizedProviders.length > 0 ? normalizedProviders : SESSION_PROVIDER_KEYS.slice();
+}
+
 function normalizeLineCount(value) {
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
 }
@@ -2006,6 +2491,7 @@ function createRunState(workspaceId = null, sessionId = null) {
     hasStreamedAssistantText: false,
     pendingApprovalRequests: new Map(),
     process: null,
+    provider: DEFAULT_PROVIDER,
     resultIsError: false,
     resultReceived: false,
     runToken: null,
@@ -2062,6 +2548,8 @@ function serializeSession(workspace, session, activeRunLookup) {
     pendingApprovals,
     path: workspace.path,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    provider: normalizeSessionProvider(session.provider),
+    providerLocked: isSessionProviderLocked(session),
     status: session.status,
     title: session.title,
     updatedAt: session.updatedAt,
@@ -2082,6 +2570,8 @@ function serializeSessionMeta(workspace, session, activeRunLookup) {
     isRunning: Boolean(activeRun?.process),
     messageCount: session.messages.filter((message) => message.role !== 'event').length,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    provider: normalizeSessionProvider(session.provider),
+    providerLocked: isSessionProviderLocked(session),
     preview: previewSource ? (truncateText(getMessagePreviewText(previewSource), 80) || '还没有消息') : '还没有消息',
     status: session.status,
     title: session.title,
@@ -2130,7 +2620,7 @@ function createStoredMessage(partial) {
   };
 }
 
-function createWorkspaceSession(createdAt = new Date().toISOString()) {
+function createWorkspaceSession(createdAt = new Date().toISOString(), provider = DEFAULT_PROVIDER) {
   return {
     claudeSessionId: null,
     currentModel: '',
@@ -2140,6 +2630,7 @@ function createWorkspaceSession(createdAt = new Date().toISOString()) {
     messages: [],
     model: '',
     permissionMode: 'default',
+    provider: normalizeSessionProvider(provider),
     status: 'idle',
     title: `新对话 ${formatShortTime(createdAt)}`,
     updatedAt: createdAt,
@@ -2396,7 +2887,62 @@ function buildPromptWithAttachments(prompt, attachments) {
   return sections.join('\n\n').trim();
 }
 
-function createStreamJsonUserMessage(prompt, sessionId) {
+function buildClaudeExecArgs({ extraAttachmentDirs, model, permissionMode, sessionId }) {
+  const args = [
+    '-p',
+    '--input-format',
+    'stream-json',
+    '--output-format',
+    'stream-json',
+    '--include-partial-messages',
+    '--replay-user-messages',
+    '--permission-prompt-tool',
+    'stdio',
+    '--verbose',
+  ];
+
+  if (Array.isArray(extraAttachmentDirs) && extraAttachmentDirs.length > 0) {
+    args.push('--add-dir', ...extraAttachmentDirs);
+  }
+
+  if (model) {
+    args.push('--model', model);
+  }
+
+  args.push('--permission-mode', normalizeSessionPermissionMode(permissionMode));
+
+  if (sessionId) {
+    args.push('--resume', sessionId);
+  }
+
+  return args;
+}
+
+function buildCodexExecArgs({ attachments, extraAttachmentDirs, model, prompt, sessionId }) {
+  const options = ['--json', '--skip-git-repo-check'];
+  if (model) {
+    options.push('--model', model);
+  }
+
+  if (Array.isArray(extraAttachmentDirs) && extraAttachmentDirs.length > 0) {
+    options.push('--add-dir', ...extraAttachmentDirs);
+  }
+
+  const imageAttachments = Array.isArray(attachments)
+    ? attachments.filter((attachment) => attachment?.kind === 'image' && attachment.path)
+    : [];
+  if (imageAttachments.length > 0) {
+    options.push('-i', ...imageAttachments.map((attachment) => attachment.path));
+  }
+
+  if (sessionId) {
+    return ['exec', 'resume', ...options, sessionId, prompt];
+  }
+
+  return ['exec', ...options, prompt];
+}
+
+function createStreamJsonUserMessage(prompt, sessionId, providerLabel = 'Claude') {
   return {
     message: {
       content: prompt,
@@ -2437,7 +2983,7 @@ function createApprovalControlResponse(approval, decision) {
 
 function writeJsonLine(stream, payload) {
   if (!stream || stream.destroyed || typeof stream.write !== 'function' || stream.writableEnded) {
-    throw new Error('Claude 输入流已关闭。');
+    throw new Error('输入流已关闭。');
   }
 
   stream.write(`${JSON.stringify(payload)}\n`);
@@ -2554,6 +3100,14 @@ function countInputMessages(messages) {
     message.role === 'user'
     || (message.role === 'event' && message.kind === 'command')
   )).length;
+}
+
+function isSessionProviderLocked(session) {
+  if (!session || !Array.isArray(session.messages)) {
+    return false;
+  }
+
+  return countInputMessages(session.messages) > 0;
 }
 
 function classifyTool(name) {
@@ -2955,10 +3509,179 @@ function formatClaudeError(event, stderrBuffer) {
   return truncateText(parts.join('\n\n'), STDERR_BUFFER_LIMIT);
 }
 
-function formatProcessFailure(code, stderrBuffer) {
-  const summary = code == null ? 'Claude 进程启动失败。' : `Claude 进程异常结束，退出码 ${code}。`;
+function formatProcessFailure(providerLabel, code, stderrBuffer) {
+  const summary = code == null
+    ? `${providerLabel} 进程启动失败。`
+    : `${providerLabel} 进程异常结束，退出码 ${code}。`;
   const details = stderrBuffer ? `\n\n${stderrBuffer.trim()}` : '';
   return truncateText(`${summary}${details}`, STDERR_BUFFER_LIMIT);
+}
+
+function formatCodexTurnFailure(event, stderrBuffer) {
+  const parts = [
+    event?.error?.message,
+    event?.message,
+    stderrBuffer,
+  ].filter(Boolean);
+
+  return truncateText(parts.join('\n\n'), STDERR_BUFFER_LIMIT);
+}
+
+function extractCodexAssistantText(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return '';
+  }
+
+  if (typeof payload.text === 'string' && payload.text.trim()) {
+    return payload.text;
+  }
+
+  if (typeof payload.delta === 'string' && payload.delta.trim()) {
+    return payload.delta;
+  }
+
+  const item = payload.item && typeof payload.item === 'object' ? payload.item : payload;
+  if (item.type === 'assistant_message' || item.type === 'agent_message' || item.type === 'message') {
+    if (typeof item.text === 'string' && item.text.trim()) {
+      return item.text;
+    }
+
+    if (Array.isArray(item.content)) {
+      const text = item.content
+        .map((block) => {
+          if (typeof block === 'string') {
+            return block;
+          }
+
+          if (typeof block?.text === 'string') {
+            return block.text;
+          }
+
+          return '';
+        })
+        .join('');
+      if (text.trim()) {
+        return text;
+      }
+    }
+  }
+
+  return '';
+}
+
+function describeCodexItem(item) {
+  if (!item || typeof item !== 'object') {
+    return null;
+  }
+
+  const type = typeof item.type === 'string' ? item.type.trim() : '';
+  if (!type || type === 'assistant_message' || type === 'agent_message' || type === 'message') {
+    return null;
+  }
+
+  if (type === 'command_execution') {
+    const command = truncateText(item.command || item.cmd || 'Run command', 220);
+    const output = truncateText(item.aggregated_output || item.output || '', STDERR_BUFFER_LIMIT);
+    return {
+      category: 'command',
+      completedDetail: output ? `${command}\n\n${output}` : command,
+      completedTitle: '命令已完成',
+      detail: command,
+      errorTitle: '命令执行失败',
+      kind: 'command',
+      name: 'command_execution',
+      runningTitle: '正在执行命令',
+      status: Number.isFinite(item.exit_code) && item.exit_code !== 0 ? 'error' : 'completed',
+      toolUseId: item.call_id || item.id || '',
+    };
+  }
+
+  if (type === 'mcp_tool_call') {
+    const server = typeof item.server === 'string' ? item.server.trim() : '';
+    const tool = typeof item.tool === 'string' ? item.tool.trim() : '';
+    const detail = [server, tool].filter(Boolean).join(' · ') || 'MCP tool';
+    const resultText = truncateText(item.result || item.output || '', STDERR_BUFFER_LIMIT);
+    return {
+      category: 'mcp',
+      completedDetail: resultText ? `${detail}\n\n${resultText}` : detail,
+      completedTitle: 'MCP 已完成',
+      detail,
+      errorTitle: 'MCP 调用失败',
+      kind: 'mcp',
+      name: 'mcp_tool_call',
+      runningTitle: '正在调用 MCP',
+      status: item.error ? 'error' : 'completed',
+      toolUseId: item.call_id || item.id || '',
+    };
+  }
+
+  if (type === 'file_change') {
+    const filePath = typeof item.path === 'string' ? item.path.trim() : '';
+    const changeKind = typeof item.change_type === 'string' ? item.change_type.trim() : '';
+    const detail = [changeKind, filePath].filter(Boolean).join(' · ') || 'Updated file';
+    return {
+      category: 'edit',
+      completedDetail: detail,
+      completedTitle: '文件已更新',
+      detail,
+      errorTitle: '文件更新失败',
+      kind: 'edit',
+      name: 'file_change',
+      runningTitle: '正在更新文件',
+      status: 'completed',
+      toolMeta: createEditToolMetaFromCodexItem(item),
+      toolUseId: item.call_id || item.id || filePath,
+    };
+  }
+
+  if (type === 'web_search') {
+    const query = truncateText(item.query || item.prompt || 'Web search', 220);
+    return {
+      category: 'fetch',
+      completedDetail: query,
+      completedTitle: '已完成检索',
+      detail: query,
+      errorTitle: '检索失败',
+      kind: 'status',
+      name: 'web_search',
+      runningTitle: '正在检索',
+      status: 'completed',
+      toolUseId: item.call_id || item.id || query,
+    };
+  }
+
+  if (type === 'reasoning') {
+    return null;
+  }
+
+  const detail = truncateText(stringifyValue(item), 220);
+  return {
+    category: 'generic',
+    completedDetail: detail,
+    completedTitle: '操作已完成',
+    detail,
+    errorTitle: '操作失败',
+    kind: 'status',
+    name: type || 'item',
+    runningTitle: '正在执行操作',
+    status: 'completed',
+    toolUseId: item.call_id || item.id || '',
+  };
+}
+
+function createEditToolMetaFromCodexItem(item) {
+  const filePath = typeof item?.path === 'string' ? item.path.trim() : '';
+  if (!filePath) {
+    return null;
+  }
+
+  return {
+    addedLines: null,
+    deletedLines: null,
+    fileName: path.basename(filePath),
+    filePath,
+    type: 'edit',
+  };
 }
 
 function hasRecentErrorEvent(session) {
@@ -3496,8 +4219,68 @@ function stripAnsi(value) {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
 }
 
-function extractClaudeModelCatalog(claudeBin) {
-  const executablePath = resolveClaudeExecutablePath(claudeBin);
+function inspectProvider(provider, env, force, previousInfo = null) {
+  const normalizedProvider = normalizeSessionProvider(provider);
+  const previousCheckedAt = Number.isFinite(previousInfo?.checkedAt) ? previousInfo.checkedAt : 0;
+  const now = Date.now();
+  if (!force && previousCheckedAt && now - previousCheckedAt < CLAUDE_CHECK_TTL_MS) {
+    return previousInfo;
+  }
+
+  const executablePath = resolveProviderExecutablePath(normalizedProvider, env);
+  if (!executablePath) {
+    return createUnavailableProviderInfo(normalizedProvider, now);
+  }
+
+  try {
+    const result = spawnSync(executablePath, ['--version'], {
+      encoding: 'utf8',
+      env,
+    });
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    return {
+      available: result.status === 0,
+      checkedAt: now,
+      executablePath: result.status === 0 ? executablePath : '',
+      models: result.status === 0 ? extractProviderModelCatalog(normalizedProvider, executablePath, env) : [],
+      version: output || 'unknown',
+    };
+  } catch {
+    return createUnavailableProviderInfo(normalizedProvider, now);
+  }
+}
+
+function createUnavailableProviderInfo(provider, checkedAt = Date.now()) {
+  return {
+    available: false,
+    checkedAt,
+    executablePath: '',
+    models: [],
+    version: '',
+  };
+}
+
+function serializeProviderInfo(provider, info, skills = [], enabled = true) {
+  return {
+    available: Boolean(info?.available),
+    enabled: Boolean(enabled),
+    key: normalizeSessionProvider(provider),
+    label: getProviderLabel(provider),
+    models: Array.isArray(info?.models) ? info.models : [],
+    skills: Array.isArray(skills) ? skills : [],
+    version: typeof info?.version === 'string' ? info.version : '',
+  };
+}
+
+function extractProviderModelCatalog(provider, executablePath, env) {
+  if (normalizeSessionProvider(provider) === 'codex') {
+    return extractCodexModelCatalog(getProviderHome('codex'));
+  }
+
+  return extractClaudeModelCatalog(executablePath, env);
+}
+
+function extractClaudeModelCatalog(executablePath) {
   if (!executablePath) {
     return [];
   }
@@ -3519,42 +4302,248 @@ function extractClaudeModelCatalog(claudeBin) {
   }
 }
 
-function resolveClaudeExecutablePath(claudeBin) {
-  if (!claudeBin || typeof claudeBin !== 'string') {
+function extractCodexModelCatalog(codexHome) {
+  const cachePath = path.join(codexHome, 'models_cache.json');
+  if (!fs.existsSync(cachePath)) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    const models = Array.isArray(parsed?.models) ? parsed.models : [];
+    return models
+      .filter((model) => model && typeof model.slug === 'string' && model.slug.trim())
+      .filter((model) => model.visibility !== 'hidden')
+      .sort((left, right) => (left.priority || 0) - (right.priority || 0))
+      .map((model) => ({
+        description: typeof model.description === 'string' ? model.description.trim() : '',
+        label: typeof model.display_name === 'string' && model.display_name.trim() ? model.display_name.trim() : model.slug.trim(),
+        summary: typeof model.description === 'string' ? model.description.trim() : '',
+        value: model.slug.trim(),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function resolveProviderExecutablePath(provider, env = process.env) {
+  return resolveCliExecutablePath(getProviderExecutableName(provider), env);
+}
+
+function resolveCliExecutablePath(commandName, env = process.env) {
+  if (!commandName || typeof commandName !== 'string') {
     return '';
   }
 
-  const trimmed = claudeBin.trim();
+  const trimmed = commandName.trim();
   if (!trimmed) {
     return '';
   }
 
   if (trimmed.includes(path.sep)) {
-    try {
-      return fs.realpathSync(trimmed);
-    } catch {
-      return trimmed;
+    return resolveExecutableCandidate(trimmed);
+  }
+
+  const pathResolved = findExecutableInPath(trimmed, env?.PATH || '');
+  if (pathResolved) {
+    return pathResolved;
+  }
+
+  const shellResolved = resolveExecutableFromUserShell(trimmed);
+  if (shellResolved) {
+    return shellResolved;
+  }
+
+  for (const candidate of getCommonExecutableCandidates(trimmed)) {
+    const resolved = resolveExecutableCandidate(candidate);
+    if (resolved) {
+      return resolved;
     }
   }
 
-  try {
-    const whichResult = spawnSync('which', [trimmed], {
-      encoding: 'utf8',
-    });
-    const resolvedPath = (whichResult.stdout || '').split('\n').find(Boolean)?.trim();
+  return '';
+}
 
-    if (!resolvedPath) {
+function getCliProcessEnv(force = false) {
+  const shellPath = getShellPathValue(force);
+  if (!shellPath) {
+    return { ...process.env };
+  }
+
+  return {
+    ...process.env,
+    PATH: shellPath,
+  };
+}
+
+function getShellPathValue(force = false) {
+  const now = Date.now();
+  if (!force && shellPathCache.checkedAt && now - shellPathCache.checkedAt < CLAUDE_CHECK_TTL_MS) {
+    return shellPathCache.value || process.env.PATH || '';
+  }
+
+  const shellPath = readPathFromUserShell();
+  shellPathCache = {
+    checkedAt: now,
+    value: shellPath || process.env.PATH || '',
+  };
+
+  return shellPathCache.value;
+}
+
+function readPathFromUserShell() {
+  const shellExecutable = getUserShellExecutable();
+  if (!shellExecutable) {
+    return '';
+  }
+
+  const marker = '__CLI_PROXY_PATH__';
+
+  try {
+    const result = spawnSync(shellExecutable, ['-ilc', `printf '${marker}%s' "$PATH"`], {
+      encoding: 'utf8',
+      env: { ...process.env },
+      maxBuffer: 512 * 1024,
+    });
+    const output = `${result.stdout || ''}${result.stderr || ''}`;
+    const markerIndex = output.lastIndexOf(marker);
+    if (markerIndex === -1) {
       return '';
     }
 
-    try {
-      return fs.realpathSync(resolvedPath);
-    } catch {
-      return resolvedPath;
-    }
+    return output.slice(markerIndex + marker.length).trim();
   } catch {
     return '';
   }
+}
+
+function getUserShellExecutable() {
+  const shellExecutable = typeof process.env.SHELL === 'string' && process.env.SHELL.trim()
+    ? process.env.SHELL.trim()
+    : '/bin/zsh';
+
+  return resolveExecutableCandidate(shellExecutable) || '/bin/zsh';
+}
+
+function resolveExecutableFromUserShell(commandName) {
+  const shellExecutable = getUserShellExecutable();
+  if (!shellExecutable || !commandName) {
+    return '';
+  }
+
+  const marker = '__CLI_PROXY_BIN__';
+  const escapedCommand = escapeShellArg(commandName);
+
+  try {
+    const result = spawnSync(shellExecutable, ['-ilc', `printf '${marker}%s' "$(command -v ${escapedCommand} 2>/dev/null)"`], {
+      encoding: 'utf8',
+      env: { ...process.env },
+      maxBuffer: 256 * 1024,
+    });
+    const output = `${result.stdout || ''}${result.stderr || ''}`;
+    const markerIndex = output.lastIndexOf(marker);
+    if (markerIndex === -1) {
+      return '';
+    }
+
+    return resolveExecutableCandidate(output.slice(markerIndex + marker.length).trim());
+  } catch {
+    return '';
+  }
+}
+
+function findExecutableInPath(commandName, pathValue) {
+  if (!commandName || !pathValue) {
+    return '';
+  }
+
+  for (const segment of String(pathValue).split(path.delimiter)) {
+    const directoryPath = segment && segment.trim() ? segment.trim() : '';
+    if (!directoryPath) {
+      continue;
+    }
+
+    const candidatePath = path.join(directoryPath, commandName);
+    const resolved = resolveExecutableCandidate(candidatePath);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return '';
+}
+
+function getCommonExecutableCandidates(commandName) {
+  const homeDirectory = os.homedir();
+  const candidates = [
+    path.join('/opt/homebrew/bin', commandName),
+    path.join('/usr/local/bin', commandName),
+    path.join(homeDirectory, '.local', 'bin', commandName),
+    path.join(homeDirectory, 'Library', 'pnpm', commandName),
+  ];
+
+  return [
+    ...candidates,
+    ...collectVersionedExecutableCandidates(path.join(homeDirectory, '.nvm', 'versions', 'node'), commandName),
+    ...collectCellarNvmExecutableCandidates('/opt/homebrew/Cellar/nvm', commandName),
+    ...collectCellarNvmExecutableCandidates('/usr/local/Cellar/nvm', commandName),
+  ];
+}
+
+function collectVersionedExecutableCandidates(rootPath, commandName, nestedSegments = []) {
+  if (!rootPath || !fs.existsSync(rootPath)) {
+    return [];
+  }
+
+  try {
+    return fs.readdirSync(rootPath)
+      .map((entry) => path.join(rootPath, entry, ...nestedSegments, 'bin', commandName))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function collectCellarNvmExecutableCandidates(rootPath, commandName) {
+  if (!rootPath || !fs.existsSync(rootPath)) {
+    return [];
+  }
+
+  try {
+    return fs.readdirSync(rootPath)
+      .flatMap((entry) => collectVersionedExecutableCandidates(path.join(rootPath, entry, 'versions', 'node'), commandName));
+  } catch {
+    return [];
+  }
+}
+
+function resolveExecutableCandidate(candidatePath) {
+  if (!candidatePath || typeof candidatePath !== 'string') {
+    return '';
+  }
+
+  try {
+    fs.accessSync(candidatePath, fs.constants.X_OK);
+    return fs.realpathSync(candidatePath);
+  } catch {
+    return '';
+  }
+}
+
+function escapeShellArg(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function getProviderExecutableName(provider) {
+  return normalizeSessionProvider(provider) === 'codex' ? CODEX_BIN : CLAUDE_BIN;
+}
+
+function getProviderLabel(provider) {
+  return normalizeSessionProvider(provider) === 'codex' ? 'Codex' : 'Claude';
+}
+
+function getProjectProviderDirectoryName(provider) {
+  return normalizeSessionProvider(provider) === 'codex' ? '.codex' : '.claude';
 }
 
 function parseClaudeModelCatalog(source) {
@@ -3690,12 +4679,13 @@ function parseSkillInstallArgs(args) {
   return { scope, sourceArg };
 }
 
-function collectInstalledSkills(workspacePath) {
+function collectInstalledSkills(workspacePath, provider = DEFAULT_PROVIDER) {
+  const normalizedProvider = normalizeSessionProvider(provider);
   const roots = [
-    { path: path.join(getClaudeHome(), 'skills'), scope: 'user' },
+    { path: path.join(getProviderHome(normalizedProvider), 'skills'), scope: 'user' },
   ];
   if (workspacePath) {
-    roots.push({ path: path.join(workspacePath, '.claude', 'skills'), scope: 'project' });
+    roots.push({ path: path.join(workspacePath, getProjectProviderDirectoryName(normalizedProvider), 'skills'), scope: 'project' });
   }
   const entries = [];
   const seen = new Set();
@@ -3752,7 +4742,12 @@ function collectInstalledSkills(workspacePath) {
   return entries.sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function getClaudeHome() {
+function getProviderHome(provider = DEFAULT_PROVIDER) {
+  if (normalizeSessionProvider(provider) === 'codex') {
+    const configuredCodexHome = typeof process.env.CODEX_HOME === 'string' ? process.env.CODEX_HOME.trim() : '';
+    return configuredCodexHome || path.join(os.homedir(), '.codex');
+  }
+
   const configured = typeof process.env.CLAUDE_CONFIG_DIR === 'string' ? process.env.CLAUDE_CONFIG_DIR.trim() : '';
   return configured || path.join(os.homedir(), '.claude');
 }

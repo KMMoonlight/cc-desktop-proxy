@@ -31,6 +31,8 @@
     --user-bubble-selection: 210 74% 81%;
     --user-bubble-selection-foreground: 222 20% 15%;
     --user-bubble-shadow: 220 20% 60% / 0.18;
+    --pane-focus: 184 54% 48%;
+    --pane-focus-surface: 184 62% 90%;
     --radius: 0.95rem;
   }
 
@@ -62,6 +64,8 @@
     --user-bubble-selection: 210 58% 48%;
     --user-bubble-selection-foreground: 210 33% 98%;
     --user-bubble-shadow: 220 30% 2% / 0.48;
+    --pane-focus: 184 62% 66%;
+    --pane-focus-surface: 186 34% 22%;
   }
 
   * {
@@ -142,6 +146,16 @@
     margin-bottom: 0;
   }
 
+  .markdown-body {
+    min-width: 0;
+  }
+
+  .markdown-body,
+  .markdown-body :where(p, li, blockquote, td, th) {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
   .markdown-body h1,
   .markdown-body h2,
   .markdown-body h3,
@@ -181,10 +195,18 @@
 
   .markdown-body a {
     @apply font-medium text-primary underline decoration-primary/25 underline-offset-4 transition-colors hover:text-primary/80;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .markdown-body code {
     @apply rounded bg-secondary/90 px-1.5 py-0.5 text-[0.875em] text-foreground;
+  }
+
+  .markdown-body :where(p, li, blockquote, td, th) code {
+    overflow-wrap: anywhere;
+    white-space: break-spaces;
+    word-break: break-word;
   }
 
   .markdown-body .markdown-copy-shell {

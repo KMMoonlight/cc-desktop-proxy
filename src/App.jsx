@@ -6,6 +6,7 @@ import {
   Blocks,
   Bot,
   BrainCircuit,
+  ChevronLeft,
   ChevronDown,
   ChevronRight,
   CheckCircle2,
@@ -19,6 +20,7 @@ import {
   Hand,
   Image as ImageIcon,
   LoaderCircle,
+  MoreHorizontal,
   MessageSquarePlus,
   Paperclip,
   Pencil,
@@ -36,11 +38,11 @@ import {
 } from 'lucide-react';
 
 import GitDiffWindow from '@/components/git-diff-window';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Textarea } from '@/components/ui/textarea';
+import { ToastViewport } from '@/components/ui/toast';
 import { renderMarkdown } from '@/lib/markdown';
 import { cn } from '@/lib/utils';
 
@@ -53,17 +55,29 @@ const EMPTY_APP_STATE = {
     skills: [],
     version: '',
   },
+  defaultProvider: 'claude',
   expandedWorkspaceIds: [],
+  paneLayout: null,
   platform: '',
+  providers: {},
   selectedSessionId: null,
   selectedWorkspaceId: null,
   workspaces: [],
 };
 
+const PROVIDER_KEYS = ['claude', 'codex'];
 const LANGUAGE_STORAGE_KEY = 'cc-desktop-proxy-language';
 const PANE_LAYOUT_STORAGE_KEY = 'cc-desktop-proxy-pane-layout';
+const PANE_RECENT_IDS_STORAGE_KEY = 'cc-desktop-proxy-pane-recent-ids';
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'cc-desktop-proxy-sidebar-collapsed';
 const THEME_STORAGE_KEY = 'cc-desktop-proxy-theme';
 const PANE_LAYOUT_MODES = ['single', 'columns', 'rows', 'grid'];
+const MIN_PANE_HEIGHT = 510;
+const MIN_PANE_WIDTH = 540;
+const SIDEBAR_EXPANDED_WIDTH = 280;
+const SIDEBAR_COLLAPSED_WIDTH = 68;
+const SIDEBAR_VIEW_WORKSPACES = 'workspaces';
+const SIDEBAR_VIEW_HIDDEN_PANES = 'hidden-panes';
 const DEFAULT_PANE_LAYOUT = {
   focusedPaneId: 'pane-1',
   mode: 'single',
@@ -92,6 +106,7 @@ const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
 ]);
 const SIDEBAR_ACTION_BUTTON_CLASS = 'h-8 w-8 shrink-0 rounded-md bg-transparent p-0 text-muted-foreground shadow-none hover:bg-background/80 hover:text-foreground';
 const SIDEBAR_ACTION_SLOT_CLASS = 'absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1';
+const SIDEBAR_RAIL_BUTTON_CLASS = 'relative inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-transparent bg-transparent text-muted-foreground transition-[background-color,color,border-color,box-shadow] hover:bg-background/85 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35';
 
 function formatShortcutLabel(platform, key) {
   const normalizedKey = String(key || '').trim().toUpperCase();
@@ -111,6 +126,63 @@ function formatShortcutTooltip(label, key, platform) {
   }
 
   return `${label} (${shortcutLabel})`;
+}
+
+function formatShortcutComboTooltip(label, shortcutLabel) {
+  if (!label || !shortcutLabel) {
+    return label || '';
+  }
+
+  return `${label} (${shortcutLabel})`;
+}
+
+function formatShiftedShortcutLabel(platform, key) {
+  const normalizedKey = String(key || '').trim().toUpperCase();
+  if (!normalizedKey) {
+    return '';
+  }
+
+  return platform === 'darwin'
+    ? `⇧⌘${normalizedKey}`
+    : `Meta+Shift+${normalizedKey}`;
+}
+
+function formatPaneSplitControlTooltip(copy, count, platform) {
+  const primaryShortcut = formatShortcutLabel(platform, 'D');
+  const combinedShortcut = formatShiftedShortcutLabel(platform, 'D');
+  const lines = [
+    copy.paneSplitAddTooltip(count),
+  ];
+
+  if (primaryShortcut) {
+    lines[0] = `${copy.paneSplitAdd} (${primaryShortcut}) · ${copy.paneSplitAddTooltip(count).replace(`${copy.paneSplitAdd} · `, '')}`;
+  }
+
+  if (combinedShortcut) {
+    lines.push(formatShortcutComboTooltip(copy.paneSplitAddAndCreate, combinedShortcut));
+  }
+
+  return lines.join('\n');
+}
+
+function formatShortcutRangeLabel(platform, start, end) {
+  const normalizedStart = String(start || '').trim();
+  const normalizedEnd = String(end || '').trim();
+  if (!normalizedStart || !normalizedEnd) {
+    return '';
+  }
+
+  return platform === 'darwin'
+    ? `⌘${normalizedStart}-${normalizedEnd}`
+    : `Meta+${normalizedStart}-${normalizedEnd}`;
+}
+
+function getPaneHeaderLabel(platform, paneNumber) {
+  if (Number.isInteger(paneNumber) && paneNumber >= 1 && paneNumber <= 9) {
+    return formatShortcutLabel(platform, String(paneNumber));
+  }
+
+  return String(paneNumber || '');
 }
 
 const COPY = {
@@ -133,14 +205,16 @@ const COPY = {
     assistantThinking: '正在思考',
     bridgeUnavailable: '当前页面没有接到 Electron bridge，请通过桌面应用启动。',
     cancel: '取消',
-    claudeCode: 'Claude Code',
-    claudeCodeUnavailable: 'Claude Code 不可用',
+    claudeCode: 'Claude',
+    claudeCodeUnavailable: 'Claude 不可用',
+    collapseSidebar: '折叠侧边栏',
     collapseDetails: '收起详情',
     collapseWorkspace: '收起工作目录',
     conversationEmpty: '这个会话还没有内容',
     createConversationForWorkspace: '为当前目录新开对话',
     createConversationInWorkspace: (path) => `在 ${path} 中新建对话`,
     emptyWorkspaces: '还没有工作目录，先添加一个本地目录。',
+    expandSidebar: '展开侧边栏',
     expandDetails: '展开详情',
     expandWorkspace: '展开工作目录',
     inputPlaceholder: '输入消息或 / 指令，Enter 发送，Shift+Enter 换行...',
@@ -157,9 +231,9 @@ const COPY = {
     modeSummaryAskBeforeEdits: 'Claude 会在每次编辑前先请求审批。',
     modeSummaryEditAutomatically: 'Claude 会自动编辑你选中的文本或整个文件。',
     modeSummaryPlanMode: 'Claude 会先探索代码并给出计划，再开始编辑。',
-    modelDefault: '跟随 Claude 默认值',
+    modelDefault: '跟随默认模型',
     modelLabel: '模型',
-    modelMenuDescription: '切换当前会话的 Claude 模型，命令值与 Claude Code 的 /model 保持一致。',
+    modelMenuDescription: '切换当前会话的模型。',
     modelMenuHint: '其他完整模型名仍然可以通过 /model <name> 设置。',
     modelMenuTitle: '选择模型',
     modelOptionCustom: '当前自定义模型',
@@ -169,11 +243,22 @@ const COPY = {
     modelOptionOpusLong: 'Opus（1M context）',
     modelOptionSonnet: 'Sonnet',
     modelSummaryCustom: (label) => `当前会话正在使用 ${label}`,
-    modelSummaryDefault: (label) => (label ? `使用 Claude Code 默认模型（当前 ${label}）` : '使用 Claude Code 默认模型'),
+    modelSummaryDefault: (label, providerLabel) => (label ? `使用 ${providerLabel || '当前 provider'} 默认模型（当前 ${label}）` : `使用 ${providerLabel || '当前 provider'} 默认模型`),
     modelSummaryHaiku: 'Haiku 4.5 · 响应最快，适合轻量任务 · $1/$5 per Mtok',
     modelSummaryOpus: 'Opus 4.6 · 最适合复杂任务 · $5/$25 per Mtok',
     modelSummaryOpusLong: 'Opus 4.6 长上下文版 · 适合超长会话 · $10/$37.50 per Mtok',
     modelSummarySonnet: 'Sonnet 4.5 · 适合日常编码任务 · $3/$15 per Mtok',
+    providerLabel: 'Provider',
+    providerMenuDescription: '为当前会话选择本地 CLI。',
+    providerMenuHint: '发送第一条消息后会锁定当前 Provider。',
+    providerLockedHint: '这个会话已经开始对话，Provider 不能再修改。',
+    providerMenuTitle: '选择 Provider',
+    providerOptionClaude: 'Claude',
+    providerOptionCodex: 'Codex',
+    providerSessionDisabledHint: (label) => `${label} 已在设置中关闭，当前会话暂时不能继续对话。`,
+    providerSummaryClaude: '本地 Claude CLI',
+    providerSummaryCodex: '本地 Codex CLI',
+    providerUnavailable: (label) => `${label} 不可用`,
     noConversationOpen: '还没有打开对话',
     paneClear: '清空当前分屏',
     paneClickToFocus: '点击切换到这个分屏',
@@ -185,7 +270,13 @@ const COPY = {
     paneLayoutRows: '上下分屏',
     paneLayoutSingle: '单对话',
     paneLayoutTitle: '布局',
+    paneOverflowBusy: '运行中',
+    paneOverflowDescription: '窗口变小时，超出的分屏会暂时收在这里。点击即可切换回来。',
+    paneOverflowLabel: '隐藏分屏',
+    paneOverflowTrigger: (count) => `${count} 个隐藏分屏`,
     paneSplitAdd: '新增分屏',
+    paneSplitAddAndCreate: '新增分屏并新建对话',
+    paneSplitAddTooltip: (count) => `新增分屏 · 当前窗口最多可显示 ${count} 个分屏`,
     paneSplitLimitReached: '当前窗口尺寸下已达到最大分屏数',
     paneLoading: '正在载入对话...',
     noSessionCommandHint: '输入 /clear 新建对话，或先在左侧选择一个历史会话',
@@ -198,6 +289,12 @@ const COPY = {
     removeWorkspaceDescription: '移除后，这个工作目录及其本地话题记录会从应用列表中删除。',
     removeWorkspaceTitle: '确认移除这个工作目录？',
     removeWorkspaceWithPath: (path) => `移除 ${path}`,
+    openWorkspaceInFinder: '在 Finder 中打开工作目录',
+    openWorkspaceInFinderWithPath: (path) => `在 Finder 中打开 ${path}`,
+    workspaceGitBranchInfo: '当前 Git 分支',
+    workspaceGitChangesSummary: (added, deleted) => `查看 Git 变更 · +${added || 0} -${deleted || 0}`,
+    workspaceGitUnavailable: '当前目录不是 Git 仓库',
+    workspaceMoreActions: '更多操作',
     removeAttachment: '移除附件',
     runStop: '停止生成',
     searchPlaceholder: '搜索对话标题、摘要或会话 ID',
@@ -205,11 +302,22 @@ const COPY = {
     sendMessage: '发送消息',
     sending: '发送中',
     settings: '设置',
-    settingsDescription: '调整客户端语言和主题偏好。',
+    settingsDescription: '调整客户端语言、主题和 Provider 偏好。',
     settingsTitle: '设置',
     settingsClose: '关闭',
+    settingsProvidersHint: '至少保留一个 Provider 处于启用状态。',
+    settingsProvidersTitle: 'Provider',
+    settingsProvidersDescription: '控制哪些本地 CLI 可以用于新会话和可切换会话。',
+    settingsShortcutsTitle: '快捷键',
+    settingsShortcutAddWorkspace: '添加工作目录',
+    settingsShortcutToggleSidebar: '切换侧边栏展开 / 收起',
+    settingsShortcutAddPane: '新增空分屏',
+    settingsShortcutAddPaneAndCreate: '新增分屏并立即新建对话',
+    settingsShortcutCreateConversation: '在当前工作目录新建对话',
+    settingsShortcutClosePane: '关闭当前分屏',
+    settingsShortcutFocusPane: '切换到当前可见的第 1-9 个分屏',
     startByAddingWorkspace: '先添加一个工作目录',
-    startByAddingWorkspaceDescription: '工作目录会成为 Claude Code 运行时的本地上下文。你可以创建多个目录，并在左侧切换它们各自的历史对话。',
+    startByAddingWorkspaceDescription: '工作目录会成为本地 CLI 运行时的上下文。你可以创建多个目录，并在左侧切换它们各自的历史对话。',
     themeDark: '🌙 深色',
     themeLabel: '主题',
     themeLight: '☀️ 浅色',
@@ -243,14 +351,16 @@ const COPY = {
     assistantThinking: 'Thinking',
     bridgeUnavailable: 'Electron bridge is not available on this page. Please open it from the desktop app.',
     cancel: 'Cancel',
-    claudeCode: 'Claude Code',
-    claudeCodeUnavailable: 'Claude Code unavailable',
+    claudeCode: 'Claude',
+    claudeCodeUnavailable: 'Claude unavailable',
+    collapseSidebar: 'Collapse sidebar',
     collapseDetails: 'Hide details',
     collapseWorkspace: 'Collapse workspace',
     conversationEmpty: 'This conversation is empty',
     createConversationForWorkspace: 'Start a conversation for this workspace',
     createConversationInWorkspace: (path) => `Start a conversation in ${path}`,
     emptyWorkspaces: 'No workspaces yet. Add a local folder to get started.',
+    expandSidebar: 'Expand sidebar',
     expandDetails: 'Show details',
     expandWorkspace: 'Expand workspace',
     inputPlaceholder: 'Type a message or / command, press Enter to send, Shift+Enter for a new line...',
@@ -267,9 +377,9 @@ const COPY = {
     modeSummaryAskBeforeEdits: 'Claude will ask for approval before making each edit.',
     modeSummaryEditAutomatically: 'Claude will edit your selected text or the whole file.',
     modeSummaryPlanMode: 'Claude will explore the code and present a plan before editing.',
-    modelDefault: 'Follow Claude default',
+    modelDefault: 'Follow default model',
     modelLabel: 'Model',
-    modelMenuDescription: 'Switch Claude models for this conversation. Command values match Claude Code /model.',
+    modelMenuDescription: 'Switch the model for this conversation.',
     modelMenuHint: 'You can still set any full model name with /model <name>.',
     modelMenuTitle: 'Select model',
     modelOptionCustom: 'Current custom model',
@@ -279,11 +389,22 @@ const COPY = {
     modelOptionOpusLong: 'Opus (1M context)',
     modelOptionSonnet: 'Sonnet',
     modelSummaryCustom: (label) => `This conversation is currently using ${label}`,
-    modelSummaryDefault: (label) => (label ? `Use Claude Code's default model (currently ${label})` : 'Use Claude Code\'s default model'),
+    modelSummaryDefault: (label, providerLabel) => (label ? `Use ${providerLabel || 'the selected provider'} default model (currently ${label})` : `Use ${providerLabel || 'the selected provider'} default model`),
     modelSummaryHaiku: 'Haiku 4.5 · Fastest for quick answers · $1/$5 per Mtok',
     modelSummaryOpus: 'Opus 4.6 · Most capable for complex work · $5/$25 per Mtok',
     modelSummaryOpusLong: 'Opus 4.6 for long sessions · $10/$37.50 per Mtok',
     modelSummarySonnet: 'Sonnet 4.5 · Best for everyday tasks · $3/$15 per Mtok',
+    providerLabel: 'Provider',
+    providerMenuDescription: 'Choose the local CLI for this conversation.',
+    providerMenuHint: 'The provider locks after the first message.',
+    providerLockedHint: 'This conversation has already started, so the provider can no longer be changed.',
+    providerMenuTitle: 'Select provider',
+    providerOptionClaude: 'Claude',
+    providerOptionCodex: 'Codex',
+    providerSessionDisabledHint: (label) => `${label} is disabled in Settings, so this conversation cannot continue for now.`,
+    providerSummaryClaude: 'Local Claude CLI',
+    providerSummaryCodex: 'Local Codex CLI',
+    providerUnavailable: (label) => `${label} unavailable`,
     noConversationOpen: 'No conversation open',
     paneClear: 'Clear pane',
     paneClickToFocus: 'Click to focus this pane',
@@ -295,7 +416,13 @@ const COPY = {
     paneLayoutRows: 'Split rows',
     paneLayoutSingle: 'Single',
     paneLayoutTitle: 'Layout',
+    paneOverflowBusy: 'Running',
+    paneOverflowDescription: 'When the window shrinks, extra panes stay here temporarily. Click one to bring it back.',
+    paneOverflowLabel: 'Hidden panes',
+    paneOverflowTrigger: (count) => `${count} hidden panes`,
     paneSplitAdd: 'Add split',
+    paneSplitAddAndCreate: 'Add split and conversation',
+    paneSplitAddTooltip: (count) => `Add split · This window can show up to ${count} panes`,
     paneSplitLimitReached: 'Maximum split count reached for this window size',
     paneLoading: 'Loading conversation...',
     noSessionCommandHint: 'Type /clear to start a conversation, or pick one from the sidebar',
@@ -308,6 +435,12 @@ const COPY = {
     removeWorkspaceDescription: 'Removing this workspace will delete it and its local conversation history from the app list.',
     removeWorkspaceTitle: 'Remove this workspace?',
     removeWorkspaceWithPath: (path) => `Remove ${path}`,
+    openWorkspaceInFinder: 'Open workspace in Finder',
+    openWorkspaceInFinderWithPath: (path) => `Open ${path} in Finder`,
+    workspaceGitBranchInfo: 'Current Git branch',
+    workspaceGitChangesSummary: (added, deleted) => `View Git changes · +${added || 0} -${deleted || 0}`,
+    workspaceGitUnavailable: 'This folder is not a Git repository',
+    workspaceMoreActions: 'More actions',
     removeAttachment: 'Remove attachment',
     runStop: 'Stop generation',
     searchPlaceholder: 'Search titles, previews, or session IDs',
@@ -315,11 +448,22 @@ const COPY = {
     sendMessage: 'Send message',
     sending: 'Sending',
     settings: 'Settings',
-    settingsDescription: 'Adjust the client language and theme preferences.',
+    settingsDescription: 'Adjust language, theme, and provider preferences.',
     settingsTitle: 'Settings',
     settingsClose: 'Close',
+    settingsProvidersHint: 'Keep at least one provider enabled.',
+    settingsProvidersTitle: 'Providers',
+    settingsProvidersDescription: 'Control which local CLIs are available for new and switchable conversations.',
+    settingsShortcutsTitle: 'Shortcuts',
+    settingsShortcutAddWorkspace: 'Add workspace',
+    settingsShortcutToggleSidebar: 'Toggle the sidebar',
+    settingsShortcutAddPane: 'Add an empty split',
+    settingsShortcutAddPaneAndCreate: 'Add a split and create a conversation',
+    settingsShortcutCreateConversation: 'Create a conversation in the current workspace',
+    settingsShortcutClosePane: 'Close the current split',
+    settingsShortcutFocusPane: 'Focus visible split 1-9',
     startByAddingWorkspace: 'Add a workspace first',
-    startByAddingWorkspaceDescription: 'A workspace becomes the local context for Claude Code. You can add multiple folders and switch between their conversation histories from the left sidebar.',
+    startByAddingWorkspaceDescription: 'A workspace becomes the local context for your coding CLI. You can add multiple folders and switch between their conversation histories from the left sidebar.',
     themeDark: '🌙 Dark',
     themeLabel: 'Theme',
     themeLight: '☀️ Light',
@@ -355,10 +499,10 @@ function MainApp({ desktopClient }) {
   const [inputValue, setInputValue] = useState('');
   const [composerAttachments, setComposerAttachments] = useState([]);
   const [composerHistoryIndex, setComposerHistoryIndex] = useState(-1);
-  const [sidebarError, setSidebarError] = useState(
-    desktopClient ? '' : COPY[getInitialLanguage()].bridgeUnavailable,
-  );
+  const [toastItems, setToastItems] = useState([]);
   const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState([]);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => getInitialSidebarCollapsed());
+  const [sidebarFlyoutView, setSidebarFlyoutView] = useState(null);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [isArchivingSession, setIsArchivingSession] = useState(false);
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
@@ -369,20 +513,28 @@ function MainApp({ desktopClient }) {
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [isUpdatingPermissionMode, setIsUpdatingPermissionMode] = useState(false);
   const [isUpdatingModel, setIsUpdatingModel] = useState(false);
+  const [isUpdatingProvider, setIsUpdatingProvider] = useState(false);
+  const [isUpdatingProviderSettings, setIsUpdatingProviderSettings] = useState(false);
   const [pendingApprovalActionId, setPendingApprovalActionId] = useState('');
   const [pendingArchiveSession, setPendingArchiveSession] = useState(null);
   const [pendingRemoveWorkspace, setPendingRemoveWorkspace] = useState(null);
   const [paneLayout, setPaneLayout] = useState(() => getInitialPaneLayout());
+  const [paneRecentIds, setPaneRecentIds] = useState(() => getInitialPaneRecentIds());
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
   const [sessionViewCache, setSessionViewCache] = useState({});
   const [sessionSearchQuery, setSessionSearchQuery] = useState('');
 
   const hasHydratedExpandedWorkspaceIdsRef = useRef(false);
+  const hasHydratedPaneLayoutRef = useRef(false);
   const hasInitializedPaneSelectionRef = useRef(false);
   const modePickerRef = useRef(null);
   const modelPickerRef = useRef(null);
-  const paneBoardRef = useRef(null);
+  const collapsedSidebarRef = useRef(null);
+  const [paneBoardElement, setPaneBoardElement] = useState(null);
+  const paneLayoutRef = useRef(paneLayout);
+  const paneRecentIdsRef = useRef(paneRecentIds);
   const paneViewportRefs = useRef(new Map());
+  const sidebarFlyoutRef = useRef(null);
   const slashCommandMenuRef = useRef(null);
   const textareaRef = useRef(null);
   const [paneBoardSize, setPaneBoardSize] = useState(() => getInitialPaneBoardSize());
@@ -423,9 +575,37 @@ function MainApp({ desktopClient }) {
     return sessionViewCache[focusedSessionCacheKey] || null;
   }, [focusedPane, focusedSessionCacheKey, selectedSession, sessionViewCache]);
   const normalizedSessionSearchQuery = sessionSearchQuery.trim().toLowerCase();
-  const installedSkills = Array.isArray(appState.claude.skills) ? appState.claude.skills : [];
+  const providerCatalog = appState.providers && typeof appState.providers === 'object'
+    ? appState.providers
+    : {};
+  const focusedProvider = normalizeProviderKey(focusedSession?.provider || appState.defaultProvider);
+  const focusedProviderInfo = getProviderInfo(providerCatalog, focusedProvider, appState.defaultProvider);
+  const sidebarProviderStatuses = useMemo(
+    () => PROVIDER_KEYS
+      .map((providerKey) => ({
+        key: providerKey,
+        info: getProviderInfo(providerCatalog, providerKey, providerKey),
+      }))
+      .filter(({ info }) => info.enabled !== false),
+    [providerCatalog],
+  );
+  const providerSettings = useMemo(
+    () => PROVIDER_KEYS.map((providerKey) => {
+      const info = getProviderInfo(providerCatalog, providerKey, providerKey);
+
+      return {
+        available: Boolean(info.available),
+        enabled: info.enabled !== false,
+        key: providerKey,
+        label: getProviderDisplayName(providerKey, copy),
+        summary: providerKey === 'codex' ? copy.providerSummaryCodex : copy.providerSummaryClaude,
+      };
+    }),
+    [copy, providerCatalog],
+  );
+  const installedSkills = Array.isArray(focusedProviderInfo.skills) ? focusedProviderInfo.skills : [];
   const slashCommands = useMemo(() => getSlashCommands(language, installedSkills), [installedSkills, language]);
-  const availableClaudeModels = Array.isArray(appState.claude.models) ? appState.claude.models : [];
+  const availableSessionModels = Array.isArray(focusedProviderInfo.models) ? focusedProviderInfo.models : [];
   const sessionPermissionMode = focusedSession?.permissionMode || 'default';
   const modeOptions = useMemo(() => getComposerSessionModeOptions(copy), [copy]);
   const currentModeDisplay = useMemo(
@@ -442,12 +622,12 @@ function MainApp({ desktopClient }) {
   );
   const effectiveCurrentModel = focusedSession?.currentModel || focusedSession?.model || '';
   const modelOptions = useMemo(
-    () => getComposerModelOptions(copy, focusedSession?.model || '', effectiveCurrentModel, availableClaudeModels),
-    [availableClaudeModels, copy, effectiveCurrentModel, focusedSession?.model],
+    () => getComposerModelOptions(copy, focusedProvider, focusedSession?.model || '', effectiveCurrentModel, availableSessionModels),
+    [availableSessionModels, copy, effectiveCurrentModel, focusedProvider, focusedSession?.model],
   );
   const currentModelDisplay = useMemo(
-    () => getModelDisplayName(effectiveCurrentModel, availableClaudeModels) || copy.modelOptionDefault,
-    [availableClaudeModels, copy.modelOptionDefault, effectiveCurrentModel],
+    () => getModelDisplayName(effectiveCurrentModel, availableSessionModels, focusedProvider) || copy.modelOptionDefault,
+    [availableSessionModels, copy.modelOptionDefault, effectiveCurrentModel, focusedProvider],
   );
   const currentModelCommandValue = useMemo(
     () => ((focusedSession?.model || '').trim() || 'default'),
@@ -482,6 +662,34 @@ function MainApp({ desktopClient }) {
     })),
     [appState, copy, language, paneLayout.focusedPaneId, paneLayout.panes, selectedSession, sendingPaneIds, sessionViewCache],
   );
+  const maxPaneCount = useMemo(
+    () => getAdaptivePaneLimit(paneBoardSize.width, paneBoardSize.height),
+    [paneBoardSize.height, paneBoardSize.width],
+  );
+  const prioritizedPaneIds = useMemo(
+    () => getPrioritizedPaneIds(paneLayout.panes, paneRecentIds, paneLayout.focusedPaneId),
+    [paneLayout.focusedPaneId, paneLayout.panes, paneRecentIds],
+  );
+  const visiblePaneIds = useMemo(
+    () => getVisiblePaneIds(paneLayout.panes, prioritizedPaneIds, maxPaneCount),
+    [maxPaneCount, paneLayout.panes, prioritizedPaneIds],
+  );
+  const visiblePaneIdSet = useMemo(() => new Set(visiblePaneIds), [visiblePaneIds]);
+  const visiblePaneViews = useMemo(
+    () => paneViews.filter((pane) => visiblePaneIdSet.has(pane.id)),
+    [paneViews, visiblePaneIdSet],
+  );
+  const hiddenPaneViews = useMemo(
+    () => orderPaneViewsByIds(
+      paneViews.filter((pane) => !visiblePaneIdSet.has(pane.id)),
+      prioritizedPaneIds,
+    ),
+    [paneViews, prioritizedPaneIds, visiblePaneIdSet],
+  );
+  const sessionPaneBindingMap = useMemo(
+    () => buildSessionPaneBindingMap(paneLayout.panes),
+    [paneLayout.panes],
+  );
   const pendingApprovalRequestIds = useMemo(
     () => new Set(
       paneViews.flatMap((pane) => (
@@ -496,13 +704,9 @@ function MainApp({ desktopClient }) {
     () => paneViews.find((pane) => pane.id === focusedPane?.id) || null,
     [focusedPane?.id, paneViews],
   );
-  const maxPaneCount = useMemo(
-    () => getAdaptivePaneLimit(paneBoardSize.width, paneBoardSize.height),
-    [paneBoardSize.height, paneBoardSize.width],
-  );
   const paneGridSpec = useMemo(
-    () => getAdaptivePaneGridSpec(paneViews.length, paneBoardSize.width, paneBoardSize.height),
-    [paneBoardSize.height, paneBoardSize.width, paneViews.length],
+    () => getAdaptivePaneGridSpec(visiblePaneViews.length, paneBoardSize.width, paneBoardSize.height),
+    [paneBoardSize.height, paneBoardSize.width, visiblePaneViews.length],
   );
   const filteredWorkspaces = useMemo(() => {
     if (!normalizedSessionSearchQuery) {
@@ -527,6 +731,111 @@ function MainApp({ desktopClient }) {
   const topBarHeightClass = isMac ? 'h-10' : 'h-11';
   const topBarOffsetClass = isMac ? 'pt-10' : 'pt-11';
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
+  const hasHiddenPanes = hiddenPaneViews.length > 0;
+  const hiddenPaneSection = hasHiddenPanes ? (
+    <HiddenPaneSection
+      copy={copy}
+      hiddenPanes={hiddenPaneViews}
+      onClearPane={(paneId) => {
+        clearPane(paneId);
+      }}
+      onFocusPane={(paneId) => {
+        setSidebarFlyoutView(null);
+        void focusPane(paneId);
+      }}
+    />
+  ) : null;
+  const workspaceSidebarSection = (
+    <SidebarSection
+      title={copy.workspaceSection}
+      action={(
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => {
+            setSidebarFlyoutView(null);
+            addWorkspace();
+          }}
+          disabled={!desktopClient || isPickingWorkspace}
+          aria-label={copy.addWorkspace}
+          title={formatShortcutTooltip(copy.addWorkspace, 'O', appState.platform)}
+          className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'text-foreground')}
+        >
+          {isPickingWorkspace ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <FolderPlus className="h-4 w-4" />}
+        </Button>
+      )}
+    >
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={sessionSearchQuery}
+          onChange={(event) => setSessionSearchQuery(event.target.value)}
+          placeholder={copy.searchPlaceholder}
+          className="h-8 rounded-xl border-border/80 bg-background/80 pl-8 pr-3 text-[12px] shadow-none placeholder:text-muted-foreground/90"
+        />
+      </div>
+
+      <div className="max-h-[min(48vh,30rem)] overflow-y-auto pr-1">
+        <div className="space-y-3">
+          {appState.workspaces.length === 0 ? (
+            <SidebarEmpty text={copy.emptyWorkspaces} />
+          ) : filteredWorkspaces.length === 0 ? (
+            <SidebarEmpty text={copy.searchNoResult(sessionSearchQuery.trim())} />
+          ) : (
+            filteredWorkspaces.map((workspace) => (
+              <WorkspaceItem
+                copy={copy}
+                key={workspace.id}
+                disabled={isArchivingSession || isRemovingWorkspace}
+                isExpanded={normalizedSessionSearchQuery ? true : expandedWorkspaceIds.includes(workspace.id)}
+                onArchiveSession={(session) => {
+                  setSidebarFlyoutView(null);
+                  setPendingArchiveSession({
+                    sessionId: session.id,
+                    title: session.title,
+                    workspaceId: workspace.id,
+                  });
+                }}
+                onCreateSession={() => {
+                  setSidebarFlyoutView(null);
+                  createSession(workspace.id);
+                }}
+                onOpenGitDiffWindow={() => {
+                  setSidebarFlyoutView(null);
+                  openGitDiffWindow(workspace.id);
+                }}
+                onOpenWorkspaceInFinder={() => {
+                  setSidebarFlyoutView(null);
+                  openWorkspaceInFinder(workspace.id);
+                }}
+                onRemoveWorkspace={() => {
+                  setSidebarFlyoutView(null);
+                  setPendingRemoveWorkspace({
+                    title: workspace.name,
+                    workspaceId: workspace.id,
+                  });
+                }}
+                onSelectSession={(sessionId) => {
+                  setSidebarFlyoutView(null);
+                  selectSession(workspace.id, sessionId);
+                }}
+                onSelectWorkspace={() => {
+                  setSidebarFlyoutView(null);
+                  selectWorkspace(workspace.id);
+                }}
+                onToggleExpand={() => toggleWorkspaceExpansion(workspace.id)}
+                platform={appState.platform}
+                selectedSessionId={focusedPane?.sessionId || appState.selectedSessionId}
+                sessionPaneBindingMap={sessionPaneBindingMap}
+                language={language}
+                workspace={workspace}
+              />
+            ))
+          )}
+        </div>
+      </div>
+    </SidebarSection>
+  );
 
   useEffect(() => {
     setSelectedSlashCommandIndex(0);
@@ -628,6 +937,64 @@ function MainApp({ desktopClient }) {
   }, [isSettingsOpen]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, JSON.stringify(isSidebarCollapsed));
+  }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    if (!isSidebarCollapsed) {
+      setSidebarFlyoutView(null);
+    }
+  }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    if (!hasHiddenPanes && sidebarFlyoutView === SIDEBAR_VIEW_HIDDEN_PANES) {
+      setSidebarFlyoutView(null);
+    }
+  }, [hasHiddenPanes, sidebarFlyoutView]);
+
+  useEffect(() => {
+    if (isSettingsOpen) {
+      setSidebarFlyoutView(null);
+    }
+  }, [isSettingsOpen]);
+
+  useEffect(() => {
+    if (!isSidebarCollapsed || !sidebarFlyoutView || typeof document === 'undefined') {
+      return undefined;
+    }
+
+    const closeOnOutsidePointer = (event) => {
+      if (!(event.target instanceof Node)) {
+        return;
+      }
+
+      if (collapsedSidebarRef.current?.contains(event.target) || sidebarFlyoutRef.current?.contains(event.target)) {
+        return;
+      }
+
+      setSidebarFlyoutView(null);
+    };
+
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        setSidebarFlyoutView(null);
+      }
+    };
+
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [isSidebarCollapsed, sidebarFlyoutView]);
+
+  useEffect(() => {
     setComposerAttachments([]);
     setComposerHistoryIndex(-1);
   }, [focusedPane?.id, focusedSession?.id]);
@@ -708,7 +1075,6 @@ function MainApp({ desktopClient }) {
         || !event.metaKey
         || event.ctrlKey
         || event.altKey
-        || event.shiftKey
       ) {
         return;
       }
@@ -716,12 +1082,28 @@ function MainApp({ desktopClient }) {
       const shortcutKey = event.key.toLowerCase();
       const paneShortcutIndex = Number.parseInt(shortcutKey, 10);
       const isPaneShortcut = Number.isInteger(paneShortcutIndex) && paneShortcutIndex >= 1 && paneShortcutIndex <= 9;
-      if (shortcutKey !== 'n' && shortcutKey !== 'd' && shortcutKey !== 'w' && !isPaneShortcut) {
+      const isSplitAndCreateShortcut = shortcutKey === 'd' && event.shiftKey;
+      const isSupportedUnshiftedShortcut = !event.shiftKey && (
+        shortcutKey === 'o'
+        || shortcutKey === 'n'
+        || shortcutKey === 'd'
+        || shortcutKey === 'w'
+        || shortcutKey === 'b'
+        || isPaneShortcut
+      );
+
+      if (!isSplitAndCreateShortcut && !isSupportedUnshiftedShortcut) {
+        return;
+      }
+
+      if (isSplitAndCreateShortcut) {
+        event.preventDefault();
+        void addPaneAndCreateSession();
         return;
       }
 
       if (isPaneShortcut) {
-        const targetPane = paneViews[paneShortcutIndex - 1];
+        const targetPane = visiblePaneViews[paneShortcutIndex - 1];
         if (!targetPane) {
           return;
         }
@@ -734,6 +1116,18 @@ function MainApp({ desktopClient }) {
       if (shortcutKey === 'd') {
         event.preventDefault();
         addPane();
+        return;
+      }
+
+      if (shortcutKey === 'o') {
+        event.preventDefault();
+        void addWorkspace();
+        return;
+      }
+
+      if (shortcutKey === 'b') {
+        event.preventDefault();
+        toggleSidebarCollapse();
         return;
       }
 
@@ -763,7 +1157,19 @@ function MainApp({ desktopClient }) {
     return () => {
       document.removeEventListener('keydown', handleGlobalPaneShortcuts);
     };
-  }, [copy.noWorkspaceSelected, focusedPane?.id, focusedWorkspace, paneLayout.panes.length, paneViews, selectedWorkspace]);
+  }, [copy.noWorkspaceSelected, focusedPane?.id, focusedWorkspace, paneLayout.panes.length, selectedWorkspace, visiblePaneViews]);
+
+  useEffect(() => {
+    setPaneRecentIds((current) => syncPaneRecentIds(current, paneLayout.panes, paneLayout.focusedPaneId));
+  }, [paneLayout.focusedPaneId, paneLayout.panes]);
+
+  useEffect(() => {
+    paneLayoutRef.current = paneLayout;
+  }, [paneLayout]);
+
+  useEffect(() => {
+    paneRecentIdsRef.current = paneRecentIds;
+  }, [paneRecentIds]);
 
   useEffect(() => {
     if (typeof document === 'undefined') {
@@ -790,6 +1196,25 @@ function MainApp({ desktopClient }) {
 
     window.localStorage.setItem(PANE_LAYOUT_STORAGE_KEY, JSON.stringify(paneLayout));
   }, [paneLayout]);
+
+  useEffect(() => {
+    if (!desktopClient || !hasHydratedPaneLayoutRef.current) {
+      return;
+    }
+
+    desktopClient.setPaneLayout?.({
+      ...paneLayout,
+      recentPaneIds: paneRecentIds,
+    }).catch(() => {});
+  }, [desktopClient, paneLayout, paneRecentIds]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(PANE_RECENT_IDS_STORAGE_KEY, JSON.stringify(paneRecentIds));
+  }, [paneRecentIds]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof document === 'undefined') {
@@ -823,33 +1248,49 @@ function MainApp({ desktopClient }) {
       return undefined;
     }
 
-    const element = paneBoardRef.current;
+    const element = paneBoardElement;
     if (!element) {
       return undefined;
     }
 
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) {
-        return;
-      }
-
-      const nextWidth = Math.round(entry.contentRect.width);
-      const nextHeight = Math.round(entry.contentRect.height);
-
+    const measurePaneBoard = (width, height) => {
+      const nextWidth = Math.round(width);
+      const nextHeight = Math.round(height);
       setPaneBoardSize((current) => (
         current.width === nextWidth && current.height === nextHeight
           ? current
           : { height: nextHeight, width: nextWidth }
       ));
+    };
+
+    const measureFromElement = () => {
+      const rect = element.getBoundingClientRect();
+      const estimatedSize = getEstimatedPaneBoardSize(window.innerWidth, window.innerHeight);
+      measurePaneBoard(
+        Math.max(rect.width, estimatedSize.width),
+        Math.max(rect.height, estimatedSize.height),
+      );
+    };
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) {
+        measureFromElement();
+        return;
+      }
+
+      measurePaneBoard(entry.contentRect.width, entry.contentRect.height);
     });
 
     observer.observe(element);
+    window.addEventListener('resize', measureFromElement);
+    measureFromElement();
 
     return () => {
       observer.disconnect();
+      window.removeEventListener('resize', measureFromElement);
     };
-  }, [paneViews.length]);
+  }, [paneBoardElement, paneViews.length]);
 
   useEffect(() => {
     if (!desktopClient) {
@@ -1086,7 +1527,35 @@ function MainApp({ desktopClient }) {
 
     try {
       const state = await desktopClient.getAppState();
+      const remotePaneLayout = state?.paneLayout ? normalizePaneLayout(state.paneLayout) : null;
+      const hydratedPaneState = resolveHydratedPaneState({
+        localLayout: paneLayoutRef.current,
+        localRecentIds: paneRecentIdsRef.current,
+        remoteLayout: remotePaneLayout,
+        remoteRecentIds: state?.paneLayout?.recentPaneIds,
+      });
+      const remoteRecentIds = normalizePaneRecentIds(state?.paneLayout?.recentPaneIds, hydratedPaneState.layout.panes);
+
       setAppState(state);
+      setPaneLayout((current) => {
+        const next = hydratedPaneState.layout;
+        return arePaneLayoutsEqual(current, next) ? current : next;
+      });
+      setPaneRecentIds((current) => {
+        const next = hydratedPaneState.recentPaneIds;
+        return arePaneIdListsEqual(current, next) ? current : next;
+      });
+      hasHydratedPaneLayoutRef.current = true;
+      if (
+        !remotePaneLayout
+        || !arePaneLayoutsEqual(remotePaneLayout, hydratedPaneState.layout)
+        || !arePaneIdListsEqual(remoteRecentIds, hydratedPaneState.recentPaneIds)
+      ) {
+        void desktopClient.setPaneLayout?.({
+          ...hydratedPaneState.layout,
+          recentPaneIds: hydratedPaneState.recentPaneIds,
+        }).catch(() => {});
+      }
       setSidebarError('');
     } catch (error) {
       setSidebarError(error.message);
@@ -1145,6 +1614,20 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function openWorkspaceInFinder(workspaceId) {
+    if (!desktopClient || !workspaceId) {
+      return;
+    }
+
+    setSidebarError('');
+
+    try {
+      await desktopClient.openWorkspaceInFinder(workspaceId);
+    } catch (error) {
+      setSidebarError(error.message);
+    }
+  }
+
   function addPane() {
     if (paneLayout.panes.length >= maxPaneCount) {
       setSidebarError(copy.paneSplitLimitReached);
@@ -1153,6 +1636,42 @@ function MainApp({ desktopClient }) {
 
     setSidebarError('');
     setPaneLayout((current) => appendPaneToLayout(current));
+  }
+
+  async function addPaneAndCreateSession() {
+    if (!desktopClient) {
+      return;
+    }
+
+    const targetWorkspace = focusedWorkspace || selectedWorkspace;
+    if (!targetWorkspace) {
+      setSidebarError(copy.noWorkspaceSelected);
+      return;
+    }
+
+    if (paneLayout.panes.length >= maxPaneCount) {
+      setSidebarError(copy.paneSplitLimitReached);
+      return;
+    }
+
+    const nextPaneId = createNextPaneId(paneLayout.panes);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.createSession(targetWorkspace.id);
+      setAppState(nextState);
+      setPaneLayout((current) => assignSessionToPaneState(
+        appendPaneToLayout(current),
+        nextPaneId,
+        {
+          sessionId: nextState.selectedSessionId,
+          workspaceId: nextState.selectedWorkspaceId,
+        },
+      ));
+      setInputValue('');
+    } catch (error) {
+      setSidebarError(error.message);
+    }
   }
 
   async function createSession(workspaceId, options = {}) {
@@ -1190,13 +1709,20 @@ function MainApp({ desktopClient }) {
     }
   }
 
-  async function openSessionInPane(workspaceId, sessionId, { paneId = paneLayout.focusedPaneId } = {}) {
+  async function openSessionInPane(workspaceId, sessionId, { paneId = paneLayout.focusedPaneId, preferPaneId = false } = {}) {
     if (!desktopClient || !workspaceId || !sessionId) {
       return;
     }
 
-    const existingPane = paneLayout.panes.find((pane) => pane.workspaceId === workspaceId && pane.sessionId === sessionId);
-    const targetPaneId = existingPane?.id || paneId || paneLayout.panes[0]?.id;
+    const requestedPaneId = paneLayout.panes.some((pane) => pane.id === paneId) ? paneId : '';
+    const existingPane = paneLayout.panes.find((pane) => (
+      pane.id !== requestedPaneId
+      && pane.workspaceId === workspaceId
+      && pane.sessionId === sessionId
+    ));
+    const targetPaneId = (preferPaneId && requestedPaneId)
+      ? requestedPaneId
+      : (existingPane?.id || requestedPaneId || paneLayout.panes[0]?.id);
     if (!targetPaneId) {
       return;
     }
@@ -1239,7 +1765,7 @@ function MainApp({ desktopClient }) {
       return;
     }
 
-    await openSessionInPane(pane.workspaceId, pane.sessionId, { paneId });
+    await openSessionInPane(pane.workspaceId, pane.sessionId, { paneId, preferPaneId: true });
   }
 
   function clearPane(paneId) {
@@ -1440,6 +1966,31 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function updateCurrentSessionProvider(nextProvider, { clearInput = false } = {}) {
+    if (!desktopClient || !focusedWorkspace || !focusedSession) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingProvider(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionProvider({
+        provider: nextProvider,
+        sessionId: focusedSession.id,
+        workspaceId: focusedWorkspace.id,
+      });
+      setAppState(nextState);
+
+      if (clearInput) {
+        setComposerHistoryIndex(-1);
+        setInputValue('');
+      }
+    } finally {
+      setIsUpdatingProvider(false);
+    }
+  }
+
   async function updateCurrentSessionPermissionMode(nextPermissionMode, { clearInput = false } = {}) {
     if (!desktopClient || !focusedWorkspace || !focusedSession) {
       throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
@@ -1462,6 +2013,27 @@ function MainApp({ desktopClient }) {
       }
     } finally {
       setIsUpdatingPermissionMode(false);
+    }
+  }
+
+  async function setProviderEnabled(provider, enabled) {
+    if (!desktopClient) {
+      throw new Error(copy.bridgeUnavailable);
+    }
+
+    setIsUpdatingProviderSettings(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.setProviderEnabled({
+        enabled,
+        provider,
+      });
+      setAppState(nextState);
+    } catch (error) {
+      setSidebarError(error.message);
+    } finally {
+      setIsUpdatingProviderSettings(false);
     }
   }
 
@@ -1788,6 +2360,31 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function updateSessionProviderForPane(paneId, nextProvider) {
+    if (!desktopClient) {
+      return;
+    }
+
+    const context = getPaneContext(paneId);
+    if (!context?.workspace || !context.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingProvider(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionProvider({
+        provider: nextProvider,
+        sessionId: context.session.id,
+        workspaceId: context.workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingProvider(false);
+    }
+  }
+
   async function updateSessionPermissionModeForPane(paneId, nextPermissionMode) {
     if (!desktopClient) {
       return;
@@ -1892,6 +2489,34 @@ function MainApp({ desktopClient }) {
           setAppState(nextState);
         } finally {
           setIsUpdatingModel(false);
+        }
+
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'provider') {
+        if (!context?.workspace || !context.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        const nextProvider = normalizeProviderCommandArg(parsedCommand.args);
+        if (!nextProvider) {
+          throw new Error(language === 'zh' ? '请使用 /provider claude 或 /provider codex。' : 'Use /provider claude or /provider codex.');
+        }
+
+        setIsUpdatingProvider(true);
+        try {
+          const nextState = await desktopClient.updateSessionProvider({
+            provider: nextProvider,
+            sessionId: context.session.id,
+            workspaceId: context.workspace.id,
+          });
+          setAppState(nextState);
+        } finally {
+          setIsUpdatingProvider(false);
         }
 
         return {
@@ -2111,9 +2736,39 @@ function MainApp({ desktopClient }) {
     && (focusedSession || trimmedInputValue.startsWith('/')),
   );
 
+  function dismissToast(toastId) {
+    setToastItems((current) => current.filter((item) => item.id !== toastId));
+  }
+
+  function setSidebarError(nextError) {
+    const message = normalizeToastMessage(nextError);
+    if (!message) {
+      return;
+    }
+
+    setToastItems((current) => appendToast(current, {
+      message,
+      tone: 'error',
+    }));
+  }
+
+  function toggleSidebarCollapse() {
+    setIsSidebarCollapsed((current) => !current);
+    setSidebarFlyoutView(null);
+  }
+
+  function toggleSidebarFlyout(nextView) {
+    if (!isSidebarCollapsed) {
+      return;
+    }
+
+    setSidebarFlyoutView((current) => (current === nextView ? null : nextView));
+  }
+
   return (
     <div className="relative h-screen overflow-hidden bg-background text-foreground">
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,hsl(var(--card)/0.88)_0%,transparent_18%,transparent_82%,hsl(var(--background)/0.96)_100%)]" />
+      <ToastViewport items={toastItems} onDismiss={dismissToast} />
 
       <div className={cn('drag-region fixed inset-x-0 top-0 z-40 bg-transparent', topBarHeightClass)} />
 
@@ -2123,116 +2778,166 @@ function MainApp({ desktopClient }) {
           topBarOffsetClass,
         )}
       >
-        <aside className="flex w-[280px] min-w-[280px] shrink-0 flex-col overflow-hidden border-r border-border/70 bg-background/60">
-          <div className="border-b border-border/70 px-3 py-3">
-            <div className="pr-2">
-              <div className="relative pr-24">
-                <StatusPill
-                  tone={appState.claude.available ? 'success' : 'error'}
-                  label={formatClaudeStatusLabel(appState.claude, language)}
-                  title={normalizeClaudeVersion(appState.claude.version) || undefined}
-                />
-                <div className={SIDEBAR_ACTION_SLOT_CLASS}>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={addPane}
-                    disabled={!desktopClient || paneLayout.panes.length >= maxPaneCount}
-                    aria-label={copy.paneSplitAdd}
-                    title={formatShortcutTooltip(copy.paneSplitAdd, 'D', appState.platform)}
-                    className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'hover:bg-background/70')}
-                  >
-                    <Columns2 className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => setIsSettingsOpen(true)}
-                    aria-label={copy.settings}
-                    title={copy.settings}
-                    className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'hover:bg-background/70')}
-                  >
-                    <Settings className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-3 py-3">
-            <div className="space-y-5 pr-2">
-                {sidebarError && (
+        {isSidebarCollapsed ? (
+          <aside
+            ref={collapsedSidebarRef}
+            className="relative z-20 flex shrink-0 flex-col overflow-visible border-r border-border/70 bg-background/70"
+            style={{ minWidth: SIDEBAR_COLLAPSED_WIDTH, width: SIDEBAR_COLLAPSED_WIDTH }}
+          >
+            <button
+              type="button"
+              onClick={toggleSidebarCollapse}
+              title={formatShortcutTooltip(copy.expandSidebar, 'B', appState.platform)}
+              aria-label={copy.expandSidebar}
+              className="absolute -right-3 top-4 z-40 inline-flex h-8 w-6 items-center justify-center rounded-full border border-border/80 bg-background/95 text-muted-foreground shadow-sm transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35"
+            >
+              <ChevronRight className="h-3.5 w-3.5" />
+            </button>
+
+            <div className="flex h-full flex-col items-center gap-2 px-2 py-3">
+              <div className="flex flex-col items-center gap-1.5">
+                {sidebarProviderStatuses.map(({ info, key }) => (
                   <div
+                    key={key}
+                    title={formatProviderStatusTitle(info, language)}
                     className={cn(
-                      'rounded-xl border px-3 py-2 text-[13px] leading-5',
-                      'border-destructive/25 bg-destructive/10 text-destructive',
+                      'relative flex h-10 w-10 items-center justify-center rounded-2xl border shadow-sm',
+                      getProviderStatusTone(info) === 'success'
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                        : 'border-destructive/20 bg-destructive/10 text-destructive',
                     )}
                   >
-                    {sidebarError}
+                    <span className="text-[10px] font-semibold uppercase tracking-[0.14em]">
+                      {getCompactProviderMonogram(key)}
+                    </span>
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        'absolute bottom-1.5 right-1.5 h-1.5 w-1.5 rounded-full',
+                        getProviderStatusTone(info) === 'success' ? 'bg-emerald-500' : 'bg-destructive',
+                      )}
+                    />
                   </div>
-                )}
+                ))}
+              </div>
 
-                <SidebarSection
+              <div className="mt-3 flex w-full flex-col items-center gap-2">
+                {hasHiddenPanes ? (
+                  <SidebarRailButton
+                    active={sidebarFlyoutView === SIDEBAR_VIEW_HIDDEN_PANES}
+                    ariaLabel={copy.paneOverflowTrigger(hiddenPaneViews.length)}
+                    badge={hiddenPaneViews.length}
+                    icon={Blocks}
+                    onClick={() => toggleSidebarFlyout(SIDEBAR_VIEW_HIDDEN_PANES)}
+                    title={copy.paneOverflowTrigger(hiddenPaneViews.length)}
+                  />
+                ) : null}
+                <SidebarRailButton
+                  active={sidebarFlyoutView === SIDEBAR_VIEW_WORKSPACES}
+                  ariaLabel={copy.workspaceSection}
+                  icon={Folder}
+                  onClick={() => toggleSidebarFlyout(SIDEBAR_VIEW_WORKSPACES)}
                   title={copy.workspaceSection}
-                  action={(
+                />
+              </div>
+
+              <div className="mt-auto flex w-full flex-col items-center gap-2 pb-1">
+                <span
+                  className="inline-flex"
+                  title={formatPaneSplitControlTooltip(copy, maxPaneCount, appState.platform)}
+                >
+                  <SidebarRailButton
+                    ariaLabel={copy.paneSplitAdd}
+                    disabled={!desktopClient || paneLayout.panes.length >= maxPaneCount}
+                    icon={Columns2}
+                    onClick={addPane}
+                    title={formatPaneSplitControlTooltip(copy, maxPaneCount, appState.platform)}
+                  />
+                </span>
+                <SidebarRailButton
+                  ariaLabel={copy.settings}
+                  icon={Settings}
+                  onClick={() => {
+                    setSidebarFlyoutView(null);
+                    setIsSettingsOpen(true);
+                  }}
+                  title={copy.settings}
+                />
+              </div>
+            </div>
+
+            {sidebarFlyoutView ? (
+              <SidebarFlyoutPanel panelRef={sidebarFlyoutRef}>
+                {sidebarFlyoutView === SIDEBAR_VIEW_HIDDEN_PANES ? hiddenPaneSection : workspaceSidebarSection}
+              </SidebarFlyoutPanel>
+            ) : null}
+          </aside>
+        ) : (
+          <aside
+            className="relative z-20 flex shrink-0 flex-col overflow-visible border-r border-border/70 bg-background/60"
+            style={{ minWidth: SIDEBAR_EXPANDED_WIDTH, width: SIDEBAR_EXPANDED_WIDTH }}
+          >
+            <button
+              type="button"
+              onClick={toggleSidebarCollapse}
+              title={formatShortcutTooltip(copy.collapseSidebar, 'B', appState.platform)}
+              aria-label={copy.collapseSidebar}
+              className="absolute -right-3 top-4 z-30 inline-flex h-8 w-6 items-center justify-center rounded-full border border-border/80 bg-background/95 text-muted-foreground shadow-sm transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+            </button>
+
+            <div className="relative z-20 overflow-visible border-b border-border/70 px-3 py-3">
+              <div className="pr-2">
+                <div className="relative pr-20">
+                  <div className="flex items-center gap-1.5">
+                    {sidebarProviderStatuses.map(({ info, key }) => (
+                      <StatusPill
+                        key={key}
+                        tone={getProviderStatusTone(info)}
+                        label={formatProviderStatusLabel(info, language)}
+                        title={formatProviderStatusTitle(info, language)}
+                      />
+                    ))}
+                  </div>
+                  <div className={SIDEBAR_ACTION_SLOT_CLASS}>
+                    <span
+                      className="inline-flex"
+                      title={formatPaneSplitControlTooltip(copy, maxPaneCount, appState.platform)}
+                    >
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={addPane}
+                        disabled={!desktopClient || paneLayout.panes.length >= maxPaneCount}
+                        aria-label={copy.paneSplitAdd}
+                        className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'hover:bg-background/70')}
+                      >
+                        <Columns2 className="h-4 w-4" />
+                      </Button>
+                    </span>
                     <Button
                       variant="ghost"
                       size="icon"
-                      onClick={addWorkspace}
-                      disabled={!desktopClient || isPickingWorkspace}
-                      aria-label={copy.addWorkspace}
-                      title={copy.addWorkspace}
-                      className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'text-foreground')}
+                      onClick={() => setIsSettingsOpen(true)}
+                      aria-label={copy.settings}
+                      title={copy.settings}
+                      className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'hover:bg-background/70')}
                     >
-                      {isPickingWorkspace ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <FolderPlus className="h-4 w-4" />}
+                      <Settings className="h-4 w-4" />
                     </Button>
-                  )}
-                >
-                  <div className="relative">
-                    <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      value={sessionSearchQuery}
-                      onChange={(event) => setSessionSearchQuery(event.target.value)}
-                      placeholder={copy.searchPlaceholder}
-                      className="h-8 rounded-xl border-border/80 bg-background/80 pl-8 pr-3 text-[12px] shadow-none placeholder:text-muted-foreground/90"
-                    />
                   </div>
-
-                  {appState.workspaces.length === 0 ? (
-                    <SidebarEmpty text={copy.emptyWorkspaces} />
-                  ) : filteredWorkspaces.length === 0 ? (
-                    <SidebarEmpty text={copy.searchNoResult(sessionSearchQuery.trim())} />
-                  ) : (
-                    filteredWorkspaces.map((workspace) => (
-                      <WorkspaceItem
-                        copy={copy}
-                        key={workspace.id}
-                        disabled={isArchivingSession || isRemovingWorkspace}
-                        isExpanded={normalizedSessionSearchQuery ? true : expandedWorkspaceIds.includes(workspace.id)}
-                        onArchiveSession={(session) => setPendingArchiveSession({
-                          sessionId: session.id,
-                          title: session.title,
-                          workspaceId: workspace.id,
-                        })}
-                        onCreateSession={() => createSession(workspace.id)}
-                        onOpenGitDiffWindow={() => openGitDiffWindow(workspace.id)}
-                        onRemoveWorkspace={() => setPendingRemoveWorkspace({
-                          title: workspace.name,
-                          workspaceId: workspace.id,
-                        })}
-                        onSelectSession={(sessionId) => selectSession(workspace.id, sessionId)}
-                        onSelectWorkspace={() => selectWorkspace(workspace.id)}
-                        onToggleExpand={() => toggleWorkspaceExpansion(workspace.id)}
-                        platform={appState.platform}
-                        selectedSessionId={focusedPane?.sessionId || appState.selectedSessionId}
-                        language={language}
-                        workspace={workspace}
-                      />
-                    ))
-                  )}
-                </SidebarSection>
+                </div>
+              </div>
             </div>
-          </div>
-        </aside>
+            <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-3 py-3">
+              <div className="space-y-5 pr-2">
+                {hiddenPaneSection}
+                {workspaceSidebarSection}
+              </div>
+            </div>
+          </aside>
+        )}
 
         <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-background/35">
           <div className="min-h-0 flex-1 overflow-hidden">
@@ -2244,14 +2949,14 @@ function MainApp({ desktopClient }) {
               />
             ) : (
               <div
-                ref={paneBoardRef}
+                ref={setPaneBoardElement}
                 className="grid h-full min-h-0 gap-px bg-border/70"
                 style={{
                   gridTemplateColumns: `repeat(${paneGridSpec.columns}, minmax(0, 1fr))`,
                   gridTemplateRows: `repeat(${paneGridSpec.rows}, minmax(0, 1fr))`,
                 }}
               >
-                {paneViews.map((pane, paneIndex) => (
+                {visiblePaneViews.map((pane, paneIndex) => (
                   <ConversationPane
                     key={pane.id}
                     canClear={!pane.isBusy}
@@ -2260,7 +2965,8 @@ function MainApp({ desktopClient }) {
                     maxPaneCount={maxPaneCount}
                     onCreateSession={(workspaceId) => createSession(workspaceId, { paneId: pane.id })}
                     pane={pane}
-                    paneShortcutLabel={formatShortcutLabel(appState.platform, String(paneIndex + 1))}
+                    paneNumber={paneIndex + 1}
+                    paneShortcutLabel={getPaneHeaderLabel(appState.platform, paneIndex + 1)}
                     onClear={() => clearPane(pane.id)}
                     onFocus={() => {
                       void focusPane(pane.id);
@@ -2272,11 +2978,14 @@ function MainApp({ desktopClient }) {
                     onRunSlashCommand={runSlashCommandForPane}
                     onSendMessage={submitPromptForPane}
                     onStopRun={stopRunForPane}
+                    onUpdateSessionProvider={updateSessionProviderForPane}
                     onUpdateSessionModel={updateSessionModelForPane}
                     onUpdateSessionPermissionMode={updateSessionPermissionModeForPane}
-                    availableClaudeModels={availableClaudeModels}
+                    defaultProvider={appState.defaultProvider}
+                    providerCatalog={providerCatalog}
                     isUpdatingModel={isUpdatingModel}
                     isUpdatingPermissionMode={isUpdatingPermissionMode}
+                    isUpdatingProvider={isUpdatingProvider}
                     pendingApprovalActionId={pendingApprovalActionId}
                     registerViewport={(node) => setPaneViewportNode(paneViewportRefs, pane.id, node)}
                     slashCommands={slashCommands}
@@ -2326,10 +3035,14 @@ function MainApp({ desktopClient }) {
       {isSettingsOpen && (
         <SettingsDialog
           copy={copy}
+          isUpdatingProviders={isUpdatingProviderSettings}
           language={language}
+          providerSettings={providerSettings}
+          platform={appState.platform}
           themePreference={themePreference}
           onClose={() => setIsSettingsOpen(false)}
           onLanguageChange={setLanguage}
+          onSetProviderEnabled={setProviderEnabled}
           onThemeChange={setThemePreference}
         />
       )}
@@ -2338,11 +3051,12 @@ function MainApp({ desktopClient }) {
 }
 
 function ConversationPane({
-  availableClaudeModels,
   canClear,
   copy,
+  defaultProvider,
   isUpdatingModel,
   isUpdatingPermissionMode,
+  isUpdatingProvider,
   language,
   onCreateSession,
   onApprovalDecision,
@@ -2354,11 +3068,14 @@ function ConversationPane({
   onRunSlashCommand,
   onSendMessage,
   onStopRun,
+  onUpdateSessionProvider,
   onUpdateSessionModel,
   onUpdateSessionPermissionMode,
   pane,
+  paneNumber,
   paneShortcutLabel,
   pendingApprovalActionId,
+  providerCatalog,
   registerViewport,
   slashCommands,
 }) {
@@ -2366,9 +3083,11 @@ function ConversationPane({
   const [composerAttachments, setComposerAttachments] = useState([]);
   const [composerHistoryIndex, setComposerHistoryIndex] = useState(-1);
   const [isComposerTextareaFocused, setIsComposerTextareaFocused] = useState(false);
+  const [isProviderPickerOpen, setIsProviderPickerOpen] = useState(false);
   const [isModePickerOpen, setIsModePickerOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
+  const providerPickerRef = useRef(null);
   const modePickerRef = useRef(null);
   const modelPickerRef = useRef(null);
   const slashMenuRef = useRef(null);
@@ -2380,41 +3099,62 @@ function ConversationPane({
   );
   const highlightedSlashCommand = visibleSlashCommands[selectedSlashCommandIndex] || visibleSlashCommands[0] || null;
   const isSlashCommandMenuOpen = pane.isFocused && slashCommandQuery !== null;
-  const hasFloatingOverlayOpen = isSlashCommandMenuOpen || isModePickerOpen || isModelPickerOpen;
+  const hasFloatingOverlayOpen = isSlashCommandMenuOpen || isProviderPickerOpen || isModePickerOpen || isModelPickerOpen;
   const hasComposerAttachments = composerAttachments.length > 0;
   const composerHistoryEntries = useMemo(
     () => getComposerHistoryEntries(pane.session?.messages || []),
     [pane.session?.messages],
   );
   const trimmedInputValue = inputValue.trim();
+  const isProviderLocked = Boolean(
+    pane.sessionMeta?.providerLocked
+    || isSessionProviderLocked(pane.session),
+  );
+  const rawSessionProvider = normalizeProviderKey(pane.session?.provider || defaultProvider || 'claude');
+  const availableEnabledProviderKeys = useMemo(
+    () => getAvailableEnabledProviderKeys(providerCatalog),
+    [providerCatalog],
+  );
+  const sessionProvider = isProviderLocked
+    ? rawSessionProvider
+    : resolveProviderSelection(providerCatalog, rawSessionProvider, defaultProvider || 'claude');
+  const providerInfo = getProviderInfo(providerCatalog, sessionProvider, 'claude');
+  const providerOptions = useMemo(
+    () => getComposerProviderOptions(copy, providerCatalog),
+    [copy, providerCatalog],
+  );
+  const showProviderPicker = Boolean(
+    pane.session
+    && !isProviderLocked
+    && availableEnabledProviderKeys.length > 1,
+  );
+  const isSessionProviderEnabled = providerInfo.enabled !== false;
+  const canUseSessionProvider = !pane.session || isSessionProviderEnabled;
   const canSend = Boolean(
     !pane.isBusy
     && pane.workspace
+    && canUseSessionProvider
     && (trimmedInputValue || hasComposerAttachments)
     && (pane.session || trimmedInputValue.startsWith('/')),
   );
+  const supportsPermissionMode = sessionProvider === 'claude';
+  const currentProviderDisplay = providerInfo.label || getProviderDisplayName(sessionProvider, copy);
+  const lockedProviderChipLabel = getLockedProviderChipLabel(sessionProvider);
+  const availableProviderModels = Array.isArray(providerInfo.models) ? providerInfo.models : [];
   const sessionPermissionMode = pane.session?.permissionMode || 'default';
   const modeOptions = useMemo(() => getComposerSessionModeOptions(copy), [copy]);
   const currentModeDisplay = useMemo(
     () => getSessionModeLabel(sessionPermissionMode, copy),
     [copy, sessionPermissionMode],
   );
-  const currentModeCommandValue = useMemo(
-    () => getSessionModeCommandValue(sessionPermissionMode),
-    [sessionPermissionMode],
-  );
-  const CurrentModeIcon = useMemo(
-    () => getSessionModeIcon(sessionPermissionMode),
-    [sessionPermissionMode],
-  );
   const effectiveCurrentModel = pane.session?.currentModel || pane.session?.model || '';
   const modelOptions = useMemo(
-    () => getComposerModelOptions(copy, pane.session?.model || '', effectiveCurrentModel, availableClaudeModels),
-    [availableClaudeModels, copy, effectiveCurrentModel, pane.session?.model],
+    () => getComposerModelOptions(copy, sessionProvider, pane.session?.model || '', effectiveCurrentModel, availableProviderModels),
+    [availableProviderModels, copy, effectiveCurrentModel, pane.session?.model, sessionProvider],
   );
   const currentModelDisplay = useMemo(
-    () => getModelDisplayName(effectiveCurrentModel, availableClaudeModels) || copy.modelOptionDefault,
-    [availableClaudeModels, copy.modelOptionDefault, effectiveCurrentModel],
+    () => getModelDisplayName(effectiveCurrentModel, availableProviderModels, sessionProvider) || copy.modelOptionDefault,
+    [availableProviderModels, copy.modelOptionDefault, effectiveCurrentModel, sessionProvider],
   );
   const currentModelCommandValue = useMemo(
     () => ((pane.session?.model || '').trim() || 'default'),
@@ -2429,18 +3169,26 @@ function ConversationPane({
 
   useEffect(() => {
     if (!pane.isFocused) {
+      setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     }
   }, [pane.isFocused]);
 
   useEffect(() => {
-    if ((!isModePickerOpen && !isModelPickerOpen) || typeof document === 'undefined') {
+    if (isProviderLocked || !showProviderPicker) {
+      setIsProviderPickerOpen(false);
+    }
+  }, [isProviderLocked, showProviderPicker]);
+
+  useEffect(() => {
+    if ((!isProviderPickerOpen && !isModePickerOpen && !isModelPickerOpen) || typeof document === 'undefined') {
       return undefined;
     }
 
     const isInsidePicker = (target) => (
-      modePickerRef.current?.contains(target)
+      providerPickerRef.current?.contains(target)
+      || modePickerRef.current?.contains(target)
       || modelPickerRef.current?.contains(target)
     );
 
@@ -2449,6 +3197,7 @@ function ConversationPane({
         return;
       }
 
+      setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     };
@@ -2458,6 +3207,7 @@ function ConversationPane({
         return;
       }
 
+      setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     };
@@ -2467,11 +3217,13 @@ function ConversationPane({
         return;
       }
 
+      setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     };
 
     const closePickersOnWindowBlur = () => {
+      setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     };
@@ -2487,7 +3239,7 @@ function ConversationPane({
       document.removeEventListener('keydown', closePickersOnEscape);
       window.removeEventListener('blur', closePickersOnWindowBlur);
     };
-  }, [isModePickerOpen, isModelPickerOpen]);
+  }, [isModePickerOpen, isModelPickerOpen, isProviderPickerOpen]);
 
   useEffect(() => {
     setSelectedSlashCommandIndex(0);
@@ -2585,6 +3337,10 @@ function ConversationPane({
   }
 
   async function handleSend() {
+    if (!canUseSessionProvider) {
+      return;
+    }
+
     if (!trimmedInputValue && composerAttachments.length === 0) {
       return;
     }
@@ -2631,30 +3387,85 @@ function ConversationPane({
       {pane.isFocused && !pane.isOnlyPane ? (
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute inset-0 z-[2] shadow-[inset_0_0_0_1px_hsl(var(--ring)/0.24)]"
+          className="pointer-events-none absolute inset-0 z-[2] shadow-[inset_0_0_0_1px_hsl(var(--pane-focus)/0.42)]"
+          style={{ boxShadow: `inset 0 0 0 1px ${getPaneAccentColorAlpha(paneNumber, 0.42)}` }}
         />
       ) : null}
       <div
         className={cn(
-          'relative z-[1] flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2 transition-colors',
+          'relative flex items-center justify-between gap-3 border-b border-border/70 px-3 py-1.5 transition-colors',
+          isProviderPickerOpen ? 'z-[30]' : 'z-[1]',
           pane.isFocused && !pane.isOnlyPane ? 'bg-accent/15' : 'bg-transparent',
         )}
       >
         <div className="min-w-0 flex-1 overflow-hidden">
-          <p className="w-full truncate text-[12px] font-medium text-foreground">
-            {paneShortcutLabel ? `${paneShortcutLabel} ${pane.title}` : pane.title}
+          <p className="flex w-full min-w-0 items-center gap-1.5 text-[12px] font-medium text-foreground">
+            {paneShortcutLabel ? (
+              <PaneAccentBadge
+                className="shrink-0"
+                label={paneShortcutLabel}
+                paneNumber={paneNumber}
+                variant="shortcut"
+              />
+            ) : null}
+            <span className="min-w-0 truncate">{pane.title}</span>
+            {pane.session && isProviderLocked ? (
+              <ReadonlyHeaderChip
+                className="shrink-0"
+                label={lockedProviderChipLabel}
+                provider={sessionProvider}
+                title={copy.providerLockedHint}
+              />
+            ) : null}
           </p>
         </div>
         <div className="flex min-w-0 shrink-0 items-center gap-2">
+          {showProviderPicker ? (
+            <ComposerSelectPicker
+              ariaLabel={copy.providerLabel}
+              buttonTitle={currentProviderDisplay}
+              containerClassName="basis-auto max-w-[118px] shrink-0"
+              currentLabel={currentProviderDisplay}
+              disabled={pane.isBusy || isUpdatingProvider}
+              isOpen={isProviderPickerOpen}
+              menuAlign="end"
+              menuDescription={copy.providerMenuDescription}
+              menuHint={copy.providerMenuHint}
+              menuPlacement="bottom"
+              menuTitle={copy.providerMenuTitle}
+              options={providerOptions}
+              pickerRef={providerPickerRef}
+              selectedValue={sessionProvider}
+              triggerVariant="header"
+              onOpenChange={(nextOpen) => {
+                setIsModePickerOpen(false);
+                setIsModelPickerOpen(false);
+                setIsProviderPickerOpen(nextOpen);
+              }}
+              onSelect={async (nextProvider) => {
+                if (nextProvider === sessionProvider) {
+                  setIsProviderPickerOpen(false);
+                  return;
+                }
+
+                try {
+                  await onUpdateSessionProvider?.(pane.id, nextProvider);
+                  setIsProviderPickerOpen(false);
+                } catch (error) {
+                  console.error(error);
+                }
+              }}
+            />
+          ) : null}
           <button
             type="button"
             onClick={onClear}
             disabled={!canClear || pane.isBusy || pane.isOnlyPane}
             aria-label={copy.paneClose}
             title={formatShortcutTooltip(copy.paneClose, 'W', platform)}
-            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
           >
-            <X className="h-4 w-4" />
+            <X className="h-3.5 w-3.5" />
           </button>
         </div>
       </div>
@@ -2667,8 +3478,12 @@ function ConversationPane({
             </div>
           </div>
         ) : pane.session ? (
-          <ScrollArea viewportRef={registerViewport} className="h-full px-3">
-            <div className="flex w-full flex-col gap-3 py-3">
+          <ScrollArea
+            viewportRef={registerViewport}
+            className="h-full px-3"
+            viewportClassName="[&>div]:!block [&>div]:min-w-0 [&>div]:w-full [&>div]:max-w-full"
+          >
+            <div className="flex w-full min-w-0 flex-col gap-3 py-3">
               {pane.renderableMessages.length === 0 ? (
                 <ConversationEmptyState
                   icon={Bot}
@@ -2703,7 +3518,7 @@ function ConversationPane({
         )}
       </div>
 
-      <div className="relative z-[1] border-t border-border/70 bg-background/75 p-3">
+      <div className="relative z-[1] bg-background/75 p-3">
         <div
           className={cn(
             'relative rounded-xl border bg-background shadow-sm transition-[border-color,box-shadow]',
@@ -2810,22 +3625,23 @@ function ConversationPane({
               }
             }}
             placeholder={
-              pane.session ? copy.inputPlaceholder : copy.noSessionCommandHint
+              pane.session && !canUseSessionProvider
+                ? copy.providerSessionDisabledHint(currentProviderDisplay)
+                : (pane.session ? copy.inputPlaceholder : copy.noSessionCommandHint)
             }
             className={cn(
               'min-h-[108px] resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-24 text-[13px] shadow-none focus-visible:ring-0',
               hasComposerAttachments && 'pt-16',
             )}
-            disabled={!pane.workspace || pane.isBusy}
+            disabled={!pane.workspace || pane.isBusy || !canUseSessionProvider}
           />
           <div className="absolute bottom-3 left-3 right-24 z-10 pb-1">
             <div className="flex items-center gap-2 pr-2">
               <ComposerSelectPicker
                 ariaLabel={copy.modeLabel}
-                buttonIcon={CurrentModeIcon}
-                buttonValue={currentModeCommandValue}
+                containerClassName="basis-auto max-w-[132px] shrink-0"
                 currentLabel={currentModeDisplay}
-                disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode}
+                disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !supportsPermissionMode || !canUseSessionProvider}
                 isOpen={isModePickerOpen}
                 menuDescription={copy.modeMenuDescription}
                 menuHint={copy.modeMenuHint}
@@ -2833,7 +3649,9 @@ function ConversationPane({
                 options={modeOptions}
                 pickerRef={modePickerRef}
                 selectedValue={sessionPermissionMode}
+                triggerVariant="minimal"
                 onOpenChange={(nextOpen) => {
+                  setIsProviderPickerOpen(false);
                   setIsModelPickerOpen(false);
                   setIsModePickerOpen(nextOpen);
                 }}
@@ -2853,10 +3671,9 @@ function ConversationPane({
               />
               <ComposerSelectPicker
                 ariaLabel={copy.modelLabel}
-                buttonIcon={Sparkles}
-                buttonValue={currentModelCommandValue}
+                containerClassName="basis-auto max-w-[148px] shrink-0"
                 currentLabel={currentModelDisplay}
-                disabled={!pane.session || pane.isBusy || isUpdatingModel}
+                disabled={!pane.session || pane.isBusy || isUpdatingModel || !canUseSessionProvider}
                 isOpen={isModelPickerOpen}
                 menuDescription={copy.modelMenuDescription}
                 menuHint={copy.modelMenuHint}
@@ -2864,7 +3681,9 @@ function ConversationPane({
                 options={modelOptions}
                 pickerRef={modelPickerRef}
                 selectedValue={pane.session?.model || ''}
+                triggerVariant="minimal"
                 onOpenChange={(nextOpen) => {
+                  setIsProviderPickerOpen(false);
                   setIsModePickerOpen(false);
                   setIsModelPickerOpen(nextOpen);
                 }}
@@ -2899,7 +3718,7 @@ function ConversationPane({
             variant="outline"
             size="icon"
             onClick={handlePickAttachments}
-            disabled={!pane.workspace || pane.isBusy}
+            disabled={!pane.workspace || pane.isBusy || !canUseSessionProvider}
             aria-label={copy.addAttachment}
             title={copy.addAttachment}
             className="absolute bottom-3 right-14 h-8 w-8 rounded-full border-border/80 bg-background shadow-sm hover:bg-muted"
@@ -2910,7 +3729,7 @@ function ConversationPane({
             onClick={pane.session?.isRunning ? () => onStopRun?.(pane.id) : () => {
               void handleSend();
             }}
-            disabled={pane.session?.isRunning ? false : !canSend}
+            disabled={pane.session?.isRunning ? false : (!canSend || !canUseSessionProvider)}
             size="icon"
             aria-label={pane.session?.isRunning ? copy.runStop : (pane.isSending ? copy.sending : copy.sendMessage)}
             className="absolute bottom-3 right-3 h-8 w-8 rounded-full shadow-sm"
@@ -2933,13 +3752,58 @@ function SidebarSection({ action, title, children }) {
   return (
     <section className="space-y-2.5">
       <div className="relative pr-12">
-        <p className="min-w-0 text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground">{title}</p>
+        <p className="min-w-0 text-[15px] font-semibold tracking-[0.02em] text-foreground/90">{title}</p>
         <div className={SIDEBAR_ACTION_SLOT_CLASS}>
           {action}
         </div>
       </div>
       <div className="space-y-2">{children}</div>
     </section>
+  );
+}
+
+function SidebarRailButton({
+  active = false,
+  ariaLabel,
+  badge,
+  disabled = false,
+  icon: Icon,
+  onClick,
+  title,
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel || title}
+      title={title || ariaLabel}
+      className={cn(
+        SIDEBAR_RAIL_BUTTON_CLASS,
+        active && 'border-border/80 bg-background text-foreground shadow-sm',
+        disabled && 'cursor-not-allowed opacity-45',
+      )}
+    >
+      <Icon className="h-4 w-4" />
+      {badge ? (
+        <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-[1rem] items-center justify-center rounded-full bg-foreground px-1 text-[9px] font-semibold leading-4 text-background">
+          {badge}
+        </span>
+      ) : null}
+    </button>
+  );
+}
+
+function SidebarFlyoutPanel({ children, panelRef }) {
+  return (
+    <div
+      ref={panelRef}
+      className="absolute left-[calc(100%+12px)] top-3 z-40 w-[320px] max-w-[min(24rem,calc(100vw-5rem))] rounded-2xl border border-border/80 bg-background p-4 shadow-xl"
+    >
+      <div className="max-h-[calc(100vh-6rem)] overflow-y-auto pr-1">
+        {children}
+      </div>
+    </div>
   );
 }
 
@@ -2963,14 +3827,57 @@ function TopbarSelect({ ariaLabel, children, onChange, value }) {
   );
 }
 
-function SettingsDialog({ copy, language, onClose, onLanguageChange, onThemeChange, themePreference }) {
+function SettingsDialog({
+  copy,
+  isUpdatingProviders,
+  language,
+  onClose,
+  onLanguageChange,
+  onSetProviderEnabled,
+  onThemeChange,
+  platform,
+  providerSettings,
+  themePreference,
+}) {
+  const shortcutItems = [
+    {
+      action: copy.settingsShortcutAddWorkspace,
+      shortcut: formatShortcutLabel(platform, 'O'),
+    },
+    {
+      action: copy.settingsShortcutToggleSidebar,
+      shortcut: formatShortcutLabel(platform, 'B'),
+    },
+    {
+      action: copy.settingsShortcutAddPane,
+      shortcut: formatShortcutLabel(platform, 'D'),
+    },
+    {
+      action: copy.settingsShortcutAddPaneAndCreate,
+      shortcut: formatShiftedShortcutLabel(platform, 'D'),
+    },
+    {
+      action: copy.settingsShortcutCreateConversation,
+      shortcut: formatShortcutLabel(platform, 'N'),
+    },
+    {
+      action: copy.settingsShortcutClosePane,
+      shortcut: formatShortcutLabel(platform, 'W'),
+    },
+    {
+      action: copy.settingsShortcutFocusPane,
+      shortcut: formatShortcutRangeLabel(platform, '1', '9'),
+    },
+  ].filter((item) => item.shortcut);
+  const enabledProviderCount = providerSettings.filter((provider) => provider.enabled).length;
+
   return (
     <div
       className="absolute inset-0 z-50 flex items-center justify-center bg-foreground/20 px-4 backdrop-blur-[2px]"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-sm rounded-2xl border border-border/80 bg-background p-5 shadow-xl"
+        className="w-full max-w-md rounded-2xl border border-border/80 bg-background p-5 shadow-xl"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3">
@@ -3014,26 +3921,148 @@ function SettingsDialog({ copy, language, onClose, onLanguageChange, onThemeChan
               <option value="dark">{copy.themeDark}</option>
             </TopbarSelect>
           </div>
+          <div className="space-y-2">
+            <div className="space-y-1">
+              <p className="text-[12px] font-medium text-foreground">{copy.settingsProvidersTitle}</p>
+              <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsProvidersDescription}</p>
+            </div>
+            <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
+              {providerSettings.map((provider) => {
+                const disableToggle = isUpdatingProviders || (provider.enabled && enabledProviderCount <= 1);
+
+                return (
+                  <div key={provider.key} className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-3 last:border-b-0">
+                    <div className="min-w-0">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span aria-hidden="true" className={cn('h-2 w-2 shrink-0 rounded-full', getProviderDotClasses(provider.key))} />
+                        <p className="truncate text-[12px] font-medium text-foreground">{provider.label}</p>
+                        {!provider.available ? (
+                          <span className="shrink-0 rounded-full border border-border/80 bg-muted/70 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                            {copy.providerUnavailable(provider.label)}
+                          </span>
+                        ) : null}
+                      </div>
+                      <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{provider.summary}</p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={provider.enabled}
+                      aria-label={`${provider.label} ${copy.providerLabel}`}
+                      disabled={disableToggle}
+                      onClick={() => {
+                        void onSetProviderEnabled?.(provider.key, !provider.enabled);
+                      }}
+                      className={cn(
+                        'inline-flex h-6 w-10 shrink-0 items-center rounded-full border p-0.5 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-45',
+                        provider.enabled
+                          ? 'border-amber-300 bg-amber-400/90 dark:border-amber-400/70 dark:bg-amber-400/80'
+                          : 'border-border/80 bg-muted/80',
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          'h-4 w-4 rounded-full bg-background shadow-sm transition-transform',
+                          provider.enabled ? 'translate-x-4' : 'translate-x-0',
+                        )}
+                      />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsProvidersHint}</p>
+          </div>
+          <div className="space-y-2">
+            <p className="text-[12px] font-medium text-foreground">{copy.settingsShortcutsTitle}</p>
+            <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
+              {shortcutItems.map((item) => (
+                <div key={item.action} className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2.5 last:border-b-0">
+                  <p className="min-w-0 text-[12px] text-foreground/90">{item.action}</p>
+                  <code className="shrink-0 rounded-md border border-border/80 bg-muted/60 px-2 py-1 text-[11px] font-semibold text-muted-foreground">
+                    {item.shortcut}
+                  </code>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
+function HiddenPaneSection({ copy, hiddenPanes, onClearPane, onFocusPane }) {
+  if (hiddenPanes.length === 0) {
+    return null;
+  }
+
+  return (
+    <section className="space-y-2.5">
+      <div className="grid grid-cols-[minmax(0,1fr)_1.5rem] items-center gap-2">
+        <p className="min-w-0 text-[15px] font-semibold tracking-[0.02em] text-foreground/90">
+          {copy.paneOverflowLabel}
+        </p>
+        <span className="inline-flex h-6 w-6 items-center justify-center text-[13px] font-medium text-muted-foreground">
+          {hiddenPanes.length}
+        </span>
+      </div>
+      <div className="max-h-40 overflow-y-auto pr-1">
+        <div className="divide-y divide-border/70">
+          {hiddenPanes.map((pane) => (
+            <div key={pane.id} className="grid min-w-0 grid-cols-[minmax(0,1fr)_1.5rem] items-center gap-2 py-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  void onFocusPane?.(pane.id);
+                }}
+                title={copy.paneClickToFocus}
+                className="flex min-w-0 items-center gap-2 py-1 text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/35"
+              >
+                <Blocks className="h-3 w-3 shrink-0 text-muted-foreground" />
+                <p className="truncate text-[12px] font-medium text-foreground/90">{pane.title}</p>
+              </button>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onClearPane?.(pane.id);
+                }}
+                disabled={pane.isBusy}
+                aria-label={copy.paneClose}
+                title={copy.paneClose}
+                className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function ComposerSelectPicker({
   ariaLabel,
   buttonIcon: ButtonIcon,
+  buttonTitle,
+  containerClassName,
   currentLabel,
   disabled,
   isOpen,
+  menuAlign = 'start',
   menuDescription,
   menuHint,
+  menuPlacement = 'top',
   menuTitle,
   onOpenChange,
   onSelect,
   options,
   pickerRef,
   selectedValue,
+  triggerVariant = 'default',
 }) {
   const localPickerRef = useRef(null);
   const [menuWidth, setMenuWidth] = useState(240);
@@ -3067,7 +4096,9 @@ function ComposerSelectPicker({
     const measure = () => {
       const triggerWidth = root.getBoundingClientRect().width;
       const paneWidth = pane instanceof HTMLElement ? pane.getBoundingClientRect().width : window.innerWidth;
-      const nextWidth = Math.max(180, Math.min(300, paneWidth - 24, triggerWidth + 72));
+      const availableWidth = Math.max(160, paneWidth - 20);
+      const targetWidth = Math.max(220, triggerWidth + 88);
+      const nextWidth = Math.min(320, availableWidth, targetWidth);
       setMenuWidth(Math.round(nextWidth));
     };
 
@@ -3087,7 +4118,15 @@ function ComposerSelectPicker({
   }, [isOpen, pickerRef]);
 
   return (
-    <div ref={localPickerRef} className="relative min-w-0 basis-[152px] shrink max-w-[152px]">
+    <div
+      ref={localPickerRef}
+      title={buttonTitle || currentLabel}
+      className={cn(
+        'relative min-w-0 basis-[152px] shrink max-w-[152px]',
+        (triggerVariant === 'minimal' || triggerVariant === 'header') && 'basis-auto max-w-none shrink-0',
+        containerClassName,
+      )}
+    >
       <button
         type="button"
         aria-label={ariaLabel}
@@ -3095,16 +4134,53 @@ function ComposerSelectPicker({
         aria-haspopup="dialog"
         disabled={disabled}
         onClick={() => onOpenChange(!isOpen)}
-        className="flex h-8 w-full items-center gap-2 rounded border border-border/80 bg-background px-2.5 text-left text-[12px] text-foreground shadow-sm outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
+        title={buttonTitle || currentLabel}
+        className={cn(
+          'flex items-center text-left text-[12px] outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+          triggerVariant === 'minimal'
+            ? 'h-7 w-auto max-w-full gap-1 rounded-md bg-transparent px-1 text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25'
+            : triggerVariant === 'header'
+              ? cn(
+                'h-7 w-auto max-w-full gap-1.5 rounded-full border px-2.5 shadow-sm focus-visible:ring-2 focus-visible:ring-ring/30',
+                getSelectedProviderBadgeClasses(),
+              )
+            : 'h-8 w-full gap-2 rounded border border-border/80 bg-background px-2.5 text-foreground shadow-sm hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/35',
+        )}
       >
-        {ButtonIcon ? <ButtonIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
-        <span className="min-w-0 flex-1 truncate font-medium">{currentLabel}</span>
-        <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform', isOpen && 'rotate-180')} />
+        {triggerVariant === 'header' ? (
+          <span aria-hidden="true" className={cn('h-1.5 w-1.5 shrink-0 rounded-full', getSelectedProviderDotClasses())} />
+        ) : ButtonIcon ? (
+          <ButtonIcon
+            className={cn(
+              'shrink-0 text-muted-foreground',
+              triggerVariant === 'minimal' ? 'h-3 w-3' : (triggerVariant === 'header' ? 'h-3.5 w-3.5 text-foreground/75' : 'h-3.5 w-3.5'),
+            )}
+          />
+        ) : null}
+        <span
+          className={cn(
+            'min-w-0 truncate font-medium',
+            (triggerVariant === 'minimal' || triggerVariant === 'header') && 'flex-1',
+          )}
+        >
+          {currentLabel}
+        </span>
+        <ChevronDown
+          className={cn(
+            'shrink-0 text-muted-foreground transition-transform',
+            triggerVariant === 'minimal' ? 'h-3 w-3' : (triggerVariant === 'header' ? 'h-3.5 w-3.5 text-current/75' : 'h-3.5 w-3.5'),
+            isOpen && 'rotate-180',
+          )}
+        />
       </button>
 
       {isOpen && (
         <div
-          className="absolute bottom-[calc(100%+8px)] left-0 z-20 overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl"
+          className={cn(
+            'absolute z-20 overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl',
+            menuAlign === 'end' ? 'right-0' : 'left-0',
+            menuPlacement === 'bottom' ? 'top-[calc(100%+8px)]' : 'bottom-[calc(100%+8px)]',
+          )}
           style={{ width: `${menuWidth}px`, maxWidth: 'calc(100vw - 48px)' }}
         >
           <div className="border-b border-border/70 px-3 py-3">
@@ -3144,6 +4220,63 @@ function ComposerSelectPicker({
         </div>
       )}
     </div>
+  );
+}
+
+function ReadonlyHeaderChip({
+  className,
+  label,
+  provider,
+  title,
+}) {
+  return (
+    <div className={cn('min-w-0', className)}>
+      <span
+        title={title || label}
+        className={cn(
+          'inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium leading-none',
+          getProviderBadgeClasses(provider),
+        )}
+      >
+        <span aria-hidden="true" className={cn('h-1.5 w-1.5 rounded-full', getProviderDotClasses(provider))} />
+        <span className="truncate">{label}</span>
+      </span>
+    </div>
+  );
+}
+
+function PaneAccentBadge({
+  className,
+  label,
+  paneNumber,
+  title,
+  variant = 'index',
+}) {
+  const tone = getPaneAccentTone(paneNumber);
+
+  return (
+    <span
+      title={title || label}
+      style={{
+        '--pane-badge-bg-dark': tone.backgroundDark,
+        '--pane-badge-bg-light': tone.backgroundLight,
+        '--pane-badge-border-dark': tone.borderDark,
+        '--pane-badge-border-light': tone.borderLight,
+        '--pane-badge-text-dark': tone.textDark,
+        '--pane-badge-text-light': tone.textLight,
+      }}
+      className={cn(
+        'inline-grid place-items-center rounded-full border font-semibold leading-none',
+        'border-[hsl(var(--pane-badge-border-light))] bg-[hsl(var(--pane-badge-bg-light))] text-[hsl(var(--pane-badge-text-light))]',
+        'dark:border-[hsl(var(--pane-badge-border-dark))] dark:bg-[hsl(var(--pane-badge-bg-dark))] dark:text-[hsl(var(--pane-badge-text-dark))]',
+        variant === 'shortcut'
+          ? 'h-5 shrink-0 px-1.5 text-[10px] tracking-[0.01em]'
+          : 'h-5 min-w-[1.25rem] shrink-0 px-1 text-[10px] tabular-nums',
+        className,
+      )}
+    >
+      <span className={cn('block leading-none', variant === 'index' && 'translate-y-[0.5px]')}>{label}</span>
+    </span>
   );
 }
 
@@ -3206,47 +4339,102 @@ function WorkspaceItem({
   onArchiveSession,
   onCreateSession,
   onOpenGitDiffWindow,
+  onOpenWorkspaceInFinder,
   onRemoveWorkspace,
   onSelectSession,
   onSelectWorkspace,
   onToggleExpand,
   platform,
   selectedSessionId,
+  sessionPaneBindingMap,
   workspace,
 }) {
   const FolderIcon = isExpanded ? FolderOpen : Folder;
-  const workspaceGitBadge = workspace.gitBranch ? (
-    workspace.gitDirty ? (
-      <button
-        type="button"
-        onClick={onOpenGitDiffWindow}
-        disabled={disabled}
-        className="inline-flex max-w-full items-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:opacity-50"
-        title={copy.viewGitChanges}
-      >
-        <span className="inline-flex h-5 max-w-full items-center gap-1 rounded border border-emerald-200 bg-emerald-50 px-1.5 text-[10px] font-medium text-emerald-700 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-100">
-          <GitBranch className="h-3 w-3 shrink-0" />
-          <span className="truncate">{truncateMiddle(workspace.gitBranch, 18)}</span>
-          <span className="whitespace-nowrap text-[9px] font-semibold">
-            <span className="text-emerald-700">+{workspace.gitAddedLines || 0}</span>
-            {' '}
-            <span className="text-rose-600">-{workspace.gitDeletedLines || 0}</span>
-          </span>
-        </span>
-      </button>
-    ) : (
-      <div
-        className="inline-flex max-w-full items-center rounded border border-border/80 bg-background/80 px-1.5 py-0.5 text-[10px] font-medium text-foreground"
-        title={workspace.gitRoot || workspace.gitBranch}
-      >
-        <GitBranch className="mr-1 h-3 w-3 shrink-0" />
-        <span className="truncate">{truncateMiddle(workspace.gitBranch, 18)}</span>
-      </div>
-    )
-  ) : null;
+  const moreButtonRef = useRef(null);
+  const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
+  const [moreMenuPosition, setMoreMenuPosition] = useState(null);
+  const moreMenuRef = useRef(null);
+
+  useEffect(() => {
+    if (!isMoreMenuOpen || typeof document === 'undefined') {
+      setMoreMenuPosition(null);
+      return undefined;
+    }
+
+    const updateMoreMenuPosition = () => {
+      const buttonRect = moreButtonRef.current?.getBoundingClientRect();
+      if (!buttonRect || typeof window === 'undefined') {
+        return;
+      }
+
+      const viewportPadding = 12;
+      const menuWidth = 220;
+      const estimatedMenuHeight = workspace.gitBranch ? 102 : 84;
+      const canOpenBelow = buttonRect.bottom + 6 + estimatedMenuHeight <= window.innerHeight - viewportPadding;
+      const left = Math.min(
+        Math.max(viewportPadding, buttonRect.right - menuWidth),
+        Math.max(viewportPadding, window.innerWidth - menuWidth - viewportPadding),
+      );
+      const top = canOpenBelow
+        ? buttonRect.bottom + 6
+        : Math.max(viewportPadding, buttonRect.top - estimatedMenuHeight - 6);
+
+      setMoreMenuPosition({
+        left: Math.round(left),
+        top: Math.round(top),
+      });
+    };
+
+    updateMoreMenuPosition();
+
+    const closeMenuOnOutsidePointer = (event) => {
+      if (moreMenuRef.current?.contains(event.target)) {
+        return;
+      }
+
+      setIsMoreMenuOpen(false);
+    };
+
+    const closeMenuOnFocusMove = (event) => {
+      if (moreMenuRef.current?.contains(event.target)) {
+        return;
+      }
+
+      setIsMoreMenuOpen(false);
+    };
+
+    const closeMenuOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        setIsMoreMenuOpen(false);
+      }
+    };
+
+    const closeMenuOnWindowBlur = () => {
+      setIsMoreMenuOpen(false);
+    };
+
+    document.addEventListener('pointerdown', closeMenuOnOutsidePointer);
+    document.addEventListener('focusin', closeMenuOnFocusMove);
+    document.addEventListener('keydown', closeMenuOnEscape);
+    window.addEventListener('blur', closeMenuOnWindowBlur);
+    window.addEventListener('resize', updateMoreMenuPosition);
+    window.addEventListener('scroll', updateMoreMenuPosition, true);
+
+    return () => {
+      document.removeEventListener('pointerdown', closeMenuOnOutsidePointer);
+      document.removeEventListener('focusin', closeMenuOnFocusMove);
+      document.removeEventListener('keydown', closeMenuOnEscape);
+      window.removeEventListener('blur', closeMenuOnWindowBlur);
+      window.removeEventListener('resize', updateMoreMenuPosition);
+      window.removeEventListener('scroll', updateMoreMenuPosition, true);
+    };
+  }, [isMoreMenuOpen, workspace.gitBranch]);
 
   return (
-    <div title={workspace.path} className="py-0.5">
+    <div
+      title={workspace.path}
+      className={cn('relative overflow-visible py-0.5', isMoreMenuOpen && 'z-20')}
+    >
       <div className="group relative pr-20">
         <div className="flex min-w-0 items-center gap-1">
           <button
@@ -3276,7 +4464,7 @@ function WorkspaceItem({
             </div>
           </button>
         </div>
-        <div className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1">
+        <div className="absolute inset-y-0 right-3 flex items-center gap-1">
           <Button
             variant="ghost"
             size="icon"
@@ -3290,30 +4478,52 @@ function WorkspaceItem({
           >
             <MessageSquarePlus className="h-4 w-4" />
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={onRemoveWorkspace}
-            disabled={disabled}
-            className={cn(
-              SIDEBAR_ACTION_BUTTON_CLASS,
-              'pointer-events-none opacity-0 transition-[opacity,color,transform] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 hover:text-destructive focus-visible:opacity-100',
-            )}
-            title={copy.removeWorkspaceWithPath(workspace.path)}
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
+          <div ref={moreMenuRef} className="relative z-10">
+            <Button
+              ref={moreButtonRef}
+              variant="ghost"
+              size="icon"
+              onClick={() => setIsMoreMenuOpen((current) => !current)}
+              disabled={disabled}
+              aria-label={copy.workspaceMoreActions}
+              className={cn(
+                SIDEBAR_ACTION_BUTTON_CLASS,
+                isMoreMenuOpen
+                  ? 'pointer-events-auto opacity-100'
+                  : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100',
+                'transition-[opacity,color,transform] duration-150 focus-visible:opacity-100',
+              )}
+              title={copy.workspaceMoreActions}
+            >
+              <MoreHorizontal className="h-4 w-4" />
+            </Button>
+            {isMoreMenuOpen && moreMenuPosition ? (
+              <WorkspaceMoreMenu
+                copy={copy}
+                disabled={disabled}
+                onOpenWorkspaceInFinder={() => {
+                  setIsMoreMenuOpen(false);
+                  onOpenWorkspaceInFinder?.();
+                }}
+                position={moreMenuPosition}
+                workspace={workspace}
+                onOpenGitDiffWindow={() => {
+                  setIsMoreMenuOpen(false);
+                  onOpenGitDiffWindow?.();
+                }}
+                onRemoveWorkspace={() => {
+                  setIsMoreMenuOpen(false);
+                  onRemoveWorkspace?.();
+                }}
+              />
+            ) : null}
+          </div>
         </div>
       </div>
       {isExpanded && (
-        <div className="mt-1.5 ml-5 border-l border-border/70 pl-2">
-          {workspaceGitBadge ? (
-            <div className="pb-2 pl-3 pr-2">
-              {workspaceGitBadge}
-            </div>
-          ) : null}
+        <div className="mt-1 ml-1">
           {workspace.sessions.length === 0 ? (
-            <p className="py-1.5 text-[11px] text-muted-foreground">{copy.noConversationsInWorkspace}</p>
+            <p className="px-2 py-1.5 text-[11px] text-muted-foreground">{copy.noConversationsInWorkspace}</p>
           ) : (
             <div className="divide-y divide-border/60">
               {workspace.sessions.map((session) => (
@@ -3324,6 +4534,7 @@ function WorkspaceItem({
                   onArchive={() => onArchiveSession(session)}
                   key={session.id}
                   session={session}
+                  paneNumbers={sessionPaneBindingMap.get(createSessionCacheKey(workspace.id, session.id)) || []}
                   isSelected={session.id === selectedSessionId}
                   onSelect={() => onSelectSession(session.id)}
                 />
@@ -3336,7 +4547,80 @@ function WorkspaceItem({
   );
 }
 
-function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect, session }) {
+function WorkspaceMoreMenu({
+  copy,
+  disabled,
+  onOpenGitDiffWindow,
+  onOpenWorkspaceInFinder,
+  onRemoveWorkspace,
+  position,
+  workspace,
+}) {
+  const hasGitBranch = Boolean(workspace.gitBranch);
+  const canOpenGitDiff = Boolean(hasGitBranch && workspace.gitDirty && onOpenGitDiffWindow);
+  const gitSummary = hasGitBranch && !workspace.gitDirty ? copy.workspaceGitBranchInfo : '';
+
+  return (
+    <div
+      className="fixed z-[80] w-[196px] overflow-hidden rounded-lg border border-border/80 bg-background/95 p-1 shadow-xl backdrop-blur-sm"
+      style={{
+        left: `${position?.left || 12}px`,
+        top: `${position?.top || 12}px`,
+      }}
+    >
+      {canOpenGitDiff ? (
+        <button
+          type="button"
+          onClick={onOpenGitDiffWindow}
+          disabled={disabled}
+          className="flex w-full items-start gap-2.5 rounded-md px-2 py-2 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
+          title={copy.viewGitChanges}
+        >
+          <GitBranch className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[11px] font-medium text-foreground">{truncateMiddle(workspace.gitBranch, 20)}</p>
+          </div>
+        </button>
+      ) : (
+        <div className="flex items-start gap-2.5 rounded-md px-2 py-2">
+          <GitBranch className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[11px] font-medium text-foreground">
+              {hasGitBranch ? truncateMiddle(workspace.gitBranch, 20) : copy.workspaceGitUnavailable}
+            </p>
+            {gitSummary ? <p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">{gitSummary}</p> : null}
+          </div>
+        </div>
+      )}
+      <div className="mt-0.5 border-t border-border/70 pt-1">
+        <button
+          type="button"
+          onClick={onOpenWorkspaceInFinder}
+          disabled={disabled}
+          className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
+          title={copy.openWorkspaceInFinderWithPath(workspace.path)}
+        >
+          <FolderOpen className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 truncate text-[11px] font-medium text-foreground">{copy.openWorkspaceInFinder}</span>
+        </button>
+      </div>
+      <div className="mt-0.5 border-t border-border/70 pt-1">
+        <button
+          type="button"
+          onClick={onRemoveWorkspace}
+          disabled={disabled}
+          className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-left text-destructive transition-colors hover:bg-destructive/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
+          title={copy.removeWorkspaceWithPath(workspace.path)}
+        >
+          <Trash2 className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 truncate text-[11px] font-medium">{copy.removeWorkspace}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect, paneNumbers = [], session }) {
   const showRunningDot = isSelected && session.isRunning;
 
   return (
@@ -3344,11 +4628,23 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
       <button
         type="button"
         onClick={onSelect}
-        className="w-full overflow-hidden px-3 py-1.5 text-left transition-[background-color,color,transform,box-shadow] hover:bg-background/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/35 active:translate-y-px active:bg-background"
+        className="w-full overflow-hidden px-2 py-1.5 text-left transition-[background-color,color,transform,box-shadow] hover:bg-background/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/35 active:translate-y-px active:bg-background"
       >
         <div className="flex items-center gap-2">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             {showRunningDot && <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-hidden="true" />}
+            {paneNumbers.length > 0 ? (
+              <div className="flex shrink-0 items-center gap-1" aria-hidden="true">
+                {paneNumbers.map((paneNumber) => (
+                  <PaneAccentBadge
+                    key={paneNumber}
+                    label={String(paneNumber)}
+                    paneNumber={paneNumber}
+                    variant="index"
+                  />
+                ))}
+              </div>
+            ) : null}
             <p className="min-w-0 flex-1 truncate text-[12px] font-medium text-foreground/90">{session.title}</p>
           </div>
           <span className="flex h-6 w-8 shrink-0 items-center justify-center" aria-hidden="true" />
@@ -3433,13 +4729,13 @@ function ChatMessage({ approvalActionId, language, message, onApprovalDecision }
 
   if (!isUser) {
     return (
-      <div className="flex items-start gap-2.5">
+      <div className="flex min-w-0 items-start gap-2.5">
         <MessageLeadIcon className="bg-primary/10 text-primary">
           <Bot className="h-3.5 w-3.5" />
         </MessageLeadIcon>
-        <div className="min-w-0 max-w-[min(100%,46rem)] flex-1 pt-0.5">
-          <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Claude</div>
-          <div className="space-y-3">
+        <div className="min-w-0 max-w-[min(100%,46rem)] flex-1 overflow-hidden pt-0.5">
+          <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Agent</div>
+          <div className="min-w-0 space-y-3">
             {assistantSegments.map((segment) => {
               if (segment.type === 'tool_activity') {
                 return <AssistantToolActivity key={segment.key} activity={segment.toolActivity} language={language} />;
@@ -3475,11 +4771,11 @@ function ChatMessage({ approvalActionId, language, message, onApprovalDecision }
   }
 
   return (
-    <div className="flex items-start justify-end gap-2.5">
-      <div className="user-bubble-message max-w-[min(100%,42rem)] rounded-2xl border px-2.5 py-2">
+    <div className="flex min-w-0 items-start justify-end gap-2.5">
+      <div className="user-bubble-message min-w-0 max-w-[min(100%,42rem)] overflow-hidden rounded-2xl border px-2.5 py-2">
         {messageAttachments.length > 0 ? <MessageAttachmentList attachments={messageAttachments} /> : null}
         {message.content ? (
-          <div className={cn('whitespace-pre-wrap text-[13px] leading-6', messageAttachments.length > 0 && 'mt-2')}>
+          <div className={cn('whitespace-pre-wrap break-words text-[13px] leading-6', messageAttachments.length > 0 && 'mt-2')}>
             {message.content}
           </div>
         ) : null}
@@ -3551,7 +4847,15 @@ function AssistantToolActivity({ activity, language }) {
       {visibleItems.length > 0 ? (
         <div className="space-y-0.5">
           {visibleItems.map((item) => (
-            <p key={item.key} className={cn('break-words text-muted-foreground/85', item.status === 'running' && 'loading-copy')}>
+            <p
+              key={item.key}
+              className={cn(
+                item.category === 'command'
+                  ? 'min-w-0 overflow-hidden text-muted-foreground/85'
+                  : 'break-words text-muted-foreground/85',
+                item.status === 'running' && 'loading-copy',
+              )}
+            >
               <ToolActivityItemLabel item={item} language={language} />
             </p>
           ))}
@@ -3625,6 +4929,14 @@ function AssistantApprovalCard({ approval, isSubmitting, language, onDecision })
 function ToolActivityItemLabel({ item, language }) {
   if (isEditToolActivityItem(item)) {
     return <EditToolActivityLabel item={item} language={language} />;
+  }
+
+  if (item?.category === 'command') {
+    return (
+      <span className="block truncate whitespace-nowrap" title={item.label}>
+        {item.label}
+      </span>
+    );
   }
 
   return item.label;
@@ -3762,28 +5074,28 @@ function EventMessage({ language, message }) {
             </span>
             <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80">{formatTime(message.createdAt, language)}</span>
           </div>
-          <code className="mt-1.5 block whitespace-pre-wrap break-words text-[12px] leading-5 text-foreground">{message.title}</code>
-          {message.content ? (
-            collapsible ? (
-              <>
-                {preview && <p className="mt-1 line-clamp-1 break-words text-[12px] leading-5 text-muted-foreground">{preview}</p>}
-                <button
-                  type="button"
-                  onClick={() => setIsOpen((current) => !current)}
-                  className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
-                >
-                  <ChevronRight className={cn('h-3.5 w-3.5 transition-transform', isOpen && 'rotate-90')} />
-                  {isOpen ? copy.collapseDetails : copy.expandDetails}
-                </button>
-                {isOpen && (
-                  <div className="mt-1.5 whitespace-pre-wrap break-words border-l border-border/80 pl-3 text-[12px] leading-5 text-muted-foreground">
-                    {message.content}
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="mt-1 whitespace-pre-wrap break-words text-[12px] leading-5 text-muted-foreground">{message.content}</p>
-            )
+          <div className="mt-1.5 flex items-center gap-2">
+            <code
+              className="min-w-0 flex-1 truncate whitespace-nowrap text-[12px] leading-5 text-foreground"
+              title={message.title}
+            >
+              {message.title}
+            </code>
+            {message.content && collapsible ? (
+              <button
+                type="button"
+                onClick={() => setIsOpen((current) => !current)}
+                className="inline-flex shrink-0 items-center gap-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <ChevronRight className={cn('h-3.5 w-3.5 transition-transform', isOpen && 'rotate-90')} />
+                {isOpen ? copy.collapseDetails : copy.expandDetails}
+              </button>
+            ) : null}
+          </div>
+          {message.content && collapsible && isOpen ? (
+            <div className="mt-1.5 whitespace-pre-wrap break-words border-l border-border/80 pl-3 text-[12px] leading-5 text-muted-foreground">
+              {message.content}
+            </div>
           ) : null}
         </div>
       </div>
@@ -3825,28 +5137,29 @@ function EventMessage({ language, message }) {
   );
 }
 
-function StatusPill({ label, title, tone }) {
+function StatusPill({ className, label, title, tone }) {
   return (
     <span
-      title={title}
+      title={title || label}
       className={cn(
-        'inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]',
+        'inline-flex max-w-full min-w-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]',
         tone === 'success' && 'border-emerald-200 bg-emerald-50 text-emerald-700',
         tone === 'error' && 'border-destructive/25 bg-destructive/10 text-destructive',
         tone === 'running' && 'border-primary/20 bg-primary/10 text-foreground',
         tone === 'muted' && 'border-border/70 bg-background/80 text-muted-foreground',
+        className,
       )}
     >
       <span
         className={cn(
-          'h-1.5 w-1.5 rounded-full',
+          'h-1.5 w-1.5 shrink-0 rounded-full',
           tone === 'success' && 'bg-emerald-500',
           tone === 'error' && 'bg-destructive',
           tone === 'running' && 'bg-primary',
           tone === 'muted' && 'bg-muted-foreground/60',
         )}
       />
-      {label}
+      <span className="min-w-0 truncate">{label}</span>
     </span>
   );
 }
@@ -3872,7 +5185,7 @@ function RunIndicator({ language }) {
         <Bot className="h-3.5 w-3.5" />
       </MessageLeadIcon>
       <div className="pt-0.5">
-        <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Claude</div>
+        <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Agent</div>
         <TypingIndicator label={copy.assistantThinking} labelLoading />
       </div>
     </div>
@@ -4939,9 +6252,16 @@ function getSlashCommands(language, installedSkills = []) {
     {
       aliases: [],
       description: isChinese ? '设置当前会话模型' : 'Set the current model',
-      detail: isChinese ? '迁移自 Claude Code 的 /model，例如 /model sonnet、/model opus、/model haiku，或直接填写完整模型名' : 'Migrated from Claude Code /model. Example: /model sonnet, /model opus, /model haiku, or a full model name',
+      detail: isChinese ? '设置当前会话模型，例如 /model sonnet、/model opus，或直接填写完整模型名' : 'Set the current model, for example /model sonnet, /model opus, or a full model name',
       name: 'model',
       template: '/model ',
+    },
+    {
+      aliases: [],
+      description: isChinese ? '切换当前会话 provider' : 'Switch the current provider',
+      detail: isChinese ? '可用值：claude、codex。切换后下一条消息会从新的 provider 线程开始。' : 'Available values: claude, codex. The next message starts on a fresh provider thread.',
+      name: 'provider',
+      template: '/provider ',
     },
     {
       aliases: [],
@@ -4979,31 +6299,49 @@ function getSlashCommands(language, installedSkills = []) {
     .filter((command) => !builtinNames.has(command.name));
 
   return [
-    ...builtinCommands.slice(0, 5),
+    ...builtinCommands.slice(0, 6),
     ...skillCommands,
-    builtinCommands[5],
+    builtinCommands[6],
   ];
 }
 
-function getComposerModelOptions(copy, selectedModel, currentModel, availableClaudeModels = []) {
-  const defaultCurrentLabel = !selectedModel ? getModelDisplayName(currentModel, availableClaudeModels) : '';
+function getComposerProviderOptions(copy, providerCatalog) {
+  return [
+    {
+      icon: Bot,
+      label: copy.providerOptionClaude,
+      summary: copy.providerSummaryClaude,
+      value: 'claude',
+    },
+    {
+      icon: Sparkles,
+      label: copy.providerOptionCodex,
+      summary: copy.providerSummaryCodex,
+      value: 'codex',
+    },
+  ].filter((option) => isProviderSelectable(providerCatalog, option.value));
+}
+
+function getComposerModelOptions(copy, provider, selectedModel, currentModel, availableProviderModels = []) {
+  const providerLabel = getProviderDisplayName(provider, copy);
+  const defaultCurrentLabel = !selectedModel ? getModelDisplayName(currentModel, availableProviderModels, provider) : '';
   const defaultOption = {
     commandValue: 'default',
     label: copy.modelOptionDefault,
-    summary: copy.modelSummaryDefault(defaultCurrentLabel),
+    summary: copy.modelSummaryDefault(defaultCurrentLabel, providerLabel),
     value: '',
   };
 
-  const dynamicPresets = availableClaudeModels
+  const dynamicPresets = availableProviderModels
     .filter((model) => model && typeof model.value === 'string' && model.value)
     .map((model) => ({
       commandValue: model.value,
-      label: model.label || getModelDisplayName(model.value, availableClaudeModels) || model.value,
+      label: model.label || getModelDisplayName(model.value, availableProviderModels, provider) || model.value,
       summary: model.summary || model.description || '',
       value: model.value,
     }));
 
-  const fallbackPresets = [
+  const fallbackPresets = provider === 'claude' ? [
     {
       commandValue: 'opus',
       label: copy.modelOptionOpus,
@@ -5028,7 +6366,7 @@ function getComposerModelOptions(copy, selectedModel, currentModel, availableCla
       summary: copy.modelSummarySonnet,
       value: 'sonnet',
     },
-  ];
+  ] : [];
 
   const presets = [defaultOption, ...(dynamicPresets.length > 0 ? dynamicPresets : fallbackPresets)];
 
@@ -5040,8 +6378,8 @@ function getComposerModelOptions(copy, selectedModel, currentModel, availableCla
     ...presets,
     {
       commandValue: selectedModel,
-      label: getModelDisplayName(selectedModel, availableClaudeModels) || copy.modelOptionCustom,
-      summary: copy.modelSummaryCustom(getModelDisplayName(currentModel || selectedModel, availableClaudeModels) || selectedModel),
+      label: getModelDisplayName(selectedModel, availableProviderModels, provider) || copy.modelOptionCustom,
+      summary: copy.modelSummaryCustom(getModelDisplayName(currentModel || selectedModel, availableProviderModels, provider) || selectedModel),
       value: selectedModel,
     },
   ];
@@ -5126,7 +6464,118 @@ function getSessionModeIcon(permissionMode) {
   }
 }
 
-function getModelDisplayName(value, availableClaudeModels = []) {
+function normalizeProviderKey(value) {
+  return value === 'codex' ? 'codex' : 'claude';
+}
+
+function getLockedProviderChipLabel(provider) {
+  return normalizeProviderKey(provider) === 'codex' ? 'Codex' : 'Claude Code';
+}
+
+function getProviderBadgeClasses(provider) {
+  return normalizeProviderKey(provider) === 'codex'
+    ? 'border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-400/80 dark:bg-sky-500/10 dark:text-sky-300 dark:hover:bg-sky-500/16'
+    : 'border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-400/80 dark:bg-emerald-500/10 dark:text-emerald-300 dark:hover:bg-emerald-500/16';
+}
+
+function getProviderDotClasses(provider) {
+  return normalizeProviderKey(provider) === 'codex'
+    ? 'bg-sky-500 dark:bg-sky-300'
+    : 'bg-emerald-500 dark:bg-emerald-300';
+}
+
+function getSelectedProviderBadgeClasses() {
+  return 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:border-amber-400/80 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/16';
+}
+
+function getSelectedProviderDotClasses() {
+  return 'bg-amber-500 dark:bg-amber-300';
+}
+
+function isSessionProviderLocked(session) {
+  if (!session || !Array.isArray(session.messages)) {
+    return Boolean(session?.providerLocked);
+  }
+
+  return Boolean(
+    session.providerLocked
+    || session.messages.some((message) => (
+      message?.role === 'user'
+      || (message?.role === 'event' && message?.kind === 'command')
+    )),
+  );
+}
+
+function normalizeProviderCommandArg(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'claude' || normalized === 'codex') {
+    return normalized;
+  }
+
+  return '';
+}
+
+function getProviderDisplayName(provider, copy) {
+  return normalizeProviderKey(provider) === 'codex'
+    ? copy.providerOptionCodex
+    : copy.providerOptionClaude;
+}
+
+function getProviderInfo(providerCatalog, provider, fallbackProvider = 'claude') {
+  const normalizedProvider = normalizeProviderKey(provider || fallbackProvider);
+  if (providerCatalog && providerCatalog[normalizedProvider]) {
+    return providerCatalog[normalizedProvider];
+  }
+
+  const fallbackKey = normalizeProviderKey(fallbackProvider);
+  if (providerCatalog && providerCatalog[fallbackKey]) {
+    return providerCatalog[fallbackKey];
+  }
+
+  return {
+    available: false,
+    enabled: true,
+    key: normalizedProvider,
+    label: normalizedProvider === 'codex' ? 'Codex' : 'Claude',
+    models: [],
+    skills: [],
+    version: '',
+  };
+}
+
+function getEnabledProviderKeys(providerCatalog) {
+  return PROVIDER_KEYS.filter((provider) => getProviderInfo(providerCatalog, provider, provider).enabled !== false);
+}
+
+function getAvailableEnabledProviderKeys(providerCatalog) {
+  return PROVIDER_KEYS.filter((provider) => isProviderSelectable(providerCatalog, provider));
+}
+
+function isProviderSelectable(providerCatalog, provider) {
+  const providerInfo = getProviderInfo(providerCatalog, provider, provider);
+  return providerInfo.enabled !== false && Boolean(providerInfo.available);
+}
+
+function resolveProviderSelection(providerCatalog, preferredProvider, fallbackProvider = 'claude') {
+  const preferredKey = normalizeProviderKey(preferredProvider || fallbackProvider);
+  const availableEnabledProviders = getAvailableEnabledProviderKeys(providerCatalog);
+  if (availableEnabledProviders.length > 0) {
+    return availableEnabledProviders.includes(preferredKey)
+      ? preferredKey
+      : availableEnabledProviders[0];
+  }
+
+  const enabledProviders = getEnabledProviderKeys(providerCatalog);
+  if (enabledProviders.length > 0) {
+    return enabledProviders.includes(preferredKey)
+      ? preferredKey
+      : enabledProviders[0];
+  }
+
+  return normalizeProviderKey(fallbackProvider);
+}
+
+function getModelDisplayName(value, availableProviderModels = [], provider = 'claude') {
   if (typeof value !== 'string') {
     return '';
   }
@@ -5136,7 +6585,7 @@ function getModelDisplayName(value, availableClaudeModels = []) {
     return '';
   }
 
-  const matchedModel = availableClaudeModels.find((model) => (
+  const matchedModel = availableProviderModels.find((model) => (
     typeof model?.value === 'string'
     && model.value.trim().toLowerCase() === normalized
     && typeof model.label === 'string'
@@ -5144,6 +6593,10 @@ function getModelDisplayName(value, availableClaudeModels = []) {
   ));
   if (matchedModel) {
     return matchedModel.label.trim();
+  }
+
+  if (normalizeProviderKey(provider) === 'codex') {
+    return value.trim();
   }
 
   if (normalized === 'opus[1m]' || normalized.includes('claude-opus-4-6[1m]')) {
@@ -5646,7 +7099,7 @@ function buildSkillInvocationPrompt(skill, rawArgs, language) {
 
   if (language === 'zh') {
     return [
-      `请使用已安装的 Claude Code skill "${skillName}" 来处理这次请求。`,
+      `请使用已安装的本地 skill "${skillName}" 来处理这次请求。`,
       skillDescription ? `Skill 说明：${skillDescription}` : '',
       skillPath ? `Skill 路径：${skillPath}` : '',
       '',
@@ -5655,7 +7108,7 @@ function buildSkillInvocationPrompt(skill, rawArgs, language) {
   }
 
   return [
-    `Please use the installed Claude Code skill "${skillName}" for this request.`,
+    `Please use the installed local skill "${skillName}" for this request.`,
     skillDescription ? `Skill description: ${skillDescription}` : '',
     skillPath ? `Skill path: ${skillPath}` : '',
     '',
@@ -5694,19 +7147,199 @@ function getInitialPaneLayout() {
   }
 }
 
+function getInitialPaneRecentIds() {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+
+  try {
+    const storedValue = window.localStorage.getItem(PANE_RECENT_IDS_STORAGE_KEY);
+    if (!storedValue) {
+      return [];
+    }
+
+    return normalizePaneRecentIds(JSON.parse(storedValue));
+  } catch {
+    return [];
+  }
+}
+
 function getInitialPaneBoardSize() {
   if (typeof window === 'undefined') {
     return { height: 0, width: 0 };
   }
 
-  const estimatedSidebarWidth = 280;
+  return getEstimatedPaneBoardSize(window.innerWidth, window.innerHeight);
+}
+
+function getEstimatedPaneBoardSize(windowWidth, windowHeight) {
   const estimatedTopBarHeight = 44;
   const estimatedPanePadding = 2;
 
   return {
-    height: Math.max(0, window.innerHeight - estimatedTopBarHeight - estimatedPanePadding),
-    width: Math.max(0, window.innerWidth - estimatedSidebarWidth - estimatedPanePadding),
+    height: Math.max(0, windowHeight - estimatedTopBarHeight - estimatedPanePadding),
+    width: Math.max(0, windowWidth - SIDEBAR_EXPANDED_WIDTH - estimatedPanePadding),
   };
+}
+
+function syncPaneRecentIds(currentIds, panes, focusedPaneId) {
+  const paneIds = normalizePaneRecentIds(null, panes);
+  const knownPaneIds = new Set(paneIds);
+  const nextIds = [];
+
+  if (focusedPaneId && knownPaneIds.has(focusedPaneId)) {
+    nextIds.push(focusedPaneId);
+  }
+
+  for (const paneId of Array.isArray(currentIds) ? currentIds : []) {
+    if (!paneId || paneId === focusedPaneId || !knownPaneIds.has(paneId) || nextIds.includes(paneId)) {
+      continue;
+    }
+
+    nextIds.push(paneId);
+  }
+
+  for (const paneId of paneIds) {
+    if (!nextIds.includes(paneId)) {
+      nextIds.push(paneId);
+    }
+  }
+
+  return arePaneIdListsEqual(currentIds, nextIds) ? currentIds : nextIds;
+}
+
+function normalizePaneRecentIds(value, panes = []) {
+  const knownPaneIds = new Set(
+    Array.isArray(panes) && panes.length > 0
+      ? panes.map((pane) => pane?.id).filter(Boolean)
+      : [],
+  );
+  const nextIds = [];
+
+  for (const paneId of Array.isArray(value) ? value : []) {
+    if (typeof paneId !== 'string' || !paneId.trim()) {
+      continue;
+    }
+
+    const normalizedId = paneId.trim();
+    if ((knownPaneIds.size > 0 && !knownPaneIds.has(normalizedId)) || nextIds.includes(normalizedId)) {
+      continue;
+    }
+
+    nextIds.push(normalizedId);
+  }
+
+  if (knownPaneIds.size > 0) {
+    for (const paneId of knownPaneIds) {
+      if (!nextIds.includes(paneId)) {
+        nextIds.push(paneId);
+      }
+    }
+  }
+
+  return nextIds;
+}
+
+function countAssignedPaneBindings(layout) {
+  return normalizePaneLayout(layout).panes.filter((pane) => pane.sessionId && pane.workspaceId).length;
+}
+
+function resolveHydratedPaneState({ localLayout, localRecentIds, remoteLayout, remoteRecentIds }) {
+  const normalizedLocalLayout = normalizePaneLayout(localLayout);
+  const normalizedRemoteLayout = remoteLayout ? normalizePaneLayout(remoteLayout) : null;
+  const shouldUseLocalLayout = shouldPreferLocalPaneLayout(normalizedLocalLayout, normalizedRemoteLayout);
+  const resolvedLayout = shouldUseLocalLayout
+    ? normalizedLocalLayout
+    : (normalizedRemoteLayout || normalizedLocalLayout);
+  const normalizedLocalRecentIds = normalizePaneRecentIds(localRecentIds, resolvedLayout.panes);
+  const normalizedRemoteRecentIds = normalizePaneRecentIds(remoteRecentIds, resolvedLayout.panes);
+  const shouldUseLocalRecentIds = shouldPreferLocalPaneRecentIds({
+    localRecentIds: normalizedLocalRecentIds,
+    preferredLayoutSource: shouldUseLocalLayout ? 'local' : 'remote',
+    remoteRecentIds: normalizedRemoteRecentIds,
+  });
+
+  return {
+    layout: resolvedLayout,
+    recentPaneIds: syncPaneRecentIds(
+      shouldUseLocalRecentIds ? normalizedLocalRecentIds : normalizedRemoteRecentIds,
+      resolvedLayout.panes,
+      resolvedLayout.focusedPaneId,
+    ),
+  };
+}
+
+function shouldPreferLocalPaneLayout(localLayout, remoteLayout) {
+  if (!remoteLayout) {
+    return true;
+  }
+
+  if (arePaneLayoutsEqual(localLayout, remoteLayout)) {
+    return true;
+  }
+
+  const localAssignedPaneCount = countAssignedPaneBindings(localLayout);
+  const remoteAssignedPaneCount = countAssignedPaneBindings(remoteLayout);
+  if (localAssignedPaneCount !== remoteAssignedPaneCount) {
+    return localAssignedPaneCount > remoteAssignedPaneCount;
+  }
+
+  if (localLayout.panes.length !== remoteLayout.panes.length) {
+    return localLayout.panes.length > remoteLayout.panes.length;
+  }
+
+  return true;
+}
+
+function shouldPreferLocalPaneRecentIds({ localRecentIds, preferredLayoutSource, remoteRecentIds }) {
+  if (localRecentIds.length !== remoteRecentIds.length) {
+    return localRecentIds.length > remoteRecentIds.length;
+  }
+
+  if (arePaneIdListsEqual(localRecentIds, remoteRecentIds)) {
+    return preferredLayoutSource === 'local';
+  }
+
+  return preferredLayoutSource === 'local';
+}
+
+function getPrioritizedPaneIds(panes, recentPaneIds, focusedPaneId) {
+  return syncPaneRecentIds(recentPaneIds, panes, focusedPaneId);
+}
+
+function getVisiblePaneIds(panes, prioritizedPaneIds, maxPaneCount) {
+  const paneIds = Array.isArray(panes) ? panes.map((pane) => pane?.id).filter(Boolean) : [];
+  const capacity = Math.max(1, maxPaneCount || 1);
+  if (paneIds.length <= capacity) {
+    return paneIds;
+  }
+
+  const visiblePaneIdSet = new Set(prioritizedPaneIds.slice(0, capacity));
+  return paneIds.filter((paneId) => visiblePaneIdSet.has(paneId));
+}
+
+function orderPaneViewsByIds(paneViews, orderedPaneIds) {
+  const priority = new Map(
+    (Array.isArray(orderedPaneIds) ? orderedPaneIds : []).map((paneId, index) => [paneId, index]),
+  );
+
+  return [...(Array.isArray(paneViews) ? paneViews : [])].sort((left, right) => {
+    const leftRank = priority.has(left.id) ? priority.get(left.id) : Number.MAX_SAFE_INTEGER;
+    const rightRank = priority.has(right.id) ? priority.get(right.id) : Number.MAX_SAFE_INTEGER;
+    return leftRank - rightRank;
+  });
+}
+
+function arePaneIdListsEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((value, index) => value === right[index]);
 }
 
 function normalizePaneLayout(value) {
@@ -5881,11 +7514,7 @@ function normalizePaneLayoutWithAppState(currentLayout, appState) {
       return pane;
     }
 
-    return {
-      ...pane,
-      sessionId: null,
-      workspaceId: workspace.id,
-    };
+    return pane;
   });
 
   return normalizePaneLayout({
@@ -5918,6 +7547,110 @@ function createSessionCacheKey(workspaceId, sessionId) {
   }
 
   return `${workspaceId}:${sessionId}`;
+}
+
+function buildSessionPaneBindingMap(panes) {
+  const bindingMap = new Map();
+
+  (Array.isArray(panes) ? panes : []).forEach((pane, index) => {
+    const cacheKey = createSessionCacheKey(pane?.workspaceId, pane?.sessionId);
+    if (!cacheKey) {
+      return;
+    }
+
+    const paneNumber = index + 1;
+    const existingNumbers = bindingMap.get(cacheKey) || [];
+    bindingMap.set(cacheKey, [...existingNumbers, paneNumber]);
+  });
+
+  return bindingMap;
+}
+
+function getPaneAccentColorAlpha(paneNumber, alpha) {
+  const seed = getPaneAccentSeed(paneNumber);
+  return `hsl(${formatPaneAccentToken(seed.hue, seed.saturation, seed.lightness, alpha)})`;
+}
+
+function getPaneAccentColor(paneNumber) {
+  const seed = getPaneAccentSeed(paneNumber);
+  return `hsl(${formatPaneAccentToken(seed.hue, seed.saturation, seed.lightness)})`;
+}
+
+function getPaneAccentTone(paneNumber) {
+  const seed = getPaneAccentSeed(paneNumber);
+
+  return {
+    backgroundDark: formatPaneAccentToken(
+      seed.hue,
+      clampNumber(seed.saturation + 6, 52, 100),
+      clampNumber(seed.lightness + 2, 42, 56),
+      0.16,
+    ),
+    backgroundLight: formatPaneAccentToken(
+      seed.hue,
+      clampNumber(seed.saturation - 14, 42, 92),
+      96,
+    ),
+    borderDark: formatPaneAccentToken(
+      seed.hue,
+      clampNumber(seed.saturation - 4, 50, 92),
+      clampNumber(seed.lightness + 12, 54, 68),
+      0.9,
+    ),
+    borderLight: formatPaneAccentToken(
+      seed.hue,
+      clampNumber(seed.saturation - 8, 44, 88),
+      clampNumber(seed.lightness + 18, 58, 72),
+    ),
+    textDark: formatPaneAccentToken(
+      seed.hue,
+      clampNumber(seed.saturation + 8, 58, 100),
+      clampNumber(seed.lightness + 24, 72, 84),
+    ),
+    textLight: formatPaneAccentToken(
+      seed.hue,
+      clampNumber(seed.saturation + 4, 48, 100),
+      clampNumber(seed.lightness - 14, 32, 42),
+    ),
+  };
+}
+
+function getPaneAccentSeed(paneNumber) {
+  const palette = [
+    { hue: 222, saturation: 78, lightness: 52 },
+    { hue: 36, saturation: 88, lightness: 48 },
+    { hue: 332, saturation: 74, lightness: 52 },
+    { hue: 145, saturation: 68, lightness: 34 },
+    { hue: 4, saturation: 74, lightness: 54 },
+    { hue: 268, saturation: 62, lightness: 56 },
+    { hue: 190, saturation: 78, lightness: 42 },
+    { hue: 84, saturation: 72, lightness: 38 },
+  ];
+  const normalizedPaneNumber = Math.max(1, paneNumber);
+  if (normalizedPaneNumber <= palette.length) {
+    return palette[normalizedPaneNumber - 1];
+  }
+
+  const overflowIndex = normalizedPaneNumber - palette.length - 1;
+  return {
+    hue: Math.round((overflowIndex * 137.508 + 18) % 360),
+    saturation: overflowIndex % 2 === 0 ? 74 : 64,
+    lightness: overflowIndex % 3 === 0 ? 46 : (overflowIndex % 3 === 1 ? 54 : 40),
+  };
+}
+
+function formatPaneAccentToken(hue, saturation, lightness, alpha) {
+  const normalizedHue = Math.round(hue);
+  const normalizedSaturation = Math.round(clampNumber(saturation, 0, 100));
+  const normalizedLightness = Math.round(clampNumber(lightness, 0, 100));
+
+  return alpha == null
+    ? `${normalizedHue} ${normalizedSaturation}% ${normalizedLightness}%`
+    : `${normalizedHue} ${normalizedSaturation}% ${normalizedLightness}% / ${alpha}`;
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function areSessionSnapshotsEqual(left, right) {
@@ -5997,9 +7730,9 @@ function getAdaptivePaneLimit(width, height) {
     return 1;
   }
 
-  const maxColumns = Math.max(1, Math.floor(width / 420));
-  const maxRows = Math.max(1, Math.floor(height / 320));
-  return Math.max(1, Math.min(6, maxColumns * maxRows));
+  const maxColumns = Math.max(1, Math.floor(width / MIN_PANE_WIDTH));
+  const maxRows = Math.max(1, Math.floor(height / MIN_PANE_HEIGHT));
+  return Math.max(1, maxColumns * maxRows);
 }
 
 function getAdaptivePaneGridSpec(count, width, height) {
@@ -6037,14 +7770,14 @@ function getAdaptivePaneGridSpec(count, width, height) {
   }
 
   if (isLandscape) {
-    const columns = Math.min(paneCount, Math.max(2, Math.floor(width / 420)));
+    const columns = Math.min(paneCount, Math.max(2, Math.floor(width / MIN_PANE_WIDTH)));
     return {
       columns,
       rows: Math.ceil(paneCount / columns),
     };
   }
 
-  const rows = Math.min(paneCount, Math.max(2, Math.floor(height / 320)));
+  const rows = Math.min(paneCount, Math.max(2, Math.floor(height / MIN_PANE_HEIGHT)));
   return {
     columns: Math.ceil(paneCount / rows),
     rows,
@@ -6062,6 +7795,43 @@ function setPaneViewportNode(refStore, paneId, node) {
   }
 
   refStore.current.delete(paneId);
+}
+
+function normalizeToastMessage(value) {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  if (value && typeof value.message === 'string') {
+    return value.message.trim();
+  }
+
+  return '';
+}
+
+function appendToast(currentItems, payload) {
+  const message = normalizeToastMessage(payload?.message);
+  if (!message) {
+    return currentItems;
+  }
+
+  if (Array.isArray(currentItems) && currentItems.some((item) => item.message === message && item.tone === payload?.tone)) {
+    return currentItems;
+  }
+
+  return [
+    ...(Array.isArray(currentItems) ? currentItems : []),
+    {
+      duration: payload?.duration ?? 3200,
+      id: createToastId(),
+      message,
+      tone: payload?.tone || 'error',
+    },
+  ].slice(-4);
+}
+
+function createToastId() {
+  return `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function getInitialThemePreference() {
@@ -6098,6 +7868,18 @@ function getInitialLanguage() {
   return window.navigator.language?.toLowerCase().startsWith('zh') ? 'zh' : 'en';
 }
 
+function getInitialSidebarCollapsed() {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
 function getWindowView() {
   if (typeof window === 'undefined') {
     return 'main';
@@ -6106,19 +7888,44 @@ function getWindowView() {
   return new URLSearchParams(window.location.search).get('view') || 'main';
 }
 
-function formatClaudeStatusLabel(claude, language) {
+function formatProviderStatusLabel(providerInfo, language) {
   const copy = COPY[language];
-  return claude?.available ? copy.claudeCode : copy.claudeCodeUnavailable;
+  return providerInfo?.label || copy.claudeCode;
 }
 
-function normalizeClaudeVersion(value) {
+function formatProviderStatusTitle(providerInfo, language) {
+  const copy = COPY[language];
+  const label = providerInfo?.label || copy.claudeCode;
+  if (!providerInfo?.available) {
+    return copy.providerUnavailable(label);
+  }
+
+  return normalizeProviderVersion(providerInfo.version, label) || label;
+}
+
+function getProviderStatusTone(providerInfo) {
+  return providerInfo?.available ? 'success' : 'error';
+}
+
+function getCompactProviderMonogram(provider) {
+  return normalizeProviderKey(provider) === 'codex' ? 'CX' : 'CL';
+}
+
+function normalizeProviderVersion(value, providerLabel) {
   if (!value) {
     return '';
   }
 
-  return value
+  const normalizedValue = String(value)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-1)[0] || '';
+
+  return normalizedValue
     .replace(/\(Claude Code\)/gi, '')
     .replace(/^Claude Code\s*/i, '')
+    .replace(/^codex-cli\s*/i, providerLabel ? `${providerLabel} ` : 'Codex ')
     .trim();
 }
 

@@ -1,19 +1,25 @@
 {
   "name": "cli_proxy",
   "version": "1.0.0",
+  "productName": "CLI Proxy",
   "main": "electron/main.cjs",
   "scripts": {
     "build": "vite build",
+    "build:icon": "node scripts/build-mac-icon.mjs",
     "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
     "dev:electron": "wait-on tcp:5173 && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .",
     "dev:renderer": "vite",
+    "dist:mac": "npm run build && npm run build:icon && electron-builder --mac dmg",
+    "dist:mac:dir": "npm run build && npm run build:icon && electron-builder --mac dir",
+    "release:mac": "node scripts/release-mac.mjs",
+    "release:mac:check": "node scripts/release-mac.mjs --check",
     "start": "npm run build && electron .",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Desktop wrapper for Claude Code with multi-pane conversation workflows.",
   "dependencies": {
     "@radix-ui/react-scroll-area": "^1.2.10",
     "@radix-ui/react-slot": "^1.2.4",
@@ -32,9 +38,41 @@
     "concurrently": "^9.2.1",
     "cross-env": "^7.0.3",
     "electron": "^37.10.3",
+    "electron-builder": "^26.8.1",
     "postcss": "^8.5.8",
     "tailwindcss": "^3.4.19",
     "vite": "^5.4.21",
     "wait-on": "^8.0.5"
+  },
+  "build": {
+    "appId": "com.sai.cli-proxy",
+    "productName": "CLI Proxy",
+    "asar": true,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "gatekeeperAssess": false,
+      "hardenedRuntime": true,
+      "icon": "build/icon.icns",
+      "notarize": true,
+      "target": [
+        "dmg"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "writeUpdateInfo": false
+    }
   }
 }

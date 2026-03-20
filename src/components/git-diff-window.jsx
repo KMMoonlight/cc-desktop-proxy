@@ -16,6 +16,7 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { ToastViewport } from '@/components/ui/toast';
 import { cn } from '@/lib/utils';
 
 const LANGUAGE_STORAGE_KEY = 'cc-desktop-proxy-language';
@@ -68,18 +69,20 @@ export default function GitDiffWindow({ desktopClient }) {
   const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
   const [systemTheme, setSystemTheme] = useState(() => getSystemTheme());
   const [data, setData] = useState(null);
-  const [error, setError] = useState(
-    desktopClient ? '' : COPY[getInitialLanguage()].bridgeUnavailable,
-  );
+  const [toastItems, setToastItems] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [selectedPath, setSelectedPath] = useState('');
 
   const copy = COPY[language];
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
   const files = Array.isArray(data?.files) ? data.files : [];
+  const summary = data?.summary || {};
   const fileTree = useMemo(() => buildFileTree(files), [files]);
   const [collapsedFolders, setCollapsedFolders] = useState(() => new Set());
   const selectedFile = files.find((file) => file.path === selectedPath) || files[0] || null;
+  const headerAddedLines = Number.isFinite(summary.addedLines) ? summary.addedLines : 0;
+  const headerDeletedLines = Number.isFinite(summary.deletedLines) ? summary.deletedLines : 0;
+  const showHeaderChangeSummary = headerAddedLines > 0 || headerDeletedLines > 0;
 
   useEffect(() => {
     if (typeof document === 'undefined') {
@@ -121,12 +124,13 @@ export default function GitDiffWindow({ desktopClient }) {
 
   useEffect(() => {
     if (!desktopClient) {
+      setError(copy.bridgeUnavailable);
       setIsLoading(false);
       return;
     }
 
     void loadData();
-  }, [desktopClient, workspaceId]);
+  }, [copy.bridgeUnavailable, desktopClient, workspaceId]);
 
   useEffect(() => {
     if (!files.length) {
@@ -170,18 +174,42 @@ export default function GitDiffWindow({ desktopClient }) {
     }
   }
 
+  function dismissToast(toastId) {
+    setToastItems((current) => current.filter((item) => item.id !== toastId));
+  }
+
+  function setError(nextError) {
+    const message = normalizeToastMessage(nextError);
+    if (!message) {
+      return;
+    }
+
+    setToastItems((current) => appendToast(current, {
+      message,
+      tone: 'error',
+    }));
+  }
+
   return (
-    <div className="flex h-full flex-col overflow-hidden bg-background">
+    <div className="relative flex h-full flex-col overflow-hidden bg-background">
+      <ToastViewport items={toastItems} onDismiss={dismissToast} />
       <div className="drag-region h-10 shrink-0 border-b border-border/60 bg-background/70 backdrop-blur" />
 
       <header className="border-b border-border/70 bg-background/85 px-4 py-2 backdrop-blur">
         <div className="flex items-center justify-between gap-3">
-          <div className="min-w-0">
+          <div className="min-w-0 flex items-center gap-2">
             <p className="text-[13px] font-semibold text-foreground">{copy.gitChanges}</p>
+            {showHeaderChangeSummary ? (
+              <div className="flex items-center gap-1.5 text-[11px] font-medium">
+                <span className="text-muted-foreground">·</span>
+                <span className="text-emerald-700 dark:text-emerald-300">+{headerAddedLines}</span>
+                <span className="text-rose-600 dark:text-rose-300">-{headerDeletedLines}</span>
+              </div>
+            ) : null}
           </div>
           <div className="no-drag flex shrink-0 items-center gap-2">
             <Badge variant="outline" className="h-6 bg-background/80 px-2 text-[10px] text-foreground">
-              {copy.changedFiles(data?.summary?.filesChanged || 0)}
+              {copy.changedFiles(summary.filesChanged || 0)}
             </Badge>
             <Button
               variant="ghost"
@@ -199,12 +227,6 @@ export default function GitDiffWindow({ desktopClient }) {
           </div>
         </div>
       </header>
-
-      {error ? (
-        <div className="border-b border-destructive/25 bg-destructive/10 px-4 py-2 text-[13px] text-destructive">
-          {error}
-        </div>
-      ) : null}
 
       <div className="min-h-0 flex-1">
         <div className="flex h-full min-h-0">
@@ -559,6 +581,39 @@ function sortFileTreeNodes(nodes) {
 
       return left.name.localeCompare(right.name);
     });
+}
+
+function normalizeToastMessage(value) {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  if (value && typeof value.message === 'string') {
+    return value.message.trim();
+  }
+
+  return '';
+}
+
+function appendToast(currentItems, payload) {
+  const message = normalizeToastMessage(payload?.message);
+  if (!message) {
+    return currentItems;
+  }
+
+  if (Array.isArray(currentItems) && currentItems.some((item) => item.message === message && item.tone === payload?.tone)) {
+    return currentItems;
+  }
+
+  return [
+    ...(Array.isArray(currentItems) ? currentItems : []),
+    {
+      duration: payload?.duration ?? 3200,
+      id: `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      message,
+      tone: payload?.tone || 'error',
+    },
+  ].slice(-4);
 }
 
 function getFileStatusIcon(status) {

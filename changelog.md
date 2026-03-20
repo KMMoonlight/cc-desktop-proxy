@@ -1,35 +1,37 @@
 # Changelog
 
-## 2026-03-20 (最新)
+## 2026-03-20（当前工作区变更汇总）
 
-### electron/preload.cjs
+### 运行时 / Provider
 
-- 新增 IPC 通道：`getGitDiffViewData`（获取 Git 变更视图数据）、`getSession`（按 ID 获取会话）、`openGitDiffWindow`（打开 Git 变更独立窗口）
-- `stopRun` 改为接受 `payload` 参数，支持按 workspaceId / sessionId 精确停止指定会话的运行
+- 应用从单一 Claude CLI 扩展为 Claude / Codex 双 Provider 运行时：新增 provider 探测、版本/模型/skills 列表、默认 provider 推导，以及 `enabledProviders`、`paneLayout` 等 schema v6 持久化字段
+- 会话支持在首次发言前切换 Provider；切换后会重置旧 Provider 的远端会话 ID、模型和权限模式，并在历史里写入命令事件。运行中或已有正式对话内容的会话会锁定 Provider，避免跨线程复用
+- `sendMessage`、`/mcp`、skills 扫描与安装路径、CLI 可执行文件解析都改为按 Provider 路由；Claude 与 Codex 分别走各自的启动参数和能力检测流程
+- 新增 IPC：`openWorkspaceInFinder`、`setPaneLayout`、`updateSessionProvider`、`setProviderEnabled`；`getGitDiffViewData`、`getSession`、`openGitDiffWindow` 继续作为 Git 变更窗口和分屏数据读取入口
+- 运行态继续支持同窗口多会话并发，`runToken` 防竞态、`resetRunState` / `deleteRunState` 收口了进程结束后的状态清理
 
-### electron/runtime.cjs
+### 前端 / 分屏与侧边栏
 
-- **多会话并发运行**：`windowRuns` 从单一 runState 重构为 `Map<contentsId, Map<runKey, runState>>`，支持同一窗口内多个会话同时运行；新增 `createRunKey`、`createRunState` 工厂函数及一系列查找辅助方法（`getWindowRunStates`、`findRunStateForSession`、`findRunStateByApprovalRequest`、`getActiveRunStates`、`getActiveRunLookup`、`findActiveRunState`）
-- **runToken 防竞态**：每次启动新进程时生成 `runToken`，stdout / stderr / close / error 回调均校验 token，防止旧进程事件污染新会话
-- **Git 变更窗口**：新增 `openGitDiffWindow` 方法，为每个工作区维护独立的 `BrowserWindow`（存入 `gitDiffWindows` Map），支持复用已有窗口；`disposeAll` 时统一销毁
-- **Git 变更数据**：新增 `getGitDiffViewData` / `serializeWorkspaceGitDiffView`，完整解析工作区 Git 变更（tracked + untracked），包含逐文件 diff patch、增删行数、状态（added / modified / deleted / renamed / copied / untracked 等）；新增大量 Git 解析工具函数（`collectWorkspaceGitDiffEntries`、`parseGitNameStatusEntries`、`parseGitNumstatMap`、`parseGitPatchMap`、`getGitUntrackedDiff`、`parseUnifiedDiffStats` 等）
-- **工作区序列化增强**：`serializeWorkspace` 新增 `gitAddedLines`、`gitDeletedLines`、`gitDirty` 字段；`getWorkspaceGitInfo` 增加 `dirty` 状态检测及增删行统计（staged + unstaged + untracked）；Git 信息缓存 TTL 从 3s 延长至 10s
-- **`addWorkspace` 行为变更**：工作目录已存在时改为抛出错误，不再静默切换选中状态
-- **runState 重置提取**：将分散在 close / error / stop 中的重置逻辑统一提取为 `resetRunState` / `deleteRunState` 方法，消除重复代码
-- `getSession` 新增 IPC 处理，支持前端按 workspaceId + sessionId 拉取完整会话数据
+- 多分屏布局进一步完善：支持 `single / columns / rows / grid`，布局和最近使用的 pane 顺序同时持久化到本地与 Electron store；窗口空间不足时，超出的 pane 会进入“隐藏分屏”区
+- Composer 和会话元信息改为感知当前 Provider：模型选择跟随聚焦会话的 Provider，可用模型和技能列表也按 Provider 动态切换；新增 `/provider` 指令和 Provider 锁定提示
+- 设置页新增 Provider 开关区，允许控制哪些本地 CLI 可用于新会话和未锁定会话，并强制至少保留一个启用项；侧边栏和顶部同时展示 Provider 可用状态
+- 侧边栏新增展开/折叠、悬浮面板、隐藏分屏入口、快捷键提示，以及工作区“更多操作”菜单；工作区现在可以直接“查看 Git 变更”或“在 Finder 中打开工作目录”
+- `focusedPane` / `focusedSession` / `focusedWorkspace`、`sessionViewCache`、`sendingPaneIds` 等状态继续支撑多分屏独立发送和会话切换
 
-### src/App.jsx
+### Git 变更窗口 / UI 收尾
 
-- **多分屏布局**：新增 `paneLayout` 状态，支持 `single / columns / rows / grid` 四种布局模式，布局偏好持久化到 `localStorage`；新增 `Columns2`、`Rows2`、`Grid2x2` 图标及对应文案（中英双语）
-- **分屏会话管理**：引入 `focusedPane` / `focusedSession` / `focusedWorkspace` 概念，composer 区域的模型、权限模式、消息历史均跟随当前聚焦分屏；新增 `sessionViewCache` 缓存非选中分屏的会话数据
-- **`isSending` → `sendingPaneIds`**：发送状态从单一布尔值改为分屏 ID 数组，支持多分屏独立发送状态
-- **Git 变更入口**：顶部栏新增"查看 Git 变更"按钮，调用 `openGitDiffWindow` IPC；新增 `viewGitChanges` 文案
-- **视图路由**：`App` 组件新增 `getWindowView()` 判断，`view=git-diff` 时渲染 `GitDiffWindow` 组件，主界面提取为 `MainApp`
-- 新增 `formatShortcutLabel` / `formatShortcutTooltip` 工具函数，统一处理跨平台快捷键标签显示
+- Git 变更窗口补充了头部增删行汇总，并把错误展示从内联 banner 改成 toast；主界面也抽出通用 `ToastViewport` 组件复用
+- `ScrollArea` 新增 `viewportClassName`，便于局部定制滚动容器；`index.css` 增加 pane focus 色板，并增强 Markdown、行内代码、长路径的自动换行能力，减少内容撑破布局的问题
+- 工作区序列化新增 `gitAddedLines`、`gitDeletedLines`、`gitDirty` 字段，Git 信息缓存 TTL 延长到 10 秒；Git 变更视图继续支持 tracked / untracked 文件、patch、状态标签和增删行统计
+- 页面标题和应用文案向 `CLI Proxy` 统一，`index.html` 标题改为 `CLI Proxy Workspace`
 
-### src/components/git-diff-window.jsx（新文件）
+### 打包 / 发布
 
-- 新增独立的 Git 变更查看窗口组件，展示工作区所有文件变更（增删行数、状态标签、diff patch 内容）
+- `package.json` 新增 `productName`、应用描述和 `electron-builder` 配置，接入 macOS `dmg` 打包、`asar`、`hardenedRuntime`、entitlements、图标和 notarization 相关参数
+- 新增 `build:icon`、`dist:mac`、`dist:mac:dir`、`release:mac`、`release:mac:check` 脚本；`package-lock.json` 同步引入 `electron-builder` 及相关依赖
+- 新增 `scripts/build-mac-icon.mjs`，基于 `qlmanage`、`sips`、`iconutil` 从 `build/icon.svg` 生成 `icon.png` 和 `icon.icns`
+- 新增 `scripts/release-mac.mjs`、`.env.release.example`、`build_release_info.md`，用于校验签名 / 公证环境、说明打包流程和维护发布所需变量
+- 新增 `build/` 下的图标与 entitlements 资源，并在 `.gitignore` 中补充忽略 `release/`、`build/generated/` 和 `.env.release.local`
 
 ---
 

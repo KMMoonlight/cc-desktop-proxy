@@ -1,5 +1,49 @@
 # Changelog
 
+## 2026-03-21（当前工作区变更汇总）
+
+### Provider / Runtime / 持久化
+
+- 本地 store schema 升级到 `v8`，新增 `codeEditor`、`providerSystemPrompts`、会话级 `reasoningEffort` / `codexPlanModeActive` 等字段；`createSession` 也支持带 `preferredProvider` 新建会话
+- Provider 状态从“CLI 是否可用”扩展为“可用性 + 本地状态概览”：Claude 会读取本地统计缓存和 settings，展示当前模型、常用模型、连续活跃、最近活跃和累计会话；Codex 会读取 auth/config/session，展示登录方式、套餐、默认模型、推理默认、上下文窗口和 rate limit
+- Provider 切换、默认 Provider 回退和未锁定会话自动纠偏时，会同步清空旧线程 ID、模型、推理强度和 Codex plan 激活态，并在已有消息的会话中追加系统事件，避免错误复用旧 Provider 上下文
+- skills 扫描补充 `skills/.system` 目录，Provider 现在会同时识别用户级、项目级和系统级 skills
+
+### 代码编辑器联动
+
+- Runtime 新增代码编辑器探测、缓存和默认编辑器选择能力，并把当前选择写入本地配置；候选集覆盖 VS Code、Cursor、Windsurf、Zed、VSCodium、JetBrains 系列、Xcode、Nova、Sublime、BBEdit 等常见编辑器
+- Git Diff 窗口新增“在编辑器中打开工作目录 / 当前文件”；主界面的工作区菜单也支持直接用编辑器打开项目
+- Markdown 和消息中的本地路径链接不再只走系统默认打开，而是优先解析 `file://`、`:line:column`、`#LxCy` 等定位信息，并跳转到当前选中的代码编辑器
+
+### Codex 会话控制 / Slash 命令
+
+- 预加载层与运行时新增 `updateSessionReasoningEffort` IPC；Codex 会话支持保存 `low / medium / high / xhigh` 推理强度，并在启动参数里同时映射到 `model_reasoning_effort` 和 `plan_mode_reasoning_effort`
+- Codex 的 `plan` 模式从单纯的权限模式值变成真实的会话切换：发送前会按需注入 `/plan`，运行成功后再把 `codexPlanModeActive` 回写到本地状态
+- slash 命令改为按当前 Provider 动态生成和解析：Claude 会话提供 `/mode`，Codex 会话提供 `/reasoning`（兼容 `/effort`），两者共享 `/provider`、`/model`、`/mcp`、`/skills`、`/theme`
+- 主会话和分屏会话都会继承当前上下文的 Provider；新增 `Cmd/Ctrl + T` 快捷键，用于在当前 pane 中轮换到下一个可用 Provider，必要时会先新建一个可切换的会话
+
+### 前端设置 / 会话交互
+
+- 设置弹窗扩展为 `App / Providers / Shortcuts / About` 四个标签页，新增代码编辑器选择、分屏大小限制忽略开关、应用版本/平台信息展示
+- Provider 设置页新增手动刷新状态、Provider 开关和每个 Provider 的 system prompt 草稿/保存/重置能力；前端会把运行时返回的本地状态整理成卡片展示
+- 会话 composer 进一步按 Provider 分化：Claude 保留模式选择，Codex 增加 Plan mode 开关与推理强度选择器；Provider / Mode / Reasoning / Model 菜单之间的互斥关闭逻辑也补齐
+- 侧边栏和顶部 Provider 状态从简单可用性标记扩展为带版本/更新时间信息的状态提示；工作区菜单新增“用编辑器打开工作目录”
+
+### 分屏 / 发送反馈 / 事件渲染
+
+- 为每个 pane 新增 `pendingPaneTurns` 本地占位态：发送后会先把用户消息或 slash 命令事件临时插入对应 pane，等真实 session 状态更新后再自动清理，减少多分屏发送时的延迟感和闪烁
+- `RunIndicator` 改为围绕“最后一个 outbound turn”判断，而不是只看普通用户消息；slash 命令、pending turn、pending approval、tool activity、thinking 状态都能更准确地控制运行指示
+- 命令事件新增 `commandSource`（`slash / tool / system`），并贯穿事件追加、工具收尾、前端序列化和 UI badge 渲染；工具触发的命令事件不再和普通系统事件混在一起
+- Git Diff 窗口补充编辑器打开入口；设置和确认弹窗改为支持滚动与 safe area 的布局
+
+### 工程元数据 / 杂项
+
+- 应用名称从 `CLI Proxy` 统一调整为 `CC Desktop Proxy`，同步更新了 `index.html` 标题、`package.json` 和打包配置中的 `productName`
+- `package-lock.json` 有一轮锁文件刷新，主要体现为若干依赖的 `peer` 标记变化，没有独立的业务逻辑改动
+- 当前工作区还包含两个未跟踪文件：`.DS_Store`、`approval-probe.txt`（内容为 `hello`），更像本地临时产物而不是产品功能变更
+
+---
+
 ## 2026-03-20（当前工作区变更汇总）
 
 ### 运行时 / Provider

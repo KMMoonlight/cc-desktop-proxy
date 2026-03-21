@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -19,6 +19,7 @@ import {
   Grid2x2,
   Hand,
   Image as ImageIcon,
+  Info,
   LoaderCircle,
   MoreHorizontal,
   MessageSquarePlus,
@@ -48,6 +49,15 @@ import { cn } from '@/lib/utils';
 
 const EMPTY_APP_STATE = {
   activeSession: null,
+  appInfo: {
+    arch: '',
+    chromeVersion: '',
+    electronVersion: '',
+    name: '',
+    nodeVersion: '',
+    userDataPath: '',
+    version: '',
+  },
   claude: {
     available: false,
     busy: false,
@@ -55,11 +65,13 @@ const EMPTY_APP_STATE = {
     skills: [],
     version: '',
   },
+  codeEditors: [],
   defaultProvider: 'claude',
   expandedWorkspaceIds: [],
   paneLayout: null,
   platform: '',
   providers: {},
+  selectedCodeEditor: '',
   selectedSessionId: null,
   selectedWorkspaceId: null,
   workspaces: [],
@@ -69,6 +81,7 @@ const PROVIDER_KEYS = ['claude', 'codex'];
 const LANGUAGE_STORAGE_KEY = 'cc-desktop-proxy-language';
 const PANE_LAYOUT_STORAGE_KEY = 'cc-desktop-proxy-pane-layout';
 const PANE_RECENT_IDS_STORAGE_KEY = 'cc-desktop-proxy-pane-recent-ids';
+const PANE_SIZE_LIMIT_IGNORED_STORAGE_KEY = 'cc-desktop-proxy-pane-size-limit-ignored';
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'cc-desktop-proxy-sidebar-collapsed';
 const THEME_STORAGE_KEY = 'cc-desktop-proxy-theme';
 const PANE_LAYOUT_MODES = ['single', 'columns', 'rows', 'grid'];
@@ -107,6 +120,32 @@ const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
 const SIDEBAR_ACTION_BUTTON_CLASS = 'h-8 w-8 shrink-0 rounded-md bg-transparent p-0 text-muted-foreground shadow-none hover:bg-background/80 hover:text-foreground';
 const SIDEBAR_ACTION_SLOT_CLASS = 'absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1';
 const SIDEBAR_RAIL_BUTTON_CLASS = 'relative inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-transparent bg-transparent text-muted-foreground transition-[background-color,color,border-color,box-shadow] hover:bg-background/85 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35';
+
+function getModalLayoutStyles(platform) {
+  if (platform === 'darwin') {
+    return {
+      viewport: {
+        paddingTop: 'calc(env(safe-area-inset-top, 0px) + 56px)',
+        paddingBottom: '16px',
+      },
+      surface: {
+        height: 'calc(100dvh - env(safe-area-inset-top, 0px) - 72px)',
+        maxHeight: 'calc(100dvh - env(safe-area-inset-top, 0px) - 72px)',
+      },
+    };
+  }
+
+  return {
+    viewport: {
+      paddingTop: '16px',
+      paddingBottom: '16px',
+    },
+    surface: {
+      height: 'calc(100dvh - 32px)',
+      maxHeight: 'calc(100dvh - 32px)',
+    },
+  };
+}
 
 function formatShortcutLabel(platform, key) {
   const normalizedKey = String(key || '').trim().toUpperCase();
@@ -150,12 +189,15 @@ function formatShiftedShortcutLabel(platform, key) {
 function formatPaneSplitControlTooltip(copy, count, platform) {
   const primaryShortcut = formatShortcutLabel(platform, 'D');
   const combinedShortcut = formatShiftedShortcutLabel(platform, 'D');
+  const baseTooltip = Number.isFinite(count)
+    ? copy.paneSplitAddTooltip(count)
+    : copy.paneSplitAddTooltipUnlimited;
   const lines = [
-    copy.paneSplitAddTooltip(count),
+    baseTooltip,
   ];
 
   if (primaryShortcut) {
-    lines[0] = `${copy.paneSplitAdd} (${primaryShortcut}) · ${copy.paneSplitAddTooltip(count).replace(`${copy.paneSplitAdd} · `, '')}`;
+    lines[0] = `${copy.paneSplitAdd} (${primaryShortcut}) · ${baseTooltip.replace(`${copy.paneSplitAdd} · `, '')}`;
   }
 
   if (combinedShortcut) {
@@ -177,6 +219,35 @@ function formatShortcutRangeLabel(platform, start, end) {
     : `Meta+${normalizedStart}-${normalizedEnd}`;
 }
 
+function formatPlatformDisplayName(platform) {
+  const normalizedPlatform = typeof platform === 'string' ? platform.trim().toLowerCase() : '';
+  if (normalizedPlatform === 'darwin') {
+    return 'macOS';
+  }
+
+  if (normalizedPlatform === 'win32') {
+    return 'Windows';
+  }
+
+  if (normalizedPlatform === 'linux') {
+    return 'Linux';
+  }
+
+  return normalizedPlatform;
+}
+
+function normalizeAppInfo(appInfo) {
+  return {
+    arch: typeof appInfo?.arch === 'string' ? appInfo.arch.trim() : '',
+    chromeVersion: typeof appInfo?.chromeVersion === 'string' ? appInfo.chromeVersion.trim() : '',
+    electronVersion: typeof appInfo?.electronVersion === 'string' ? appInfo.electronVersion.trim() : '',
+    name: typeof appInfo?.name === 'string' ? appInfo.name.trim() : '',
+    nodeVersion: typeof appInfo?.nodeVersion === 'string' ? appInfo.nodeVersion.trim() : '',
+    userDataPath: typeof appInfo?.userDataPath === 'string' ? appInfo.userDataPath.trim() : '',
+    version: typeof appInfo?.version === 'string' ? appInfo.version.trim() : '',
+  };
+}
+
 function getPaneHeaderLabel(platform, paneNumber) {
   if (Number.isInteger(paneNumber) && paneNumber >= 1 && paneNumber <= 9) {
     return formatShortcutLabel(platform, String(paneNumber));
@@ -196,9 +267,15 @@ const COPY = {
     archiveConversationTitle: '确认归档这个话题？',
     approvalAction: '申请执行',
     approvalAllow: '允许',
-    approvalAllowAlwaysCommand: '一直允许此命令',
+    approvalAllowAlwaysCommand: '允许，且相同命令不再询问',
+    approvalAllowAlwaysCommandSummary: '保存到当前工作目录的已允许命令列表',
+    approvalAllowAlwaysWorkspaceWrite: '允许，且此工作目录不再询问',
+    approvalAllowAlwaysWorkspaceWriteSummary: '下次 Codex 需要提升此工作目录权限时直接允许',
+    approvalAllowSummary: '仅允许这一次',
     approvalBlockedPath: '目标路径',
     approvalDeny: '拒绝',
+    approvalDenyReadonlySummary: '拒绝这次权限升级',
+    approvalDenySummary: '拒绝这次请求',
     approvalReason: '原因',
     approvalResponding: '提交中...',
     approvalTitle: '需要你的审批',
@@ -211,6 +288,11 @@ const COPY = {
     collapseDetails: '收起详情',
     collapseWorkspace: '收起工作目录',
     conversationEmpty: '这个会话还没有内容',
+    contextWindowUsageTooltip: (used, total, percent, lastTokens) => (
+      lastTokens
+        ? `上下文窗口已用 ${used} / ${total}（${percent}） · 最近一轮 ${lastTokens}`
+        : `上下文窗口已用 ${used} / ${total}（${percent}）`
+    ),
     createConversationForWorkspace: '为当前目录新开对话',
     createConversationInWorkspace: (path) => `在 ${path} 中新建对话`,
     emptyWorkspaces: '还没有工作目录，先添加一个本地目录。',
@@ -231,6 +313,7 @@ const COPY = {
     modeSummaryAskBeforeEdits: 'Claude 会在每次编辑前先请求审批。',
     modeSummaryEditAutomatically: 'Claude 会自动编辑你选中的文本或整个文件。',
     modeSummaryPlanMode: 'Claude 会先探索代码并给出计划，再开始编辑。',
+    codexPlanModeHint: '打开后，Codex 会优先给出计划，再开始执行。',
     modelDefault: '跟随默认模型',
     modelLabel: '模型',
     modelMenuDescription: '切换当前会话的模型。',
@@ -238,6 +321,7 @@ const COPY = {
     modelMenuTitle: '选择模型',
     modelOptionCustom: '当前自定义模型',
     modelOptionDefault: 'Default（推荐）',
+    modelOptionDefaultShort: 'Default',
     modelOptionHaiku: 'Haiku',
     modelOptionOpus: 'Opus',
     modelOptionOpusLong: 'Opus（1M context）',
@@ -248,6 +332,22 @@ const COPY = {
     modelSummaryOpus: 'Opus 4.6 · 最适合复杂任务 · $5/$25 per Mtok',
     modelSummaryOpusLong: 'Opus 4.6 长上下文版 · 适合超长会话 · $10/$37.50 per Mtok',
     modelSummarySonnet: 'Sonnet 4.5 · 适合日常编码任务 · $3/$15 per Mtok',
+    reasoningEffortLabel: '推理',
+    reasoningEffortMenuDescription: '调整 Codex 当前会话的推理深度。',
+    reasoningEffortMenuHint: '会同时应用到普通对话和 Plan mode，并在下一条消息时生效。',
+    reasoningEffortMenuTitle: '选择推理强度',
+    reasoningEffortOptionDefault: 'Default（推荐）',
+    reasoningEffortOptionDefaultShort: '推理默认',
+    reasoningEffortOptionHigh: '高',
+    reasoningEffortOptionLow: '低',
+    reasoningEffortOptionMedium: '中',
+    reasoningEffortOptionXHigh: '超高',
+    reasoningEffortSummaryCustom: (label) => `当前会话正在使用 ${label} 推理强度`,
+    reasoningEffortSummaryDefault: '使用 Codex CLI 的默认推理强度。',
+    reasoningEffortSummaryHigh: '更深的推理，适合复杂实现、重构和排障。',
+    reasoningEffortSummaryLow: '更快、更省资源，适合简单修改和确认。',
+    reasoningEffortSummaryMedium: '平衡速度与推理深度，适合大多数编码任务。',
+    reasoningEffortSummaryXHigh: '最高推理深度，适合复杂多步骤问题。',
     providerLabel: 'Provider',
     providerMenuDescription: '为当前会话选择本地 CLI。',
     providerMenuHint: '发送第一条消息后会锁定当前 Provider。',
@@ -256,6 +356,7 @@ const COPY = {
     providerOptionClaude: 'Claude',
     providerOptionCodex: 'Codex',
     providerSessionDisabledHint: (label) => `${label} 已在设置中关闭，当前会话暂时不能继续对话。`,
+    providerShortcutUnavailable: '至少需要两个可用的 Provider 才能切换。',
     providerSummaryClaude: '本地 Claude CLI',
     providerSummaryCodex: '本地 Codex CLI',
     providerUnavailable: (label) => `${label} 不可用`,
@@ -277,12 +378,16 @@ const COPY = {
     paneSplitAdd: '新增分屏',
     paneSplitAddAndCreate: '新增分屏并新建对话',
     paneSplitAddTooltip: (count) => `新增分屏 · 当前窗口最多可显示 ${count} 个分屏`,
+    paneSplitAddTooltipUnlimited: '新增分屏 · 已忽略窗口尺寸限制',
     paneSplitLimitReached: '当前窗口尺寸下已达到最大分屏数',
     paneLoading: '正在载入对话...',
     noSessionCommandHint: '输入 /clear 新建对话，或先在左侧选择一个历史会话',
     noConversationsInWorkspace: '还没有对话',
     noSessionsYet: '先在左侧创建或选择一个历史会话',
     noWorkspaceSelected: '选择一个工作目录',
+    openWorkspaceInCodeEditor: '使用编辑器打开工作目录',
+    openWorkspaceInCodeEditorUnavailable: '当前没有可用的代码编辑器',
+    openWorkspaceInCodeEditorWithPath: (path) => `使用编辑器打开 ${path}`,
     removeWorkspace: '移除工作目录',
     removeWorkspaceConfirm: '确认移除',
     removeWorkspaceConfirming: '移除中...',
@@ -302,18 +407,73 @@ const COPY = {
     sendMessage: '发送消息',
     sending: '发送中',
     settings: '设置',
-    settingsDescription: '调整客户端语言、主题和 Provider 偏好。',
+    settingsCodeEditorDescription: '展示当前系统中检测到的代码编辑器，并设置默认选择。',
+    settingsCodeEditorEmpty: '当前没有检测到可用的代码编辑器。',
+    settingsCodeEditorTitle: '代码编辑器',
+    settingsDescription: '调整客户端语言、主题、代码编辑器、分屏和 Provider 偏好，并查看应用信息。',
     settingsTitle: '设置',
     settingsClose: '关闭',
+    settingsTabApp: '应用设置',
+    settingsTabAppDescription: '语言、主题、代码编辑器和分屏行为。',
+    settingsTabAbout: '关于应用',
+    settingsTabAboutDescription: '查看当前应用版本、运行平台和本地数据目录。',
+    settingsTabProviders: '模型与 Provider',
+    settingsTabProvidersDescription: 'Provider 可用性与相关能力配置。',
+    settingsTabShortcuts: '快捷键',
+    settingsTabShortcutsDescription: '查看当前应用内的操作快捷键。',
+    settingsAboutTitle: '关于应用',
+    settingsAboutDescription: '查看当前应用版本、运行平台和本地数据目录。',
+    settingsAboutName: '应用名称',
+    settingsAboutVersion: '版本',
+    settingsAboutPlatform: '平台',
+    settingsAboutArch: '架构',
+    settingsAboutElectron: 'Electron',
+    settingsAboutChrome: 'Chrome',
+    settingsAboutNode: 'Node.js',
+    settingsAboutDataDirectory: '数据目录',
+    settingsAboutUnavailable: '暂无信息',
+    settingsPaneBehaviorDescription: '控制是否根据窗口尺寸限制分屏数量。',
+    settingsPaneBehaviorTitle: '分屏',
+    settingsPaneSizeLimitDescription: '开启后不再因为屏幕或窗口尺寸隐藏分屏，可以继续新增分屏。',
+    settingsPaneSizeLimitTitle: '无视屏幕大小限制',
     settingsProvidersHint: '至少保留一个 Provider 处于启用状态。',
     settingsProvidersTitle: 'Provider',
     settingsProvidersDescription: '控制哪些本地 CLI 可以用于新会话和可切换会话。',
+    settingsProvidersRefresh: '刷新状态',
+    settingsProvidersRefreshing: '刷新中...',
+    settingsProviderStatusTitle: '状态概览',
+    settingsProviderStatusEmpty: '当前没有可展示的本地状态。',
+    settingsProviderStatusUpdatedAt: (value) => `更新于 ${value}`,
+    settingsProviderStatusCurrentModel: '当前模型',
+    settingsProviderStatusFavoriteModel: '常用模型',
+    settingsProviderStatusUsageStreak: '连续活跃',
+    settingsProviderStatusLastActive: '最近活跃',
+    settingsProviderStatusTotalSessions: '累计会话',
+    settingsProviderStatusTotalMessages: '累计消息',
+    settingsProviderStatusAuthMode: '登录方式',
+    settingsProviderStatusPlanType: '套餐',
+    settingsProviderStatusDefaultModel: '默认模型',
+    settingsProviderStatusReasoning: '推理默认',
+    settingsProviderStatusLastTokens: '最近 Tokens',
+    settingsProviderStatusContextWindow: '上下文窗口',
+    settingsProviderStatusPrimaryLimit: '5 小时剩余',
+    settingsProviderStatusSecondaryLimit: '7 天剩余',
+    settingsProviderPromptTitle: '系统提示词',
+    settingsProviderPromptDescription: (label) => `为 ${label} 追加全局额外指令。留空时使用 CLI 默认行为。`,
+    settingsProviderPromptPlaceholder: (label) => `给 ${label} 的额外要求，例如：默认使用中文；先给简短计划；修改前说明风险。`,
+    settingsProviderPromptHintClaude: 'Claude 会通过 CLI 的附加系统提示参数应用这段内容。',
+    settingsProviderPromptHintCodex: 'Codex 会通过 developer instructions 注入这段内容，不替换内置基础能力配置。',
+    settingsProviderPromptReset: '恢复默认',
+    settingsProviderPromptSave: '保存',
+    settingsProviderPromptSaving: '保存中...',
     settingsShortcutsTitle: '快捷键',
     settingsShortcutAddWorkspace: '添加工作目录',
+    settingsShortcutOpenSettings: '打开设置',
     settingsShortcutToggleSidebar: '切换侧边栏展开 / 收起',
     settingsShortcutAddPane: '新增空分屏',
     settingsShortcutAddPaneAndCreate: '新增分屏并立即新建对话',
     settingsShortcutCreateConversation: '在当前工作目录新建对话',
+    settingsShortcutToggleFreshProvider: '在新建对话中切换 Provider',
     settingsShortcutClosePane: '关闭当前分屏',
     settingsShortcutFocusPane: '切换到当前可见的第 1-9 个分屏',
     startByAddingWorkspace: '先添加一个工作目录',
@@ -342,9 +502,15 @@ const COPY = {
     archiveConversationTitle: 'Archive this conversation?',
     approvalAction: 'Requested action',
     approvalAllow: 'Allow',
-    approvalAllowAlwaysCommand: 'Always allow this command',
+    approvalAllowAlwaysCommand: 'Allow and don’t ask again for this command',
+    approvalAllowAlwaysCommandSummary: 'Save it to the current workspace allowlist',
+    approvalAllowAlwaysWorkspaceWrite: 'Allow and don’t ask again for this workspace',
+    approvalAllowAlwaysWorkspaceWriteSummary: 'Future Codex workspace escalations in this workspace will be allowed directly',
+    approvalAllowSummary: 'Allow only this time',
     approvalBlockedPath: 'Path',
     approvalDeny: 'Deny',
+    approvalDenyReadonlySummary: 'Reject this permission escalation',
+    approvalDenySummary: 'Reject this request',
     approvalReason: 'Reason',
     approvalResponding: 'Submitting...',
     approvalTitle: 'Approval needed',
@@ -357,6 +523,11 @@ const COPY = {
     collapseDetails: 'Hide details',
     collapseWorkspace: 'Collapse workspace',
     conversationEmpty: 'This conversation is empty',
+    contextWindowUsageTooltip: (used, total, percent, lastTokens) => (
+      lastTokens
+        ? `Context window used ${used} / ${total} (${percent}) · Last turn ${lastTokens}`
+        : `Context window used ${used} / ${total} (${percent})`
+    ),
     createConversationForWorkspace: 'Start a conversation for this workspace',
     createConversationInWorkspace: (path) => `Start a conversation in ${path}`,
     emptyWorkspaces: 'No workspaces yet. Add a local folder to get started.',
@@ -377,6 +548,7 @@ const COPY = {
     modeSummaryAskBeforeEdits: 'Claude will ask for approval before making each edit.',
     modeSummaryEditAutomatically: 'Claude will edit your selected text or the whole file.',
     modeSummaryPlanMode: 'Claude will explore the code and present a plan before editing.',
+    codexPlanModeHint: 'When enabled, Codex should plan first before taking action.',
     modelDefault: 'Follow default model',
     modelLabel: 'Model',
     modelMenuDescription: 'Switch the model for this conversation.',
@@ -384,6 +556,7 @@ const COPY = {
     modelMenuTitle: 'Select model',
     modelOptionCustom: 'Current custom model',
     modelOptionDefault: 'Default (recommended)',
+    modelOptionDefaultShort: 'Default',
     modelOptionHaiku: 'Haiku',
     modelOptionOpus: 'Opus',
     modelOptionOpusLong: 'Opus (1M context)',
@@ -394,6 +567,22 @@ const COPY = {
     modelSummaryOpus: 'Opus 4.6 · Most capable for complex work · $5/$25 per Mtok',
     modelSummaryOpusLong: 'Opus 4.6 for long sessions · $10/$37.50 per Mtok',
     modelSummarySonnet: 'Sonnet 4.5 · Best for everyday tasks · $3/$15 per Mtok',
+    reasoningEffortLabel: 'Reasoning',
+    reasoningEffortMenuDescription: 'Adjust the reasoning depth for this Codex conversation.',
+    reasoningEffortMenuHint: 'This applies to both normal turns and Plan mode on the next message.',
+    reasoningEffortMenuTitle: 'Select reasoning effort',
+    reasoningEffortOptionDefault: 'Default (recommended)',
+    reasoningEffortOptionDefaultShort: 'Reasoning',
+    reasoningEffortOptionHigh: 'High',
+    reasoningEffortOptionLow: 'Low',
+    reasoningEffortOptionMedium: 'Medium',
+    reasoningEffortOptionXHigh: 'Extra high',
+    reasoningEffortSummaryCustom: (label) => `This conversation is currently using ${label} reasoning`,
+    reasoningEffortSummaryDefault: 'Use the Codex CLI default reasoning effort.',
+    reasoningEffortSummaryHigh: 'Deeper reasoning for complex implementation and debugging work.',
+    reasoningEffortSummaryLow: 'Faster, lighter reasoning for simple edits and checks.',
+    reasoningEffortSummaryMedium: 'Balanced speed and reasoning depth for most coding tasks.',
+    reasoningEffortSummaryXHigh: 'Maximum reasoning depth for complex multi-step problems.',
     providerLabel: 'Provider',
     providerMenuDescription: 'Choose the local CLI for this conversation.',
     providerMenuHint: 'The provider locks after the first message.',
@@ -402,6 +591,7 @@ const COPY = {
     providerOptionClaude: 'Claude',
     providerOptionCodex: 'Codex',
     providerSessionDisabledHint: (label) => `${label} is disabled in Settings, so this conversation cannot continue for now.`,
+    providerShortcutUnavailable: 'At least two available providers are required to switch.',
     providerSummaryClaude: 'Local Claude CLI',
     providerSummaryCodex: 'Local Codex CLI',
     providerUnavailable: (label) => `${label} unavailable`,
@@ -423,12 +613,16 @@ const COPY = {
     paneSplitAdd: 'Add split',
     paneSplitAddAndCreate: 'Add split and conversation',
     paneSplitAddTooltip: (count) => `Add split · This window can show up to ${count} panes`,
+    paneSplitAddTooltipUnlimited: 'Add split · Window size limit ignored',
     paneSplitLimitReached: 'Maximum split count reached for this window size',
     paneLoading: 'Loading conversation...',
     noSessionCommandHint: 'Type /clear to start a conversation, or pick one from the sidebar',
     noConversationsInWorkspace: 'No conversations yet',
     noSessionsYet: 'Create or select a conversation from the sidebar first',
     noWorkspaceSelected: 'Select a workspace',
+    openWorkspaceInCodeEditor: 'Open workspace in editor',
+    openWorkspaceInCodeEditorUnavailable: 'No available code editor detected',
+    openWorkspaceInCodeEditorWithPath: (path) => `Open ${path} in the selected editor`,
     removeWorkspace: 'Remove workspace',
     removeWorkspaceConfirm: 'Remove',
     removeWorkspaceConfirming: 'Removing...',
@@ -448,18 +642,73 @@ const COPY = {
     sendMessage: 'Send message',
     sending: 'Sending',
     settings: 'Settings',
-    settingsDescription: 'Adjust language, theme, and provider preferences.',
+    settingsCodeEditorDescription: 'Review the code editors detected on this system and choose the default one.',
+    settingsCodeEditorEmpty: 'No available code editors were detected on this system.',
+    settingsCodeEditorTitle: 'Code editor',
+    settingsDescription: 'Adjust language, theme, code editor, split behavior, provider preferences, and review app information.',
     settingsTitle: 'Settings',
     settingsClose: 'Close',
+    settingsTabApp: 'App settings',
+    settingsTabAppDescription: 'Language, theme, code editor, and split behavior.',
+    settingsTabAbout: 'About',
+    settingsTabAboutDescription: 'Review the current app version, runtime platform, and local data directory.',
+    settingsTabProviders: 'Models & Providers',
+    settingsTabProvidersDescription: 'Provider availability and related capabilities.',
+    settingsTabShortcuts: 'Shortcuts',
+    settingsTabShortcutsDescription: 'Review the in-app keyboard shortcuts.',
+    settingsAboutTitle: 'About',
+    settingsAboutDescription: 'Review the current app version, runtime platform, and local data directory.',
+    settingsAboutName: 'App name',
+    settingsAboutVersion: 'Version',
+    settingsAboutPlatform: 'Platform',
+    settingsAboutArch: 'Architecture',
+    settingsAboutElectron: 'Electron',
+    settingsAboutChrome: 'Chrome',
+    settingsAboutNode: 'Node.js',
+    settingsAboutDataDirectory: 'Data directory',
+    settingsAboutUnavailable: 'Unavailable',
+    settingsPaneBehaviorDescription: 'Control whether split count follows the current window size.',
+    settingsPaneBehaviorTitle: 'Splits',
+    settingsPaneSizeLimitDescription: 'When enabled, panes stay visible and you can keep adding splits regardless of screen or window size.',
+    settingsPaneSizeLimitTitle: 'Ignore screen size limit',
     settingsProvidersHint: 'Keep at least one provider enabled.',
     settingsProvidersTitle: 'Providers',
     settingsProvidersDescription: 'Control which local CLIs are available for new and switchable conversations.',
+    settingsProvidersRefresh: 'Refresh status',
+    settingsProvidersRefreshing: 'Refreshing...',
+    settingsProviderStatusTitle: 'Status',
+    settingsProviderStatusEmpty: 'No local status is available right now.',
+    settingsProviderStatusUpdatedAt: (value) => `Updated ${value}`,
+    settingsProviderStatusCurrentModel: 'Current model',
+    settingsProviderStatusFavoriteModel: 'Favorite model',
+    settingsProviderStatusUsageStreak: 'Active streak',
+    settingsProviderStatusLastActive: 'Last active',
+    settingsProviderStatusTotalSessions: 'Total sessions',
+    settingsProviderStatusTotalMessages: 'Total messages',
+    settingsProviderStatusAuthMode: 'Auth',
+    settingsProviderStatusPlanType: 'Plan',
+    settingsProviderStatusDefaultModel: 'Default model',
+    settingsProviderStatusReasoning: 'Reasoning',
+    settingsProviderStatusLastTokens: 'Last tokens',
+    settingsProviderStatusContextWindow: 'Context window',
+    settingsProviderStatusPrimaryLimit: '5h remaining',
+    settingsProviderStatusSecondaryLimit: '7d remaining',
+    settingsProviderPromptTitle: 'System prompt',
+    settingsProviderPromptDescription: (label) => `Add global extra instructions for ${label}. Leave it empty to use the CLI default behavior.`,
+    settingsProviderPromptPlaceholder: (label) => `Extra instructions for ${label}, for example: respond in Chinese; give a brief plan first; explain risks before editing.`,
+    settingsProviderPromptHintClaude: 'Claude applies this through its append-system-prompt CLI option.',
+    settingsProviderPromptHintCodex: 'Codex applies this through developer instructions without replacing its built-in base behavior.',
+    settingsProviderPromptReset: 'Reset',
+    settingsProviderPromptSave: 'Save',
+    settingsProviderPromptSaving: 'Saving...',
     settingsShortcutsTitle: 'Shortcuts',
     settingsShortcutAddWorkspace: 'Add workspace',
+    settingsShortcutOpenSettings: 'Open settings',
     settingsShortcutToggleSidebar: 'Toggle the sidebar',
     settingsShortcutAddPane: 'Add an empty split',
     settingsShortcutAddPaneAndCreate: 'Add a split and create a conversation',
     settingsShortcutCreateConversation: 'Create a conversation in the current workspace',
+    settingsShortcutToggleFreshProvider: 'Switch provider in a new conversation',
     settingsShortcutClosePane: 'Close the current split',
     settingsShortcutFocusPane: 'Focus visible split 1-9',
     startByAddingWorkspace: 'Add a workspace first',
@@ -495,6 +744,7 @@ function MainApp({ desktopClient }) {
   const [appState, setAppState] = useState(EMPTY_APP_STATE);
   const [language, setLanguage] = useState(() => getInitialLanguage());
   const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
+  const [isPaneSizeLimitIgnored, setIsPaneSizeLimitIgnored] = useState(() => getInitialPaneSizeLimitIgnored());
   const [systemTheme, setSystemTheme] = useState(() => getSystemTheme());
   const [inputValue, setInputValue] = useState('');
   const [composerAttachments, setComposerAttachments] = useState([]);
@@ -507,14 +757,20 @@ function MainApp({ desktopClient }) {
   const [isArchivingSession, setIsArchivingSession] = useState(false);
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
   const [isRemovingWorkspace, setIsRemovingWorkspace] = useState(false);
+  const [pendingPaneTurns, setPendingPaneTurns] = useState({});
   const [sendingPaneIds, setSendingPaneIds] = useState([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settingsActiveTab, setSettingsActiveTab] = useState('app');
   const [isModePickerOpen, setIsModePickerOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [isUpdatingPermissionMode, setIsUpdatingPermissionMode] = useState(false);
+  const [isUpdatingReasoningEffort, setIsUpdatingReasoningEffort] = useState(false);
   const [isUpdatingModel, setIsUpdatingModel] = useState(false);
   const [isUpdatingProvider, setIsUpdatingProvider] = useState(false);
+  const [isUpdatingCodeEditorSettings, setIsUpdatingCodeEditorSettings] = useState(false);
   const [isUpdatingProviderSettings, setIsUpdatingProviderSettings] = useState(false);
+  const [savingProviderSystemPromptKey, setSavingProviderSystemPromptKey] = useState('');
+  const [isRefreshingProviderStatus, setIsRefreshingProviderStatus] = useState(false);
   const [pendingApprovalActionId, setPendingApprovalActionId] = useState('');
   const [pendingArchiveSession, setPendingArchiveSession] = useState(null);
   const [pendingRemoveWorkspace, setPendingRemoveWorkspace] = useState(null);
@@ -533,7 +789,6 @@ function MainApp({ desktopClient }) {
   const [paneBoardElement, setPaneBoardElement] = useState(null);
   const paneLayoutRef = useRef(paneLayout);
   const paneRecentIdsRef = useRef(paneRecentIds);
-  const paneViewportRefs = useRef(new Map());
   const sidebarFlyoutRef = useRef(null);
   const slashCommandMenuRef = useRef(null);
   const textareaRef = useRef(null);
@@ -578,6 +833,24 @@ function MainApp({ desktopClient }) {
   const providerCatalog = appState.providers && typeof appState.providers === 'object'
     ? appState.providers
     : {};
+  const appInfo = normalizeAppInfo(appState.appInfo);
+  const codeEditors = useMemo(
+    () => (
+      Array.isArray(appState.codeEditors)
+        ? appState.codeEditors.filter((editor) => editor && typeof editor.key === 'string')
+        : []
+    ),
+    [appState.codeEditors],
+  );
+  const selectedCodeEditor = useMemo(() => {
+    if (codeEditors.length === 0) {
+      return null;
+    }
+
+    return codeEditors.find((editor) => editor.key === appState.selectedCodeEditor)
+      || codeEditors.find((editor) => editor.key === 'vscode')
+      || codeEditors[0];
+  }, [appState.selectedCodeEditor, codeEditors]);
   const focusedProvider = normalizeProviderKey(focusedSession?.provider || appState.defaultProvider);
   const focusedProviderInfo = getProviderInfo(providerCatalog, focusedProvider, appState.defaultProvider);
   const sidebarProviderStatuses = useMemo(
@@ -598,13 +871,20 @@ function MainApp({ desktopClient }) {
         enabled: info.enabled !== false,
         key: providerKey,
         label: getProviderDisplayName(providerKey, copy),
+        models: Array.isArray(info.models) ? info.models : [],
+        status: info?.status && typeof info.status === 'object' ? info.status : null,
         summary: providerKey === 'codex' ? copy.providerSummaryCodex : copy.providerSummaryClaude,
+        systemPrompt: typeof info.systemPrompt === 'string' ? info.systemPrompt : '',
+        version: typeof info.version === 'string' ? info.version : '',
       };
     }),
     [copy, providerCatalog],
   );
   const installedSkills = Array.isArray(focusedProviderInfo.skills) ? focusedProviderInfo.skills : [];
-  const slashCommands = useMemo(() => getSlashCommands(language, installedSkills), [installedSkills, language]);
+  const slashCommands = useMemo(
+    () => getSlashCommands(language, focusedProvider, installedSkills),
+    [focusedProvider, installedSkills, language],
+  );
   const availableSessionModels = Array.isArray(focusedProviderInfo.models) ? focusedProviderInfo.models : [];
   const sessionPermissionMode = focusedSession?.permissionMode || 'default';
   const modeOptions = useMemo(() => getComposerSessionModeOptions(copy), [copy]);
@@ -654,17 +934,18 @@ function MainApp({ desktopClient }) {
       appState,
       copy,
       focusedPaneId: paneLayout.focusedPaneId,
+      pendingPaneTurns,
       sendingPaneIds,
       language,
       paneCount: paneLayout.panes.length,
       pane,
       sessionViewCache,
     })),
-    [appState, copy, language, paneLayout.focusedPaneId, paneLayout.panes, selectedSession, sendingPaneIds, sessionViewCache],
+    [appState, copy, language, paneLayout.focusedPaneId, paneLayout.panes, pendingPaneTurns, selectedSession, sendingPaneIds, sessionViewCache],
   );
   const maxPaneCount = useMemo(
-    () => getAdaptivePaneLimit(paneBoardSize.width, paneBoardSize.height),
-    [paneBoardSize.height, paneBoardSize.width],
+    () => (isPaneSizeLimitIgnored ? Number.POSITIVE_INFINITY : getAdaptivePaneLimit(paneBoardSize.width, paneBoardSize.height)),
+    [isPaneSizeLimitIgnored, paneBoardSize.height, paneBoardSize.width],
   );
   const prioritizedPaneIds = useMemo(
     () => getPrioritizedPaneIds(paneLayout.panes, paneRecentIds, paneLayout.focusedPaneId),
@@ -700,13 +981,14 @@ function MainApp({ desktopClient }) {
     ),
     [paneViews],
   );
-  const focusedPaneView = useMemo(
-    () => paneViews.find((pane) => pane.id === focusedPane?.id) || null,
-    [focusedPane?.id, paneViews],
-  );
   const paneGridSpec = useMemo(
-    () => getAdaptivePaneGridSpec(visiblePaneViews.length, paneBoardSize.width, paneBoardSize.height),
-    [paneBoardSize.height, paneBoardSize.width, visiblePaneViews.length],
+    () => getAdaptivePaneGridSpec(
+      visiblePaneViews.length,
+      paneBoardSize.width,
+      paneBoardSize.height,
+      { prioritizePaneWidth: isPaneSizeLimitIgnored },
+    ),
+    [isPaneSizeLimitIgnored, paneBoardSize.height, paneBoardSize.width, visiblePaneViews.length],
   );
   const filteredWorkspaces = useMemo(() => {
     if (!normalizedSessionSearchQuery) {
@@ -808,6 +1090,10 @@ function MainApp({ desktopClient }) {
                   setSidebarFlyoutView(null);
                   openWorkspaceInFinder(workspace.id);
                 }}
+                onOpenWorkspaceInCodeEditor={() => {
+                  setSidebarFlyoutView(null);
+                  openWorkspaceInCodeEditor(workspace.id);
+                }}
                 onRemoveWorkspace={() => {
                   setSidebarFlyoutView(null);
                   setPendingRemoveWorkspace({
@@ -827,6 +1113,7 @@ function MainApp({ desktopClient }) {
                 platform={appState.platform}
                 selectedSessionId={focusedPane?.sessionId || appState.selectedSessionId}
                 sessionPaneBindingMap={sessionPaneBindingMap}
+                canOpenWorkspaceInCodeEditor={Boolean(selectedCodeEditor)}
                 language={language}
                 workspace={workspace}
               />
@@ -836,6 +1123,10 @@ function MainApp({ desktopClient }) {
       </div>
     </SidebarSection>
   );
+  const openSettings = useCallback(() => {
+    setSidebarFlyoutView(null);
+    setIsSettingsOpen(true);
+  }, []);
 
   useEffect(() => {
     setSelectedSlashCommandIndex(0);
@@ -872,6 +1163,30 @@ function MainApp({ desktopClient }) {
 
     refreshAppStateSilently();
   }, [isSlashCommandMenuOpen]);
+
+  useEffect(() => {
+    if (!isSettingsOpen) {
+      return;
+    }
+
+    refreshAppStateSilently();
+  }, [isSettingsOpen]);
+
+  useEffect(() => {
+    if (!isSettingsOpen || settingsActiveTab !== 'providers' || !desktopClient?.refreshProviderStatus) {
+      return;
+    }
+
+    void refreshProviderStatus();
+  }, [desktopClient, isSettingsOpen, settingsActiveTab]);
+
+  useEffect(() => {
+    if (isSettingsOpen) {
+      return;
+    }
+
+    setSettingsActiveTab('app');
+  }, [isSettingsOpen]);
 
   useEffect(() => {
     if (!desktopClient || typeof document === 'undefined') {
@@ -1018,6 +1333,56 @@ function MainApp({ desktopClient }) {
   }, [selectedSession]);
 
   useEffect(() => {
+    if (sendingPaneIds.length === 0 && Object.keys(pendingPaneTurns).length === 0) {
+      return;
+    }
+
+    const paneById = new Map(paneLayout.panes.map((pane) => [pane.id, pane]));
+    const paneIdsToClear = new Set(
+      sendingPaneIds.filter((paneId) => !pendingPaneTurns[paneId]),
+    );
+
+    for (const [paneId, pendingTurn] of Object.entries(pendingPaneTurns)) {
+      const pane = paneById.get(paneId);
+      if (!pane) {
+        paneIdsToClear.add(paneId);
+        continue;
+      }
+
+      if (pane.workspaceId !== pendingTurn.workspaceId || pane.sessionId !== pendingTurn.sessionId) {
+        paneIdsToClear.add(paneId);
+        continue;
+      }
+
+      const session = resolvePaneSessionSnapshot(pane, selectedSession, sessionViewCache);
+      if (hasSessionAppliedPendingTurn(session, pendingTurn)) {
+        paneIdsToClear.add(paneId);
+      }
+    }
+
+    if (paneIdsToClear.size === 0) {
+      return;
+    }
+
+    setPendingPaneTurns((current) => {
+      let mutated = false;
+      const next = { ...current };
+
+      for (const paneId of paneIdsToClear) {
+        if (!Object.prototype.hasOwnProperty.call(next, paneId)) {
+          continue;
+        }
+
+        delete next[paneId];
+        mutated = true;
+      }
+
+      return mutated ? next : current;
+    });
+    setSendingPaneIds((current) => current.filter((paneId) => !paneIdsToClear.has(paneId)));
+  }, [paneLayout.panes, pendingPaneTurns, selectedSession, sendingPaneIds, sessionViewCache]);
+
+  useEffect(() => {
     if (!pendingApprovalActionId) {
       return;
     }
@@ -1085,8 +1450,10 @@ function MainApp({ desktopClient }) {
       const isSplitAndCreateShortcut = shortcutKey === 'd' && event.shiftKey;
       const isSupportedUnshiftedShortcut = !event.shiftKey && (
         shortcutKey === 'o'
+        || shortcutKey === '.'
         || shortcutKey === 'n'
         || shortcutKey === 'd'
+        || shortcutKey === 't'
         || shortcutKey === 'w'
         || shortcutKey === 'b'
         || isPaneShortcut
@@ -1125,9 +1492,21 @@ function MainApp({ desktopClient }) {
         return;
       }
 
+      if (shortcutKey === '.') {
+        event.preventDefault();
+        openSettings();
+        return;
+      }
+
       if (shortcutKey === 'b') {
         event.preventDefault();
         toggleSidebarCollapse();
+        return;
+      }
+
+      if (shortcutKey === 't') {
+        event.preventDefault();
+        void toggleFreshSessionProvider();
         return;
       }
 
@@ -1157,7 +1536,7 @@ function MainApp({ desktopClient }) {
     return () => {
       document.removeEventListener('keydown', handleGlobalPaneShortcuts);
     };
-  }, [copy.noWorkspaceSelected, focusedPane?.id, focusedWorkspace, paneLayout.panes.length, selectedWorkspace, visiblePaneViews]);
+  }, [copy.noWorkspaceSelected, focusedPane?.id, focusedWorkspace, openSettings, paneLayout.panes.length, selectedWorkspace, toggleFreshSessionProvider, visiblePaneViews]);
 
   useEffect(() => {
     setPaneRecentIds((current) => syncPaneRecentIds(current, paneLayout.panes, paneLayout.focusedPaneId));
@@ -1188,6 +1567,14 @@ function MainApp({ desktopClient }) {
 
     window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
   }, [themePreference]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(PANE_SIZE_LIMIT_IGNORED_STORAGE_KEY, JSON.stringify(isPaneSizeLimitIgnored));
+  }, [isPaneSizeLimitIgnored]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -1307,7 +1694,6 @@ function MainApp({ desktopClient }) {
     const unsubscribe = desktopClient.onStateChange((event) => {
       if (event?.type === 'state' && event.state) {
         setAppState(event.state);
-        setSendingPaneIds([]);
       }
     });
 
@@ -1493,31 +1879,6 @@ function MainApp({ desktopClient }) {
     textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
   }, [inputValue]);
 
-  useEffect(() => {
-    const viewport = paneViewportRefs.current.get(focusedPane?.id);
-    if (!viewport) {
-      return undefined;
-    }
-
-    let nextFrameId = 0;
-    const frameId = window.requestAnimationFrame(() => {
-      nextFrameId = window.requestAnimationFrame(() => {
-        const top = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
-        viewport.scrollTo({
-          top,
-          behavior: focusedSession?.status === 'running' || focusedPaneView?.shouldShowRunIndicator ? 'auto' : 'smooth',
-        });
-      });
-    });
-
-    return () => {
-      window.cancelAnimationFrame(frameId);
-      if (nextFrameId) {
-        window.cancelAnimationFrame(nextFrameId);
-      }
-    };
-  }, [focusedPane?.id, focusedPaneView?.shouldShowRunIndicator, focusedSession?.id, focusedSession?.messages, focusedSession?.status]);
-
   async function loadAppState() {
     if (!desktopClient) {
       return;
@@ -1577,6 +1938,24 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function refreshProviderStatus() {
+    if (!desktopClient?.refreshProviderStatus || isRefreshingProviderStatus) {
+      return;
+    }
+
+    setIsRefreshingProviderStatus(true);
+
+    try {
+      const state = await desktopClient.refreshProviderStatus();
+      setAppState(state);
+      setSidebarError('');
+    } catch (error) {
+      setSidebarError(error.message);
+    } finally {
+      setIsRefreshingProviderStatus(false);
+    }
+  }
+
   async function addWorkspace() {
     if (!desktopClient || isPickingWorkspace) {
       return;
@@ -1628,6 +2007,20 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function openWorkspaceInCodeEditor(workspaceId) {
+    if (!desktopClient || !workspaceId) {
+      return;
+    }
+
+    setSidebarError('');
+
+    try {
+      await desktopClient.openWorkspaceInCodeEditor(workspaceId);
+    } catch (error) {
+      setSidebarError(error.message);
+    }
+  }
+
   function addPane() {
     if (paneLayout.panes.length >= maxPaneCount) {
       setSidebarError(copy.paneSplitLimitReached);
@@ -1636,6 +2029,37 @@ function MainApp({ desktopClient }) {
 
     setSidebarError('');
     setPaneLayout((current) => appendPaneToLayout(current));
+  }
+
+  function getPreferredProviderForNewSession(workspaceId, options = {}) {
+    const explicitProvider = normalizeProviderCommandArg(options.preferredProvider);
+    if (explicitProvider) {
+      return explicitProvider;
+    }
+
+    const paneContext = options.paneId ? getPaneContext(options.paneId) : null;
+    if (paneContext?.workspace?.id === workspaceId) {
+      const paneProvider = normalizeProviderCommandArg(paneContext.session?.provider);
+      if (paneProvider) {
+        return paneProvider;
+      }
+    }
+
+    if (focusedWorkspace?.id === workspaceId) {
+      const focusedSessionProvider = normalizeProviderCommandArg(focusedSession?.provider);
+      if (focusedSessionProvider) {
+        return focusedSessionProvider;
+      }
+    }
+
+    if (selectedWorkspace?.id === workspaceId) {
+      const selectedSessionProvider = normalizeProviderCommandArg(selectedSession?.provider);
+      if (selectedSessionProvider) {
+        return selectedSessionProvider;
+      }
+    }
+
+    return '';
   }
 
   async function addPaneAndCreateSession() {
@@ -1658,7 +2082,10 @@ function MainApp({ desktopClient }) {
     setSidebarError('');
 
     try {
-      const nextState = await desktopClient.createSession(targetWorkspace.id);
+      const nextState = await desktopClient.createSession({
+        preferredProvider: getPreferredProviderForNewSession(targetWorkspace.id),
+        workspaceId: targetWorkspace.id,
+      });
       setAppState(nextState);
       setPaneLayout((current) => assignSessionToPaneState(
         appendPaneToLayout(current),
@@ -1676,21 +2103,76 @@ function MainApp({ desktopClient }) {
 
   async function createSession(workspaceId, options = {}) {
     if (!desktopClient) {
-      return;
+      return null;
     }
 
     setSidebarError('');
 
     try {
-      const nextState = await desktopClient.createSession(workspaceId);
+      const nextState = await desktopClient.createSession({
+        preferredProvider: getPreferredProviderForNewSession(workspaceId, options),
+        workspaceId,
+      });
       setAppState(nextState);
       setPaneLayout((current) => assignSessionToPaneState(current, options.paneId || current.focusedPaneId, {
         sessionId: nextState.selectedSessionId,
         workspaceId: nextState.selectedWorkspaceId,
       }));
       setInputValue('');
+      return nextState;
     } catch (error) {
       setSidebarError(error.message);
+      return null;
+    }
+  }
+
+  async function toggleFreshSessionProvider() {
+    if (!desktopClient) {
+      return;
+    }
+
+    const targetPaneId = focusedPane?.id || paneLayout.focusedPaneId || paneLayout.panes[0]?.id || '';
+    const context = targetPaneId ? getPaneContext(targetPaneId) : null;
+    const targetWorkspace = context?.workspace || focusedWorkspace || selectedWorkspace;
+    if (!targetWorkspace) {
+      setSidebarError(copy.noWorkspaceSelected);
+      return;
+    }
+
+    const currentProvider = normalizeProviderKey(context?.session?.provider || focusedProvider || appState.defaultProvider);
+    const nextProvider = getNextAvailableProviderKey(providerCatalog, currentProvider, appState.defaultProvider);
+    if (!nextProvider) {
+      setSidebarError(copy.providerShortcutUnavailable);
+      return;
+    }
+
+    let targetWorkspaceId = context?.workspace?.id || targetWorkspace.id;
+    let targetSessionId = context?.session?.id || '';
+
+    if (!context?.session || isSessionProviderLocked(context.session)) {
+      const createdState = await createSession(targetWorkspace.id, targetPaneId ? { paneId: targetPaneId } : {});
+      if (!createdState?.selectedWorkspaceId || !createdState?.selectedSessionId) {
+        return;
+      }
+
+      targetWorkspaceId = createdState.selectedWorkspaceId;
+      targetSessionId = createdState.selectedSessionId;
+    }
+
+    setIsUpdatingProvider(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionProvider({
+        provider: nextProvider,
+        sessionId: targetSessionId,
+        workspaceId: targetWorkspaceId,
+      });
+      setAppState(nextState);
+    } catch (error) {
+      setSidebarError(error.message);
+    } finally {
+      setIsUpdatingProvider(false);
     }
   }
 
@@ -1966,6 +2448,31 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function updateCurrentSessionReasoningEffort(nextReasoningEffort, { clearInput = false } = {}) {
+    if (!desktopClient || !focusedWorkspace || !focusedSession) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingReasoningEffort(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionReasoningEffort({
+        reasoningEffort: nextReasoningEffort,
+        sessionId: focusedSession.id,
+        workspaceId: focusedWorkspace.id,
+      });
+      setAppState(nextState);
+
+      if (clearInput) {
+        setComposerHistoryIndex(-1);
+        setInputValue('');
+      }
+    } finally {
+      setIsUpdatingReasoningEffort(false);
+    }
+  }
+
   async function updateCurrentSessionProvider(nextProvider, { clearInput = false } = {}) {
     if (!desktopClient || !focusedWorkspace || !focusedSession) {
       throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
@@ -2037,6 +2544,48 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function setProviderSystemPrompt(provider, systemPrompt) {
+    if (!desktopClient) {
+      throw new Error(copy.bridgeUnavailable);
+    }
+
+    setSavingProviderSystemPromptKey(normalizeProviderKey(provider));
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.setProviderSystemPrompt({
+        provider,
+        systemPrompt,
+      });
+      setAppState(nextState);
+    } catch (error) {
+      setSidebarError(error.message);
+      throw error;
+    } finally {
+      setSavingProviderSystemPromptKey('');
+    }
+  }
+
+  async function setCodeEditor(codeEditor) {
+    if (!desktopClient) {
+      throw new Error(copy.bridgeUnavailable);
+    }
+
+    setIsUpdatingCodeEditorSettings(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.setCodeEditor({
+        codeEditor,
+      });
+      setAppState(nextState);
+    } catch (error) {
+      setSidebarError(error.message);
+    } finally {
+      setIsUpdatingCodeEditorSettings(false);
+    }
+  }
+
   async function submitPrompt(prompt, { attachments = [], displayKind = '', displayPrompt, displayTitle = '' } = {}) {
     if (!desktopClient) {
       return;
@@ -2067,6 +2616,16 @@ function MainApp({ desktopClient }) {
     }
 
     markPaneSending(focusedPane?.id);
+    setPendingTurnForPane(focusedPane?.id, createPendingPaneTurn({
+      attachments: normalizedAttachments,
+      displayKind,
+      displayPrompt,
+      displayTitle,
+      paneId: focusedPane?.id || '',
+      prompt: normalizedPrompt,
+      session: focusedSession,
+      workspaceId: focusedWorkspace.id,
+    }));
     setSidebarError('');
     setComposerAttachments([]);
     setComposerHistoryIndex(-1);
@@ -2083,7 +2642,7 @@ function MainApp({ desktopClient }) {
         workspaceId: focusedWorkspace.id,
       });
     } catch (error) {
-      clearPaneSending(focusedPane?.id);
+      clearPanePendingState(focusedPane?.id);
       setComposerAttachments(normalizedAttachments);
       setComposerHistoryIndex(-1);
       setInputValue(displayPrompt || normalizedPrompt);
@@ -2097,12 +2656,10 @@ function MainApp({ desktopClient }) {
       return false;
     }
 
-    const commandName = resolveSlashCommandName(parsedCommand.name);
-    const installedSkill = findInstalledSkillCommand(parsedCommand.name, installedSkills);
-    if (!commandName && !installedSkill) {
-      setSidebarError(formatUnknownSlashCommand(parsedCommand.name, language));
-      return true;
-    }
+    const currentProvider = normalizeProviderKey(focusedSession?.provider || focusedProvider || appState.defaultProvider);
+    const providerSkills = Array.isArray(focusedProviderInfo.skills) ? focusedProviderInfo.skills : [];
+    const commandName = resolveSlashCommandName(parsedCommand.name, currentProvider);
+    const installedSkill = findInstalledSkillCommand(parsedCommand.name, providerSkills);
 
     setSidebarError('');
 
@@ -2151,6 +2708,64 @@ function MainApp({ desktopClient }) {
         }
 
         await updateCurrentSessionModel(normalizeModelCommandArg(parsedCommand.args), { clearInput: true });
+        return true;
+      }
+
+      if (commandName === 'reasoning') {
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /reasoning low、/reasoning medium、/reasoning high、/reasoning xhigh 或 /reasoning default。'
+              : 'Use /reasoning low, /reasoning medium, /reasoning high, /reasoning xhigh, or /reasoning default.',
+          );
+        }
+
+        const nextReasoningEffort = normalizeReasoningEffortCommandArg(parsedCommand.args);
+        if (nextReasoningEffort === null) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /reasoning low、/reasoning medium、/reasoning high、/reasoning xhigh 或 /reasoning default。'
+              : 'Use /reasoning low, /reasoning medium, /reasoning high, /reasoning xhigh, or /reasoning default.',
+          );
+        }
+
+        await updateCurrentSessionReasoningEffort(nextReasoningEffort, { clearInput: true });
+        return true;
+      }
+
+      if (commandName === 'mode') {
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /mode ask、/mode auto 或 /mode plan。'
+              : 'Use /mode ask, /mode auto, or /mode plan.',
+          );
+        }
+
+        const nextPermissionMode = normalizeModeCommandArg(parsedCommand.args);
+        if (!nextPermissionMode) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /mode ask、/mode auto 或 /mode plan。'
+              : 'Use /mode ask, /mode auto, or /mode plan.',
+          );
+        }
+
+        await updateCurrentSessionPermissionMode(nextPermissionMode, { clearInput: true });
+        return true;
+      }
+
+      if (commandName === 'provider') {
+        if (!parsedCommand.args) {
+          throw new Error(language === 'zh' ? '请使用 /provider claude 或 /provider codex。' : 'Use /provider claude or /provider codex.');
+        }
+
+        const nextProvider = normalizeProviderCommandArg(parsedCommand.args);
+        if (!nextProvider) {
+          throw new Error(language === 'zh' ? '请使用 /provider claude 或 /provider codex。' : 'Use /provider claude or /provider codex.');
+        }
+
+        await updateCurrentSessionProvider(nextProvider, { clearInput: true });
         return true;
       }
 
@@ -2224,6 +2839,15 @@ function MainApp({ desktopClient }) {
         );
         return true;
       }
+
+      if (!commandName) {
+        await submitPrompt(rawInput.trim(), {
+          displayKind: 'command',
+          displayPrompt: rawInput.trim(),
+          displayTitle: rawInput.trim(),
+        });
+        return true;
+      }
     } catch (error) {
       setSidebarError(error.message);
       return true;
@@ -2279,6 +2903,34 @@ function MainApp({ desktopClient }) {
     setSendingPaneIds((current) => current.filter((id) => id !== paneId));
   }
 
+  function setPendingTurnForPane(paneId, pendingTurn) {
+    if (!paneId || !pendingTurn) {
+      return;
+    }
+
+    setPendingPaneTurns((current) => ({
+      ...current,
+      [paneId]: pendingTurn,
+    }));
+  }
+
+  function clearPanePendingState(paneId) {
+    if (!paneId) {
+      return;
+    }
+
+    clearPaneSending(paneId);
+    setPendingPaneTurns((current) => {
+      if (!Object.prototype.hasOwnProperty.call(current, paneId)) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[paneId];
+      return next;
+    });
+  }
+
   async function submitPromptForPane(paneId, prompt, {
     attachments = [],
     displayKind = '',
@@ -2315,6 +2967,16 @@ function MainApp({ desktopClient }) {
     }
 
     markPaneSending(paneId);
+    setPendingTurnForPane(paneId, createPendingPaneTurn({
+      attachments: normalizedAttachments,
+      displayKind,
+      displayPrompt,
+      displayTitle,
+      paneId,
+      prompt: normalizedPrompt,
+      session: context.session,
+      workspaceId: context.workspace.id,
+    }));
     setSidebarError('');
 
     try {
@@ -2329,7 +2991,7 @@ function MainApp({ desktopClient }) {
       });
       return true;
     } catch (error) {
-      clearPaneSending(paneId);
+      clearPanePendingState(paneId);
       setSidebarError(error.message);
       return false;
     }
@@ -2357,6 +3019,31 @@ function MainApp({ desktopClient }) {
       setAppState(nextState);
     } finally {
       setIsUpdatingModel(false);
+    }
+  }
+
+  async function updateSessionReasoningEffortForPane(paneId, nextReasoningEffort) {
+    if (!desktopClient) {
+      return;
+    }
+
+    const context = getPaneContext(paneId);
+    if (!context?.workspace || !context.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingReasoningEffort(true);
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.updateSessionReasoningEffort({
+        reasoningEffort: nextReasoningEffort,
+        sessionId: context.session.id,
+        workspaceId: context.workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingReasoningEffort(false);
     }
   }
 
@@ -2419,12 +3106,11 @@ function MainApp({ desktopClient }) {
     }
 
     const context = getPaneContext(paneId);
-    const commandName = resolveSlashCommandName(parsedCommand.name);
-    const installedSkill = findInstalledSkillCommand(parsedCommand.name, installedSkills);
-    if (!commandName && !installedSkill) {
-      setSidebarError(formatUnknownSlashCommand(parsedCommand.name, language));
-      return { handled: true };
-    }
+    const currentProvider = normalizeProviderKey(context?.session?.provider || appState.defaultProvider);
+    const currentProviderInfo = getProviderInfo(providerCatalog, currentProvider, appState.defaultProvider);
+    const commandSkills = Array.isArray(currentProviderInfo.skills) ? currentProviderInfo.skills : [];
+    const commandName = resolveSlashCommandName(parsedCommand.name, currentProvider);
+    const installedSkill = findInstalledSkillCommand(parsedCommand.name, commandSkills);
 
     setSidebarError('');
 
@@ -2489,6 +3175,86 @@ function MainApp({ desktopClient }) {
           setAppState(nextState);
         } finally {
           setIsUpdatingModel(false);
+        }
+
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'reasoning') {
+        if (!context?.workspace || !context.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /reasoning low、/reasoning medium、/reasoning high、/reasoning xhigh 或 /reasoning default。'
+              : 'Use /reasoning low, /reasoning medium, /reasoning high, /reasoning xhigh, or /reasoning default.',
+          );
+        }
+
+        const nextReasoningEffort = normalizeReasoningEffortCommandArg(parsedCommand.args);
+        if (nextReasoningEffort === null) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /reasoning low、/reasoning medium、/reasoning high、/reasoning xhigh 或 /reasoning default。'
+              : 'Use /reasoning low, /reasoning medium, /reasoning high, /reasoning xhigh, or /reasoning default.',
+          );
+        }
+
+        setIsUpdatingReasoningEffort(true);
+        try {
+          const nextState = await desktopClient.updateSessionReasoningEffort({
+            reasoningEffort: nextReasoningEffort,
+            sessionId: context.session.id,
+            workspaceId: context.workspace.id,
+          });
+          setAppState(nextState);
+        } finally {
+          setIsUpdatingReasoningEffort(false);
+        }
+
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'mode') {
+        if (!context?.workspace || !context.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /mode ask、/mode auto 或 /mode plan。'
+              : 'Use /mode ask, /mode auto, or /mode plan.',
+          );
+        }
+
+        const nextPermissionMode = normalizeModeCommandArg(parsedCommand.args);
+        if (!nextPermissionMode) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /mode ask、/mode auto 或 /mode plan。'
+              : 'Use /mode ask, /mode auto, or /mode plan.',
+          );
+        }
+
+        setIsUpdatingPermissionMode(true);
+        try {
+          const nextState = await desktopClient.updateSessionPermissionMode({
+            permissionMode: nextPermissionMode,
+            sessionId: context.session.id,
+            workspaceId: context.workspace.id,
+          });
+          setAppState(nextState);
+        } finally {
+          setIsUpdatingPermissionMode(false);
         }
 
         return {
@@ -2603,6 +3369,23 @@ function MainApp({ desktopClient }) {
           nextInputValue: handled ? '' : rawInput,
         };
       }
+
+      if (!commandName) {
+        const handled = await submitPromptForPane(
+          paneId,
+          rawInput.trim(),
+          {
+            displayKind: 'command',
+            displayPrompt: rawInput.trim(),
+            displayTitle: rawInput.trim(),
+          },
+        );
+
+        return {
+          handled,
+          nextInputValue: handled ? '' : rawInput,
+        };
+      }
     } catch (error) {
       setSidebarError(error.message);
       return {
@@ -2639,7 +3422,7 @@ function MainApp({ desktopClient }) {
         workspaceId: context.workspace.id,
       });
       setAppState(nextState);
-      clearPaneSending(paneId);
+      clearPanePendingState(paneId);
     } catch (error) {
       setSidebarError(error.message);
     }
@@ -2857,11 +3640,8 @@ function MainApp({ desktopClient }) {
                 <SidebarRailButton
                   ariaLabel={copy.settings}
                   icon={Settings}
-                  onClick={() => {
-                    setSidebarFlyoutView(null);
-                    setIsSettingsOpen(true);
-                  }}
-                  title={copy.settings}
+                  onClick={openSettings}
+                  title={formatShortcutTooltip(copy.settings, '.', appState.platform)}
                 />
               </div>
             </div>
@@ -2919,9 +3699,9 @@ function MainApp({ desktopClient }) {
                     <Button
                       variant="ghost"
                       size="icon"
-                      onClick={() => setIsSettingsOpen(true)}
+                      onClick={openSettings}
                       aria-label={copy.settings}
-                      title={copy.settings}
+                      title={formatShortcutTooltip(copy.settings, '.', appState.platform)}
                       className={cn(SIDEBAR_ACTION_BUTTON_CLASS, 'hover:bg-background/70')}
                     >
                       <Settings className="h-4 w-4" />
@@ -2980,15 +3760,15 @@ function MainApp({ desktopClient }) {
                     onStopRun={stopRunForPane}
                     onUpdateSessionProvider={updateSessionProviderForPane}
                     onUpdateSessionModel={updateSessionModelForPane}
+                    onUpdateSessionReasoningEffort={updateSessionReasoningEffortForPane}
                     onUpdateSessionPermissionMode={updateSessionPermissionModeForPane}
                     defaultProvider={appState.defaultProvider}
                     providerCatalog={providerCatalog}
                     isUpdatingModel={isUpdatingModel}
+                    isUpdatingReasoningEffort={isUpdatingReasoningEffort}
                     isUpdatingPermissionMode={isUpdatingPermissionMode}
                     isUpdatingProvider={isUpdatingProvider}
                     pendingApprovalActionId={pendingApprovalActionId}
-                    registerViewport={(node) => setPaneViewportNode(paneViewportRefs, pane.id, node)}
-                    slashCommands={slashCommands}
                   />
                 ))}
               </div>
@@ -3005,6 +3785,7 @@ function MainApp({ desktopClient }) {
           description={copy.archiveConversationDescription}
           isPending={isArchivingSession}
           itemLabel={pendingArchiveSession.title}
+          platform={appState.platform}
           title={copy.archiveConversationTitle}
           onCancel={() => {
             if (!isArchivingSession) {
@@ -3022,6 +3803,7 @@ function MainApp({ desktopClient }) {
           description={copy.removeWorkspaceDescription}
           isPending={isRemovingWorkspace}
           itemLabel={pendingRemoveWorkspace.title}
+          platform={appState.platform}
           title={copy.removeWorkspaceTitle}
           onCancel={() => {
             if (!isRemovingWorkspace) {
@@ -3034,15 +3816,28 @@ function MainApp({ desktopClient }) {
 
       {isSettingsOpen && (
         <SettingsDialog
+          activeTab={settingsActiveTab}
+          appInfo={appInfo}
+          codeEditors={codeEditors}
           copy={copy}
+          isPaneSizeLimitIgnored={isPaneSizeLimitIgnored}
+          isUpdatingCodeEditor={isUpdatingCodeEditorSettings}
           isUpdatingProviders={isUpdatingProviderSettings}
+          savingProviderSystemPromptKey={savingProviderSystemPromptKey}
+          isRefreshingProviderStatus={isRefreshingProviderStatus}
           language={language}
+          onActiveTabChange={setSettingsActiveTab}
+          onCodeEditorChange={setCodeEditor}
+          onRefreshProviderStatus={refreshProviderStatus}
           providerSettings={providerSettings}
           platform={appState.platform}
+          selectedCodeEditor={selectedCodeEditor}
           themePreference={themePreference}
           onClose={() => setIsSettingsOpen(false)}
           onLanguageChange={setLanguage}
+          onPaneSizeLimitIgnoredChange={setIsPaneSizeLimitIgnored}
           onSetProviderEnabled={setProviderEnabled}
+          onSetProviderSystemPrompt={setProviderSystemPrompt}
           onThemeChange={setThemePreference}
         />
       )}
@@ -3055,6 +3850,7 @@ function ConversationPane({
   copy,
   defaultProvider,
   isUpdatingModel,
+  isUpdatingReasoningEffort,
   isUpdatingPermissionMode,
   isUpdatingProvider,
   language,
@@ -3070,14 +3866,13 @@ function ConversationPane({
   onStopRun,
   onUpdateSessionProvider,
   onUpdateSessionModel,
+  onUpdateSessionReasoningEffort,
   onUpdateSessionPermissionMode,
   pane,
   paneNumber,
   paneShortcutLabel,
   pendingApprovalActionId,
   providerCatalog,
-  registerViewport,
-  slashCommands,
 }) {
   const [inputValue, setInputValue] = useState('');
   const [composerAttachments, setComposerAttachments] = useState([]);
@@ -3085,27 +3880,16 @@ function ConversationPane({
   const [isComposerTextareaFocused, setIsComposerTextareaFocused] = useState(false);
   const [isProviderPickerOpen, setIsProviderPickerOpen] = useState(false);
   const [isModePickerOpen, setIsModePickerOpen] = useState(false);
+  const [isReasoningPickerOpen, setIsReasoningPickerOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
   const providerPickerRef = useRef(null);
   const modePickerRef = useRef(null);
+  const reasoningPickerRef = useRef(null);
   const modelPickerRef = useRef(null);
   const slashMenuRef = useRef(null);
   const textareaRef = useRef(null);
-  const slashCommandQuery = useMemo(() => getSlashCommandQuery(inputValue), [inputValue]);
-  const visibleSlashCommands = useMemo(
-    () => filterSlashCommands(slashCommands, slashCommandQuery),
-    [slashCommandQuery, slashCommands],
-  );
-  const highlightedSlashCommand = visibleSlashCommands[selectedSlashCommandIndex] || visibleSlashCommands[0] || null;
-  const isSlashCommandMenuOpen = pane.isFocused && slashCommandQuery !== null;
-  const hasFloatingOverlayOpen = isSlashCommandMenuOpen || isProviderPickerOpen || isModePickerOpen || isModelPickerOpen;
-  const hasComposerAttachments = composerAttachments.length > 0;
-  const composerHistoryEntries = useMemo(
-    () => getComposerHistoryEntries(pane.session?.messages || []),
-    [pane.session?.messages],
-  );
-  const trimmedInputValue = inputValue.trim();
+  const viewportRef = useRef(null);
   const isProviderLocked = Boolean(
     pane.sessionMeta?.providerLocked
     || isSessionProviderLocked(pane.session),
@@ -3123,6 +3907,25 @@ function ConversationPane({
     () => getComposerProviderOptions(copy, providerCatalog),
     [copy, providerCatalog],
   );
+  const providerSkills = Array.isArray(providerInfo.skills) ? providerInfo.skills : [];
+  const slashCommands = useMemo(
+    () => getSlashCommands(language, sessionProvider, providerSkills),
+    [language, providerSkills, sessionProvider],
+  );
+  const slashCommandQuery = useMemo(() => getSlashCommandQuery(inputValue), [inputValue]);
+  const visibleSlashCommands = useMemo(
+    () => filterSlashCommands(slashCommands, slashCommandQuery),
+    [slashCommandQuery, slashCommands],
+  );
+  const highlightedSlashCommand = visibleSlashCommands[selectedSlashCommandIndex] || visibleSlashCommands[0] || null;
+  const isSlashCommandMenuOpen = pane.isFocused && slashCommandQuery !== null;
+  const hasFloatingOverlayOpen = isSlashCommandMenuOpen || isProviderPickerOpen || isModePickerOpen || isReasoningPickerOpen || isModelPickerOpen;
+  const hasComposerAttachments = composerAttachments.length > 0;
+  const composerHistoryEntries = useMemo(
+    () => getComposerHistoryEntries(pane.session?.messages || []),
+    [pane.session?.messages],
+  );
+  const trimmedInputValue = inputValue.trim();
   const showProviderPicker = Boolean(
     pane.session
     && !isProviderLocked
@@ -3137,24 +3940,41 @@ function ConversationPane({
     && (trimmedInputValue || hasComposerAttachments)
     && (pane.session || trimmedInputValue.startsWith('/')),
   );
-  const supportsPermissionMode = sessionProvider === 'claude';
+  const sessionPermissionMode = pane.session?.permissionMode || 'default';
+  const supportsClaudeModePicker = sessionProvider === 'claude';
+  const showsCodexPlanToggle = sessionProvider === 'codex';
+  const showsCodexReasoningPicker = sessionProvider === 'codex';
+  const sessionContextUsage = pane.session?.contextUsage || null;
+  const shouldShowContextUsage = Boolean(
+    sessionContextUsage?.modelContextWindow > 0,
+  );
+  const isCodexPlanMode = sessionPermissionMode === 'plan';
   const currentProviderDisplay = providerInfo.label || getProviderDisplayName(sessionProvider, copy);
   const lockedProviderChipLabel = getLockedProviderChipLabel(sessionProvider);
   const availableProviderModels = Array.isArray(providerInfo.models) ? providerInfo.models : [];
-  const sessionPermissionMode = pane.session?.permissionMode || 'default';
   const modeOptions = useMemo(() => getComposerSessionModeOptions(copy), [copy]);
   const currentModeDisplay = useMemo(
     () => getSessionModeLabel(sessionPermissionMode, copy),
     [copy, sessionPermissionMode],
   );
-  const effectiveCurrentModel = pane.session?.currentModel || pane.session?.model || '';
+  const sessionReasoningEffort = pane.session?.reasoningEffort || '';
+  const effectiveReasoningEffort = pane.session?.effectiveReasoningEffort || sessionReasoningEffort;
+  const reasoningEffortOptions = useMemo(
+    () => getComposerReasoningEffortOptions(copy, sessionReasoningEffort),
+    [copy, sessionReasoningEffort],
+  );
+  const currentReasoningEffortDisplay = useMemo(
+    () => getCurrentReasoningEffortDisplayLabel(sessionReasoningEffort, effectiveReasoningEffort, copy),
+    [copy, effectiveReasoningEffort, sessionReasoningEffort],
+  );
+  const effectiveCurrentModel = pane.session?.effectiveModel || pane.session?.currentModel || pane.session?.model || '';
   const modelOptions = useMemo(
     () => getComposerModelOptions(copy, sessionProvider, pane.session?.model || '', effectiveCurrentModel, availableProviderModels),
     [availableProviderModels, copy, effectiveCurrentModel, pane.session?.model, sessionProvider],
   );
   const currentModelDisplay = useMemo(
-    () => getModelDisplayName(effectiveCurrentModel, availableProviderModels, sessionProvider) || copy.modelOptionDefault,
-    [availableProviderModels, copy.modelOptionDefault, effectiveCurrentModel, sessionProvider],
+    () => getModelDisplayName(effectiveCurrentModel, availableProviderModels, sessionProvider) || copy.modelOptionDefaultShort || copy.modelOptionDefault,
+    [availableProviderModels, copy.modelOptionDefault, copy.modelOptionDefaultShort, effectiveCurrentModel, sessionProvider],
   );
   const currentModelCommandValue = useMemo(
     () => ((pane.session?.model || '').trim() || 'default'),
@@ -3171,6 +3991,7 @@ function ConversationPane({
     if (!pane.isFocused) {
       setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
+      setIsReasoningPickerOpen(false);
       setIsModelPickerOpen(false);
     }
   }, [pane.isFocused]);
@@ -3182,13 +4003,26 @@ function ConversationPane({
   }, [isProviderLocked, showProviderPicker]);
 
   useEffect(() => {
-    if ((!isProviderPickerOpen && !isModePickerOpen && !isModelPickerOpen) || typeof document === 'undefined') {
+    if (!supportsClaudeModePicker) {
+      setIsModePickerOpen(false);
+    }
+  }, [supportsClaudeModePicker]);
+
+  useEffect(() => {
+    if (!showsCodexReasoningPicker) {
+      setIsReasoningPickerOpen(false);
+    }
+  }, [showsCodexReasoningPicker]);
+
+  useEffect(() => {
+    if ((!isProviderPickerOpen && !isModePickerOpen && !isReasoningPickerOpen && !isModelPickerOpen) || typeof document === 'undefined') {
       return undefined;
     }
 
     const isInsidePicker = (target) => (
       providerPickerRef.current?.contains(target)
       || modePickerRef.current?.contains(target)
+      || reasoningPickerRef.current?.contains(target)
       || modelPickerRef.current?.contains(target)
     );
 
@@ -3199,6 +4033,7 @@ function ConversationPane({
 
       setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
+      setIsReasoningPickerOpen(false);
       setIsModelPickerOpen(false);
     };
 
@@ -3209,6 +4044,7 @@ function ConversationPane({
 
       setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
+      setIsReasoningPickerOpen(false);
       setIsModelPickerOpen(false);
     };
 
@@ -3219,6 +4055,7 @@ function ConversationPane({
 
       setIsProviderPickerOpen(false);
       setIsModePickerOpen(false);
+      setIsReasoningPickerOpen(false);
       setIsModelPickerOpen(false);
     };
 
@@ -3239,7 +4076,7 @@ function ConversationPane({
       document.removeEventListener('keydown', closePickersOnEscape);
       window.removeEventListener('blur', closePickersOnWindowBlur);
     };
-  }, [isModePickerOpen, isModelPickerOpen, isProviderPickerOpen]);
+  }, [isModePickerOpen, isModelPickerOpen, isProviderPickerOpen, isReasoningPickerOpen]);
 
   useEffect(() => {
     setSelectedSlashCommandIndex(0);
@@ -3270,6 +4107,41 @@ function ConversationPane({
     textarea.style.height = '0px';
     textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
   }, [inputValue]);
+
+  // Each pane maintains its own scroll position, including background panes that
+  // continue receiving messages while another pane is focused.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return undefined;
+    }
+
+    let nextFrameId = 0;
+    const frameId = window.requestAnimationFrame(() => {
+      nextFrameId = window.requestAnimationFrame(() => {
+        const top = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
+        viewport.scrollTo({
+          top,
+          behavior: pane.session?.status === 'running' || pane.shouldShowRunIndicator ? 'auto' : 'smooth',
+        });
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      if (nextFrameId) {
+        window.cancelAnimationFrame(nextFrameId);
+      }
+    };
+  }, [
+    pane.id,
+    pane.displayMessages.length,
+    pane.session?.id,
+    pane.session?.pendingApprovals?.length,
+    pane.session?.status,
+    pane.session?.updatedAt,
+    pane.shouldShowRunIndicator,
+  ]);
 
   function applySlashCommand(command) {
     if (!command) {
@@ -3345,28 +4217,54 @@ function ConversationPane({
       return;
     }
 
-    if (trimmedInputValue.startsWith('/')) {
-      const result = await onRunSlashCommand?.(pane.id, trimmedInputValue);
+    const draftInputValue = trimmedInputValue;
+    const draftAttachments = composerAttachments;
+
+    const clearComposer = () => {
+      setComposerAttachments([]);
+      setComposerHistoryIndex(-1);
+      setInputValue('');
+    };
+
+    const restoreComposer = ({
+      nextAttachments = draftAttachments,
+      nextInputValue = draftInputValue,
+    } = {}) => {
+      setComposerAttachments((current) => (
+        current.length === 0 ? nextAttachments : current
+      ));
+      setComposerHistoryIndex(-1);
+      setInputValue((current) => (current === '' ? nextInputValue : current));
+    };
+
+    if (draftInputValue.startsWith('/')) {
+      clearComposer();
+      const result = await onRunSlashCommand?.(pane.id, draftInputValue);
       if (result?.handled) {
         if (typeof result.nextInputValue === 'string') {
           setInputValue(result.nextInputValue);
-          if (result.nextInputValue === '') {
-            setComposerAttachments([]);
-            setComposerHistoryIndex(-1);
+          if (result.nextInputValue !== '') {
+            setComposerAttachments((current) => (
+              current.length === 0 ? draftAttachments : current
+            ));
           }
+        } else {
+          restoreComposer();
         }
         return;
       }
     }
 
-    const didSend = await onSendMessage?.(pane.id, trimmedInputValue, {
-      attachments: composerAttachments,
+    if (!draftInputValue.startsWith('/')) {
+      clearComposer();
+    }
+
+    const didSend = await onSendMessage?.(pane.id, draftInputValue, {
+      attachments: draftAttachments,
     });
 
-    if (didSend) {
-      setComposerAttachments([]);
-      setComposerHistoryIndex(-1);
-      setInputValue('');
+    if (!didSend) {
+      restoreComposer();
     }
   }
 
@@ -3387,8 +4285,8 @@ function ConversationPane({
       {pane.isFocused && !pane.isOnlyPane ? (
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute inset-0 z-[2] shadow-[inset_0_0_0_1px_hsl(var(--pane-focus)/0.42)]"
-          style={{ boxShadow: `inset 0 0 0 1px ${getPaneAccentColorAlpha(paneNumber, 0.42)}` }}
+          className="pointer-events-none absolute inset-0 z-[2] shadow-[inset_0_0_0_2px_hsl(var(--pane-focus)/0.42)]"
+          style={{ boxShadow: `inset 0 0 0 2px ${getPaneAccentColorAlpha(paneNumber, 0.42)}` }}
         />
       ) : null}
       <div
@@ -3423,7 +4321,7 @@ function ConversationPane({
           {showProviderPicker ? (
             <ComposerSelectPicker
               ariaLabel={copy.providerLabel}
-              buttonTitle={currentProviderDisplay}
+              buttonTitle={formatShortcutTooltip(copy.settingsShortcutToggleFreshProvider, 'T', platform)}
               containerClassName="basis-auto max-w-[118px] shrink-0"
               currentLabel={currentProviderDisplay}
               disabled={pane.isBusy || isUpdatingProvider}
@@ -3439,6 +4337,7 @@ function ConversationPane({
               triggerVariant="header"
               onOpenChange={(nextOpen) => {
                 setIsModePickerOpen(false);
+                setIsReasoningPickerOpen(false);
                 setIsModelPickerOpen(false);
                 setIsProviderPickerOpen(nextOpen);
               }}
@@ -3479,19 +4378,19 @@ function ConversationPane({
           </div>
         ) : pane.session ? (
           <ScrollArea
-            viewportRef={registerViewport}
+            viewportRef={viewportRef}
             className="h-full px-3"
             viewportClassName="[&>div]:!block [&>div]:min-w-0 [&>div]:w-full [&>div]:max-w-full"
           >
             <div className="flex w-full min-w-0 flex-col gap-3 py-3">
-              {pane.renderableMessages.length === 0 ? (
+              {pane.displayMessages.length === 0 ? (
                 <ConversationEmptyState
                   icon={Bot}
                   title={copy.conversationEmpty}
                 />
               ) : (
                 <>
-                  {pane.renderableMessages.map((message) => (
+                  {pane.displayMessages.map((message) => (
                     <ChatMessage
                       key={message.id}
                       approvalActionId={pendingApprovalActionId}
@@ -3528,7 +4427,7 @@ function ConversationPane({
           )}
         >
           {hasComposerAttachments && (
-            <div className="absolute left-3 right-24 top-3 z-10 overflow-x-auto pb-1">
+            <div className="absolute left-3 right-32 top-3 z-10 overflow-x-auto pb-1">
               <div className="flex min-w-max items-center gap-2 pr-2">
                 {composerAttachments.map((attachment) => (
                   <ComposerAttachmentChip
@@ -3592,7 +4491,7 @@ function ConversationPane({
                   return;
                 }
 
-                if (event.key === 'Enter' && !event.shiftKey && !resolveSlashCommandName(slashCommandQuery)) {
+                if (event.key === 'Enter' && !event.shiftKey && !resolveSlashCommandName(slashCommandQuery, sessionProvider)) {
                   event.preventDefault();
                   applySlashCommand(highlightedSlashCommand);
                   return;
@@ -3630,45 +4529,101 @@ function ConversationPane({
                 : (pane.session ? copy.inputPlaceholder : copy.noSessionCommandHint)
             }
             className={cn(
-              'min-h-[108px] resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-24 text-[13px] shadow-none focus-visible:ring-0',
-              hasComposerAttachments && 'pt-16',
+              'resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-32 text-[13px] shadow-none focus-visible:ring-0',
+              hasComposerAttachments ? 'min-h-[148px] pt-16' : 'min-h-[108px]',
             )}
             disabled={!pane.workspace || pane.isBusy || !canUseSessionProvider}
           />
-          <div className="absolute bottom-3 left-3 right-24 z-10 pb-1">
+          <div className="absolute bottom-3 left-3 right-32 z-10 pb-1">
             <div className="flex items-center gap-2 pr-2">
-              <ComposerSelectPicker
-                ariaLabel={copy.modeLabel}
-                containerClassName="basis-auto max-w-[132px] shrink-0"
-                currentLabel={currentModeDisplay}
-                disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !supportsPermissionMode || !canUseSessionProvider}
-                isOpen={isModePickerOpen}
-                menuDescription={copy.modeMenuDescription}
-                menuHint={copy.modeMenuHint}
-                menuTitle={copy.modeMenuTitle}
-                options={modeOptions}
-                pickerRef={modePickerRef}
-                selectedValue={sessionPermissionMode}
-                triggerVariant="minimal"
-                onOpenChange={(nextOpen) => {
-                  setIsProviderPickerOpen(false);
-                  setIsModelPickerOpen(false);
-                  setIsModePickerOpen(nextOpen);
-                }}
-                onSelect={async (nextPermissionMode) => {
-                  if (nextPermissionMode === sessionPermissionMode) {
-                    setIsModePickerOpen(false);
-                    return;
-                  }
+              {supportsClaudeModePicker ? (
+                <ComposerSelectPicker
+                  ariaLabel={copy.modeLabel}
+                  containerClassName="basis-auto max-w-[132px] shrink-0"
+                  currentLabel={currentModeDisplay}
+                  disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !canUseSessionProvider}
+                  isOpen={isModePickerOpen}
+                  menuDescription={copy.modeMenuDescription}
+                  menuHint={copy.modeMenuHint}
+                  menuTitle={copy.modeMenuTitle}
+                  options={modeOptions}
+                  pickerRef={modePickerRef}
+                  selectedValue={sessionPermissionMode}
+                  triggerVariant="minimal"
+                  onOpenChange={(nextOpen) => {
+                    setIsProviderPickerOpen(false);
+                    setIsReasoningPickerOpen(false);
+                    setIsModelPickerOpen(false);
+                    setIsModePickerOpen(nextOpen);
+                  }}
+                  onSelect={async (nextPermissionMode) => {
+                    if (nextPermissionMode === sessionPermissionMode) {
+                      setIsModePickerOpen(false);
+                      return;
+                    }
 
-                  try {
-                    await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
+                    try {
+                      await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
+                      setIsModePickerOpen(false);
+                    } catch (error) {
+                      console.error(error);
+                    }
+                  }}
+                />
+              ) : null}
+              {showsCodexPlanToggle ? (
+                <ComposerInlineSwitch
+                  ariaLabel={copy.modeOptionPlanMode}
+                  checked={isCodexPlanMode}
+                  disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !canUseSessionProvider}
+                  label={copy.modeOptionPlanMode}
+                  title={copy.codexPlanModeHint}
+                  onToggle={async () => {
+                    const nextPermissionMode = isCodexPlanMode ? 'default' : 'plan';
+
+                    try {
+                      await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
+                    } catch (error) {
+                      console.error(error);
+                    }
+                  }}
+                />
+              ) : null}
+              {showsCodexReasoningPicker ? (
+                <ComposerSelectPicker
+                  ariaLabel={copy.reasoningEffortLabel}
+                  containerClassName="basis-auto max-w-[112px] shrink-0"
+                  currentLabel={currentReasoningEffortDisplay}
+                  disabled={!pane.session || pane.isBusy || isUpdatingReasoningEffort || !canUseSessionProvider}
+                  isOpen={isReasoningPickerOpen}
+                  menuDescription={copy.reasoningEffortMenuDescription}
+                  menuHint={copy.reasoningEffortMenuHint}
+                  menuTitle={copy.reasoningEffortMenuTitle}
+                  options={reasoningEffortOptions}
+                  pickerRef={reasoningPickerRef}
+                  selectedValue={sessionReasoningEffort}
+                  triggerVariant="minimal"
+                  onOpenChange={(nextOpen) => {
+                    setIsProviderPickerOpen(false);
                     setIsModePickerOpen(false);
-                  } catch (error) {
-                    console.error(error);
-                  }
-                }}
-              />
+                    setIsModelPickerOpen(false);
+                    setIsReasoningPickerOpen(nextOpen);
+                  }}
+                  onSelect={async (nextReasoningEffort) => {
+                    if (nextReasoningEffort === sessionReasoningEffort) {
+                      setIsReasoningPickerOpen(false);
+                      return;
+                    }
+
+                    try {
+                      await onUpdateSessionReasoningEffort?.(pane.id, nextReasoningEffort);
+                      setIsReasoningPickerOpen(false);
+                    } catch (error) {
+                      console.error(error);
+                    }
+                  }}
+                />
+              ) : null}
               <ComposerSelectPicker
                 ariaLabel={copy.modelLabel}
                 containerClassName="basis-auto max-w-[148px] shrink-0"
@@ -3685,6 +4640,7 @@ function ConversationPane({
                 onOpenChange={(nextOpen) => {
                   setIsProviderPickerOpen(false);
                   setIsModePickerOpen(false);
+                  setIsReasoningPickerOpen(false);
                   setIsModelPickerOpen(nextOpen);
                 }}
                 onSelect={async (nextModel) => {
@@ -3713,37 +4669,120 @@ function ConversationPane({
               onSelectCommand={applySlashCommand}
             />
           ) : null}
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={handlePickAttachments}
-            disabled={!pane.workspace || pane.isBusy || !canUseSessionProvider}
-            aria-label={copy.addAttachment}
-            title={copy.addAttachment}
-            className="absolute bottom-3 right-14 h-8 w-8 rounded-full border-border/80 bg-background shadow-sm hover:bg-muted"
-          >
-            <Paperclip className="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            onClick={pane.session?.isRunning ? () => onStopRun?.(pane.id) : () => {
-              void handleSend();
-            }}
-            disabled={pane.session?.isRunning ? false : (!canSend || !canUseSessionProvider)}
-            size="icon"
-            aria-label={pane.session?.isRunning ? copy.runStop : (pane.isSending ? copy.sending : copy.sendMessage)}
-            className="absolute bottom-3 right-3 h-8 w-8 rounded-full shadow-sm"
-          >
-            {pane.session?.isRunning ? (
-              <Square className="h-3.5 w-3.5" />
-            ) : pane.isSending ? (
-              <LoaderCircle className="h-4 w-4 animate-spin" />
-            ) : (
-              <ArrowUp className="h-4 w-4" />
-            )}
-          </Button>
+          <div className="absolute bottom-3 right-3 z-10 flex items-center gap-2">
+            {shouldShowContextUsage ? (
+              <ConversationContextUsageChip
+                copy={copy}
+                language={language}
+                usage={sessionContextUsage}
+              />
+            ) : null}
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={handlePickAttachments}
+              disabled={!pane.workspace || pane.isBusy || !canUseSessionProvider}
+              aria-label={copy.addAttachment}
+              title={copy.addAttachment}
+              className="h-8 w-8 rounded-full border-border/80 bg-background shadow-sm hover:bg-muted"
+            >
+              <Paperclip className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              onClick={pane.session?.isRunning ? () => onStopRun?.(pane.id) : () => {
+                void handleSend();
+              }}
+              disabled={pane.session?.isRunning ? false : (!canSend || !canUseSessionProvider)}
+              size="icon"
+              aria-label={pane.session?.isRunning ? copy.runStop : (pane.isSending ? copy.sending : copy.sendMessage)}
+              className="h-8 w-8 rounded-full shadow-sm"
+            >
+              {pane.session?.isRunning ? (
+                <Square className="h-3.5 w-3.5" />
+              ) : pane.isSending ? (
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+              ) : (
+                <ArrowUp className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ConversationContextUsageChip({ copy, language, usage }) {
+  if (!usage || !(usage.modelContextWindow > 0)) {
+    return null;
+  }
+
+  const progress = Number.isFinite(usage.usedRatio)
+    ? clampNumber(usage.usedRatio, 0, 1)
+    : 0;
+  const percentLabel = formatUsagePercentValue(progress);
+  const usedLabel = formatTokenCountValue(usage.usedTokens, language, { allowZero: true });
+  const totalLabel = formatTokenCountValue(usage.modelContextWindow, language, { allowZero: true });
+  const recentTokensLabel = formatCodexTokenUsageValue(usage.lastTokenUsage, language);
+  const lastTokensLabel = recentTokensLabel && recentTokensLabel !== usedLabel
+    ? recentTokensLabel
+    : '';
+  const title = copy.contextWindowUsageTooltip(usedLabel, totalLabel, percentLabel, lastTokensLabel);
+
+  return (
+    <ConversationContextUsageRing
+      label={title}
+      progress={progress}
+      title={title}
+    />
+  );
+}
+
+function ConversationContextUsageRing({ label, progress, title = '' }) {
+  const size = 16;
+  const strokeWidth = 1.75;
+  const radius = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference * (1 - progress);
+
+  return (
+    <div
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(progress * 100)}
+      aria-valuetext={formatUsagePercentValue(progress)}
+      title={title || label}
+      className="inline-flex h-8 w-4 shrink-0 items-center justify-center self-center"
+    >
+      <svg
+        aria-hidden="true"
+        viewBox={`0 0 ${size} ${size}`}
+        className="block h-[16px] w-[16px] -rotate-90"
+      >
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={strokeWidth}
+          style={{ stroke: 'hsl(var(--border) / 0.88)' }}
+        />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          strokeLinecap="round"
+          strokeWidth={strokeWidth}
+          strokeDasharray={circumference}
+          strokeDashoffset={dashOffset}
+          style={{ stroke: 'hsl(var(--foreground) / 0.82)' }}
+          className="transition-[stroke-dashoffset] duration-300 ease-out"
+        />
+      </svg>
     </div>
   );
 }
@@ -3811,14 +4850,17 @@ function SidebarEmpty({ text }) {
   return <div className="rounded-xl border border-dashed border-border/80 bg-background/70 px-3 py-3 text-[13px] leading-5 text-muted-foreground">{text}</div>;
 }
 
-function TopbarSelect({ ariaLabel, children, onChange, value }) {
+function TopbarSelect({ ariaLabel, children, disabled = false, onChange, value }) {
   return (
     <div className="relative w-full">
       <select
         value={value}
         onChange={onChange}
+        disabled={disabled}
         aria-label={ariaLabel}
-        className="h-8 w-full appearance-none rounded border border-border/80 bg-background px-3 pr-9 text-[12px] text-foreground outline-none transition-colors hover:bg-background focus:ring-2 focus:ring-ring/20"
+        className={cn(
+          'h-8 w-full appearance-none rounded border border-border/80 bg-background px-3 pr-9 text-[12px] text-foreground outline-none transition-colors hover:bg-background focus:ring-2 focus:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60',
+        )}
       >
         {children}
       </select>
@@ -3827,22 +4869,54 @@ function TopbarSelect({ ariaLabel, children, onChange, value }) {
   );
 }
 
+function createProviderPromptDrafts(providerSettings) {
+  return Array.isArray(providerSettings)
+    ? providerSettings.reduce((drafts, provider) => {
+      drafts[provider.key] = typeof provider?.systemPrompt === 'string' ? provider.systemPrompt : '';
+      return drafts;
+    }, {})
+    : {};
+}
+
 function SettingsDialog({
+  activeTab,
+  appInfo,
+  codeEditors,
   copy,
+  isPaneSizeLimitIgnored,
+  isUpdatingCodeEditor,
   isUpdatingProviders,
+  savingProviderSystemPromptKey,
+  isRefreshingProviderStatus,
   language,
+  onActiveTabChange,
   onClose,
+  onCodeEditorChange,
   onLanguageChange,
+  onPaneSizeLimitIgnoredChange,
+  onRefreshProviderStatus,
   onSetProviderEnabled,
+  onSetProviderSystemPrompt,
   onThemeChange,
   platform,
   providerSettings,
+  selectedCodeEditor,
   themePreference,
 }) {
+  const [providerPromptDrafts, setProviderPromptDrafts] = useState(() => createProviderPromptDrafts(providerSettings));
+
+  useEffect(() => {
+    setProviderPromptDrafts(createProviderPromptDrafts(providerSettings));
+  }, [providerSettings]);
+
   const shortcutItems = [
     {
       action: copy.settingsShortcutAddWorkspace,
       shortcut: formatShortcutLabel(platform, 'O'),
+    },
+    {
+      action: copy.settingsShortcutOpenSettings,
+      shortcut: formatShortcutLabel(platform, '.'),
     },
     {
       action: copy.settingsShortcutToggleSidebar,
@@ -3861,6 +4935,10 @@ function SettingsDialog({
       shortcut: formatShortcutLabel(platform, 'N'),
     },
     {
+      action: copy.settingsShortcutToggleFreshProvider,
+      shortcut: formatShortcutLabel(platform, 'T'),
+    },
+    {
       action: copy.settingsShortcutClosePane,
       shortcut: formatShortcutLabel(platform, 'W'),
     },
@@ -3870,120 +4948,432 @@ function SettingsDialog({
     },
   ].filter((item) => item.shortcut);
   const enabledProviderCount = providerSettings.filter((provider) => provider.enabled).length;
+  const modalLayoutStyles = getModalLayoutStyles(platform);
+  const aboutItems = [
+    { label: copy.settingsAboutName, value: appInfo.name || copy.settingsAboutUnavailable },
+    { label: copy.settingsAboutVersion, value: appInfo.version || copy.settingsAboutUnavailable },
+    { label: copy.settingsAboutPlatform, value: formatPlatformDisplayName(platform) || copy.settingsAboutUnavailable },
+    { label: copy.settingsAboutArch, value: appInfo.arch || copy.settingsAboutUnavailable },
+    { label: copy.settingsAboutElectron, value: appInfo.electronVersion || copy.settingsAboutUnavailable },
+    { label: copy.settingsAboutChrome, value: appInfo.chromeVersion || copy.settingsAboutUnavailable },
+    { label: copy.settingsAboutNode, value: appInfo.nodeVersion || copy.settingsAboutUnavailable },
+  ];
+  const settingsTabs = [
+    {
+      description: copy.settingsTabAppDescription,
+      icon: Settings,
+      key: 'app',
+      label: copy.settingsTabApp,
+    },
+    {
+      description: copy.settingsTabProvidersDescription,
+      icon: BrainCircuit,
+      key: 'providers',
+      label: copy.settingsTabProviders,
+    },
+    {
+      description: copy.settingsTabShortcutsDescription,
+      icon: TerminalSquare,
+      key: 'shortcuts',
+      label: copy.settingsTabShortcuts,
+    },
+    {
+      description: copy.settingsTabAboutDescription,
+      icon: Info,
+      key: 'about',
+      label: copy.settingsTabAbout,
+    },
+  ];
+  const activeTabItem = settingsTabs.find((item) => item.key === activeTab) || settingsTabs[0];
+  const ActiveTabIcon = activeTabItem.icon;
 
   return (
     <div
-      className="absolute inset-0 z-50 flex items-center justify-center bg-foreground/20 px-4 backdrop-blur-[2px]"
+      className="absolute inset-0 z-50 overflow-y-auto bg-foreground/20 px-4 backdrop-blur-[2px]"
+      style={modalLayoutStyles.viewport}
       onClick={onClose}
     >
-      <div
-        className="w-full max-w-md rounded-2xl border border-border/80 bg-background p-5 shadow-xl"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <p className="text-sm font-semibold text-foreground">{copy.settingsTitle}</p>
-            <p className="mt-1 text-[13px] leading-6 text-muted-foreground">{copy.settingsDescription}</p>
-          </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={onClose}
-            aria-label={copy.settingsClose}
-            title={copy.settingsClose}
-            className="h-8 w-8 shrink-0 rounded-xl text-muted-foreground hover:text-foreground"
-          >
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-
-        <div className="mt-5 space-y-4">
-          <div className="space-y-1.5">
-            <p className="text-[12px] font-medium text-foreground">{copy.languageLabel}</p>
-            <TopbarSelect
-              value={language}
-              onChange={(event) => onLanguageChange(event.target.value)}
-              ariaLabel={copy.languageLabel}
-            >
-              <option value="zh">{copy.languageChinese}</option>
-              <option value="en">{copy.languageEnglish}</option>
-            </TopbarSelect>
-          </div>
-          <div className="space-y-1.5">
-            <p className="text-[12px] font-medium text-foreground">{copy.themeLabel}</p>
-            <TopbarSelect
-              value={themePreference}
-              onChange={(event) => onThemeChange(event.target.value)}
-              ariaLabel={copy.themeLabel}
-            >
-              <option value="system">{copy.themeSystem}</option>
-              <option value="light">{copy.themeLight}</option>
-              <option value="dark">{copy.themeDark}</option>
-            </TopbarSelect>
-          </div>
-          <div className="space-y-2">
-            <div className="space-y-1">
-              <p className="text-[12px] font-medium text-foreground">{copy.settingsProvidersTitle}</p>
-              <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsProvidersDescription}</p>
+      <div className="flex min-h-full items-start justify-center">
+        <div
+          className="flex h-full w-full max-w-[900px] flex-col overflow-hidden rounded-2xl border border-border/80 bg-background shadow-xl"
+          style={modalLayoutStyles.surface}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="flex shrink-0 items-start justify-between gap-3 px-5 pb-4 pt-5">
+            <div>
+              <p className="text-sm font-semibold text-foreground">{copy.settingsTitle}</p>
+              <p className="mt-1 text-[13px] leading-6 text-muted-foreground">{copy.settingsDescription}</p>
             </div>
-            <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
-              {providerSettings.map((provider) => {
-                const disableToggle = isUpdatingProviders || (provider.enabled && enabledProviderCount <= 1);
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onClose}
+              aria-label={copy.settingsClose}
+              title={copy.settingsClose}
+              className="h-8 w-8 shrink-0 rounded-xl text-muted-foreground hover:text-foreground"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
 
-                return (
-                  <div key={provider.key} className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-3 last:border-b-0">
-                    <div className="min-w-0">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <span aria-hidden="true" className={cn('h-2 w-2 shrink-0 rounded-full', getProviderDotClasses(provider.key))} />
-                        <p className="truncate text-[12px] font-medium text-foreground">{provider.label}</p>
-                        {!provider.available ? (
-                          <span className="shrink-0 rounded-full border border-border/80 bg-muted/70 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-                            {copy.providerUnavailable(provider.label)}
-                          </span>
-                        ) : null}
-                      </div>
-                      <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{provider.summary}</p>
-                    </div>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={provider.enabled}
-                      aria-label={`${provider.label} ${copy.providerLabel}`}
-                      disabled={disableToggle}
-                      onClick={() => {
-                        void onSetProviderEnabled?.(provider.key, !provider.enabled);
-                      }}
-                      className={cn(
-                        'inline-flex h-6 w-10 shrink-0 items-center rounded-full border p-0.5 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-45',
-                        provider.enabled
-                          ? 'border-amber-300 bg-amber-400/90 dark:border-amber-400/70 dark:bg-amber-400/80'
-                          : 'border-border/80 bg-muted/80',
-                      )}
-                    >
-                      <span
+          <div className="min-h-0 flex-1 border-t border-border/70">
+            <div className="flex h-full min-h-0 flex-col md:flex-row">
+              <div className="shrink-0 border-b border-border/70 bg-muted/20 md:w-[220px] md:border-b-0 md:border-r md:bg-muted/10">
+                <div className="flex gap-2 overflow-x-auto px-4 py-4 md:flex-col md:overflow-visible">
+                  {settingsTabs.map((item) => {
+                    const Icon = item.icon;
+                    const isActive = activeTab === item.key;
+
+                    return (
+                      <button
+                        key={item.key}
+                        type="button"
+                        aria-pressed={isActive}
+                        onClick={() => onActiveTabChange(item.key)}
                         className={cn(
-                          'h-4 w-4 rounded-full bg-background shadow-sm transition-transform',
-                          provider.enabled ? 'translate-x-4' : 'translate-x-0',
+                          'flex min-w-[220px] items-start gap-3 rounded-2xl border px-3 py-3 text-left transition-colors md:min-w-0',
+                          isActive
+                            ? 'border-border/80 bg-background text-foreground shadow-sm'
+                            : 'border-transparent bg-transparent text-muted-foreground hover:border-border/60 hover:bg-background/70 hover:text-foreground',
                         )}
-                      />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-            <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsProvidersHint}</p>
-          </div>
-          <div className="space-y-2">
-            <p className="text-[12px] font-medium text-foreground">{copy.settingsShortcutsTitle}</p>
-            <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
-              {shortcutItems.map((item) => (
-                <div key={item.action} className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2.5 last:border-b-0">
-                  <p className="min-w-0 text-[12px] text-foreground/90">{item.action}</p>
-                  <code className="shrink-0 rounded-md border border-border/80 bg-muted/60 px-2 py-1 text-[11px] font-semibold text-muted-foreground">
-                    {item.shortcut}
-                  </code>
+                      >
+                        <span
+                          className={cn(
+                            'mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl',
+                            isActive ? 'bg-primary/12 text-primary' : 'bg-background text-muted-foreground',
+                          )}
+                        >
+                          <Icon className="h-4 w-4" />
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block text-[12px] font-medium">{item.label}</span>
+                          <span className="mt-1 block text-[11px] leading-5 text-current/80">{item.description}</span>
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
-              ))}
+              </div>
+
+              <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5 pt-5">
+                <div className="mb-5 rounded-2xl border border-border/70 bg-muted/20 px-4 py-3">
+                  <div className="flex items-start gap-3">
+                    <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/12 text-primary">
+                      <ActiveTabIcon className="h-4 w-4" />
+                    </span>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-foreground">{activeTabItem.label}</p>
+                      <p className="mt-1 text-[12px] leading-6 text-muted-foreground">{activeTabItem.description}</p>
+                    </div>
+                  </div>
+                </div>
+
+                {activeTab === 'app' ? (
+                  <div className="space-y-5">
+                    <div className="space-y-1.5">
+                      <p className="text-[12px] font-medium text-foreground">{copy.languageLabel}</p>
+                      <TopbarSelect
+                        value={language}
+                        onChange={(event) => onLanguageChange(event.target.value)}
+                        ariaLabel={copy.languageLabel}
+                      >
+                        <option value="zh">{copy.languageChinese}</option>
+                        <option value="en">{copy.languageEnglish}</option>
+                      </TopbarSelect>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <p className="text-[12px] font-medium text-foreground">{copy.themeLabel}</p>
+                      <TopbarSelect
+                        value={themePreference}
+                        onChange={(event) => onThemeChange(event.target.value)}
+                        ariaLabel={copy.themeLabel}
+                      >
+                        <option value="system">{copy.themeSystem}</option>
+                        <option value="light">{copy.themeLight}</option>
+                        <option value="dark">{copy.themeDark}</option>
+                      </TopbarSelect>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="space-y-1">
+                        <p className="text-[12px] font-medium text-foreground">{copy.settingsCodeEditorTitle}</p>
+                        <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsCodeEditorDescription}</p>
+                      </div>
+                      {codeEditors.length > 0 ? (
+                        <div className="space-y-1.5">
+                          <TopbarSelect
+                            value={selectedCodeEditor?.key || ''}
+                            onChange={(event) => onCodeEditorChange?.(event.target.value)}
+                            disabled={isUpdatingCodeEditor}
+                            ariaLabel={copy.settingsCodeEditorTitle}
+                          >
+                            {codeEditors.map((editor) => (
+                              <option key={editor.key} value={editor.key}>{editor.label}</option>
+                            ))}
+                          </TopbarSelect>
+                          {selectedCodeEditor?.path ? (
+                            <p className="break-all rounded-xl border border-border/70 bg-background/60 px-3 py-2 text-[11px] leading-5 text-muted-foreground">
+                              {selectedCodeEditor.path}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className="rounded-xl border border-dashed border-border/80 bg-background/50 px-3 py-3 text-[11px] leading-5 text-muted-foreground">
+                          {copy.settingsCodeEditorEmpty}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="space-y-1">
+                        <p className="text-[12px] font-medium text-foreground">{copy.settingsPaneBehaviorTitle}</p>
+                        <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsPaneBehaviorDescription}</p>
+                      </div>
+                      <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
+                        <div className="flex items-center justify-between gap-3 px-3 py-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-[12px] font-medium text-foreground">{copy.settingsPaneSizeLimitTitle}</p>
+                            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{copy.settingsPaneSizeLimitDescription}</p>
+                          </div>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={isPaneSizeLimitIgnored}
+                            aria-label={copy.settingsPaneSizeLimitTitle}
+                            onClick={() => onPaneSizeLimitIgnoredChange(!isPaneSizeLimitIgnored)}
+                            className={cn(
+                              'inline-flex h-6 w-10 shrink-0 items-center rounded-full border p-0.5 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35',
+                              isPaneSizeLimitIgnored
+                                ? 'border-amber-300 bg-amber-400/90 dark:border-amber-400/70 dark:bg-amber-400/80'
+                                : 'border-border/80 bg-muted/80',
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                'h-4 w-4 rounded-full bg-background shadow-sm transition-transform',
+                                isPaneSizeLimitIgnored ? 'translate-x-4' : 'translate-x-0',
+                              )}
+                            />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                  </div>
+                ) : null}
+
+                {activeTab === 'providers' ? (
+                  <div className="space-y-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 space-y-1">
+                        <p className="text-[12px] font-medium text-foreground">{copy.settingsProvidersTitle}</p>
+                        <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsProvidersDescription}</p>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isRefreshingProviderStatus}
+                        onClick={() => {
+                          void onRefreshProviderStatus?.();
+                        }}
+                        className="shrink-0 border-border/80"
+                      >
+                        <LoaderCircle className={cn('h-3.5 w-3.5', isRefreshingProviderStatus && 'animate-spin')} />
+                        {isRefreshingProviderStatus ? copy.settingsProvidersRefreshing : copy.settingsProvidersRefresh}
+                      </Button>
+                    </div>
+                    <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
+                      {providerSettings.map((provider) => {
+                        const disableToggle = isUpdatingProviders || (provider.enabled && enabledProviderCount <= 1);
+                        const statusItems = getProviderSettingsStatusItems(provider, copy, language);
+                        const statusMeta = getProviderSettingsStatusMeta(provider, copy, language);
+                        const systemPromptDraft = providerPromptDrafts[provider.key] ?? '';
+                        const savedSystemPrompt = typeof provider.systemPrompt === 'string' ? provider.systemPrompt : '';
+                        const isSavingSystemPrompt = savingProviderSystemPromptKey === provider.key;
+                        const isSystemPromptDirty = systemPromptDraft !== savedSystemPrompt;
+                        const systemPromptHint = provider.key === 'codex'
+                          ? copy.settingsProviderPromptHintCodex
+                          : copy.settingsProviderPromptHintClaude;
+
+                        return (
+                          <div key={provider.key} className="border-b border-border/70 px-3 py-3 last:border-b-0">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <span aria-hidden="true" className={cn('h-2 w-2 shrink-0 rounded-full', getProviderDotClasses(provider.key))} />
+                                  <p className="truncate text-[12px] font-medium text-foreground">{provider.label}</p>
+                                  {!provider.available ? (
+                                    <span className="shrink-0 rounded-full border border-border/80 bg-muted/70 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                                      {copy.providerUnavailable(provider.label)}
+                                    </span>
+                                  ) : null}
+                                </div>
+                                <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{provider.summary}</p>
+
+                                <div className="mt-3 overflow-hidden rounded-xl border border-border/70 bg-muted/20">
+                                  <div className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2">
+                                    <p className="text-[11px] font-medium text-foreground">{copy.settingsProviderStatusTitle}</p>
+                                    {statusMeta ? (
+                                      <p className="text-[10px] leading-5 text-muted-foreground">{statusMeta}</p>
+                                    ) : null}
+                                  </div>
+                                  {statusItems.length > 0 ? (
+                                    <div className="grid gap-2 px-3 py-3 sm:grid-cols-2">
+                                      {statusItems.map((item) => (
+                                        <div key={`${provider.key}-${item.label}`} className="min-w-0 rounded-lg border border-border/60 bg-background/70 px-2.5 py-2">
+                                          <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{item.label}</p>
+                                          <p className="mt-1 break-words text-[11px] leading-5 text-foreground">{item.value}</p>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <div className="px-3 py-3 text-[11px] leading-5 text-muted-foreground">
+                                      {copy.settingsProviderStatusEmpty}
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="mt-3 rounded-xl border border-border/70 bg-background/70 px-3 py-3">
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                      <p className="text-[11px] font-medium text-foreground">{copy.settingsProviderPromptTitle}</p>
+                                      <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+                                        {copy.settingsProviderPromptDescription(provider.label)}
+                                      </p>
+                                    </div>
+                                    <div className="flex shrink-0 items-center gap-2">
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        disabled={isSavingSystemPrompt || (!savedSystemPrompt && !isSystemPromptDirty)}
+                                        onClick={() => {
+                                          setProviderPromptDrafts((current) => ({
+                                            ...current,
+                                            [provider.key]: '',
+                                          }));
+                                          void onSetProviderSystemPrompt?.(provider.key, '');
+                                        }}
+                                        className="h-7 px-2 text-[11px]"
+                                      >
+                                        {copy.settingsProviderPromptReset}
+                                      </Button>
+                                      <Button
+                                        type="button"
+                                        size="sm"
+                                        disabled={!isSystemPromptDirty || isSavingSystemPrompt}
+                                        onClick={() => {
+                                          void onSetProviderSystemPrompt?.(provider.key, systemPromptDraft);
+                                        }}
+                                        className="h-7 px-2 text-[11px]"
+                                      >
+                                        {isSavingSystemPrompt ? (
+                                          <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                                        ) : null}
+                                        {isSavingSystemPrompt ? copy.settingsProviderPromptSaving : copy.settingsProviderPromptSave}
+                                      </Button>
+                                    </div>
+                                  </div>
+
+                                  <Textarea
+                                    value={systemPromptDraft}
+                                    onChange={(event) => {
+                                      const nextValue = event.target.value;
+                                      setProviderPromptDrafts((current) => ({
+                                        ...current,
+                                        [provider.key]: nextValue,
+                                      }));
+                                    }}
+                                    disabled={isSavingSystemPrompt}
+                                    placeholder={copy.settingsProviderPromptPlaceholder(provider.label)}
+                                    aria-label={copy.settingsProviderPromptTitle}
+                                    className="mt-3 min-h-[108px] resize-y border-border/80 bg-background/80 text-[12px] leading-6"
+                                  />
+                                  <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                                    {systemPromptHint}
+                                  </p>
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                role="switch"
+                                aria-checked={provider.enabled}
+                                aria-label={`${provider.label} ${copy.providerLabel}`}
+                                disabled={disableToggle}
+                                onClick={() => {
+                                  void onSetProviderEnabled?.(provider.key, !provider.enabled);
+                                }}
+                                className={cn(
+                                  'inline-flex h-6 w-10 shrink-0 items-center rounded-full border p-0.5 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-45',
+                                  provider.enabled
+                                    ? 'border-amber-300 bg-amber-400/90 dark:border-amber-400/70 dark:bg-amber-400/80'
+                                    : 'border-border/80 bg-muted/80',
+                                )}
+                              >
+                                <span
+                                  className={cn(
+                                    'h-4 w-4 rounded-full bg-background shadow-sm transition-transform',
+                                    provider.enabled ? 'translate-x-4' : 'translate-x-0',
+                                  )}
+                                />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsProvidersHint}</p>
+                  </div>
+                ) : null}
+
+                {activeTab === 'shortcuts' ? (
+                  <div className="space-y-2">
+                    <p className="text-[12px] font-medium text-foreground">{copy.settingsShortcutsTitle}</p>
+                    <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
+                      {shortcutItems.map((item) => (
+                        <div key={item.action} className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2.5 last:border-b-0">
+                          <p className="min-w-0 text-[12px] text-foreground/90">{item.action}</p>
+                          <code className="shrink-0 rounded-md border border-border/80 bg-muted/60 px-2 py-1 text-[11px] font-semibold text-muted-foreground">
+                            {item.shortcut}
+                          </code>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {activeTab === 'about' ? (
+                  <div className="space-y-2">
+                    <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
+                      <div className="flex items-start gap-3 border-b border-border/70 px-3 py-3">
+                        <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-primary/12 text-primary">
+                          <Info className="h-4 w-4" />
+                        </span>
+                        <div className="min-w-0">
+                          <p className="text-[12px] font-medium text-foreground">{appInfo.name || copy.settingsAboutTitle}</p>
+                          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{copy.settingsAboutDescription}</p>
+                        </div>
+                      </div>
+                      <div className="grid gap-2 px-3 py-3 sm:grid-cols-2">
+                        {aboutItems.map((item) => (
+                          <div key={item.label} className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-2.5 py-2">
+                            <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{item.label}</p>
+                            <p className="mt-1 break-words text-[11px] leading-5 text-foreground">{item.value}</p>
+                          </div>
+                        ))}
+                        <div className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-2.5 py-2 sm:col-span-2">
+                          <p className="text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{copy.settingsAboutDataDirectory}</p>
+                          <p className="mt-1 break-all text-[11px] leading-5 text-foreground">
+                            {appInfo.userDataPath || copy.settingsAboutUnavailable}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
         </div>
@@ -4041,6 +5431,41 @@ function HiddenPaneSection({ copy, hiddenPanes, onClearPane, onFocusPane }) {
         </div>
       </div>
     </section>
+  );
+}
+
+function ComposerInlineSwitch({
+  ariaLabel,
+  checked,
+  disabled,
+  label,
+  onToggle,
+  title,
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={checked}
+      aria-label={ariaLabel || label}
+      disabled={disabled}
+      onClick={onToggle}
+      title={title || label}
+      className={cn(
+        'inline-flex h-7 max-w-full items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50',
+        checked
+          ? 'border-emerald-400/60 bg-emerald-500/10 text-emerald-700 shadow-sm dark:border-emerald-400/40 dark:bg-emerald-500/12 dark:text-emerald-300'
+          : 'border-border/80 bg-background text-muted-foreground hover:border-border hover:text-foreground',
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn(
+          'h-1.5 w-1.5 shrink-0 rounded-full transition-colors',
+          checked ? 'bg-current' : 'bg-muted-foreground/45',
+        )}
+      />
+      <span className="truncate">{label}</span>
+    </button>
   );
 }
 
@@ -4332,6 +5757,7 @@ function SlashCommandMenu({
 }
 
 function WorkspaceItem({
+  canOpenWorkspaceInCodeEditor,
   copy,
   disabled,
   isExpanded,
@@ -4339,6 +5765,7 @@ function WorkspaceItem({
   onArchiveSession,
   onCreateSession,
   onOpenGitDiffWindow,
+  onOpenWorkspaceInCodeEditor,
   onOpenWorkspaceInFinder,
   onRemoveWorkspace,
   onSelectSession,
@@ -4369,7 +5796,7 @@ function WorkspaceItem({
 
       const viewportPadding = 12;
       const menuWidth = 220;
-      const estimatedMenuHeight = workspace.gitBranch ? 102 : 84;
+      const estimatedMenuHeight = workspace.gitBranch ? 138 : 120;
       const canOpenBelow = buttonRect.bottom + 6 + estimatedMenuHeight <= window.innerHeight - viewportPadding;
       const left = Math.min(
         Math.max(viewportPadding, buttonRect.right - menuWidth),
@@ -4499,8 +5926,13 @@ function WorkspaceItem({
             </Button>
             {isMoreMenuOpen && moreMenuPosition ? (
               <WorkspaceMoreMenu
+                canOpenWorkspaceInCodeEditor={canOpenWorkspaceInCodeEditor}
                 copy={copy}
                 disabled={disabled}
+                onOpenWorkspaceInCodeEditor={() => {
+                  setIsMoreMenuOpen(false);
+                  onOpenWorkspaceInCodeEditor?.();
+                }}
                 onOpenWorkspaceInFinder={() => {
                   setIsMoreMenuOpen(false);
                   onOpenWorkspaceInFinder?.();
@@ -4548,9 +5980,11 @@ function WorkspaceItem({
 }
 
 function WorkspaceMoreMenu({
+  canOpenWorkspaceInCodeEditor,
   copy,
   disabled,
   onOpenGitDiffWindow,
+  onOpenWorkspaceInCodeEditor,
   onOpenWorkspaceInFinder,
   onRemoveWorkspace,
   position,
@@ -4592,6 +6026,22 @@ function WorkspaceMoreMenu({
           </div>
         </div>
       )}
+      <div className="mt-0.5 border-t border-border/70 pt-1">
+        <button
+          type="button"
+          onClick={onOpenWorkspaceInCodeEditor}
+          disabled={disabled || !canOpenWorkspaceInCodeEditor}
+          className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
+          title={
+            canOpenWorkspaceInCodeEditor
+              ? copy.openWorkspaceInCodeEditorWithPath(workspace.path)
+              : copy.openWorkspaceInCodeEditorUnavailable
+          }
+        >
+          <Pencil className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 truncate text-[11px] font-medium text-foreground">{copy.openWorkspaceInCodeEditor}</span>
+        </button>
+      </div>
       <div className="mt-0.5 border-t border-border/70 pt-1">
         <button
           type="button"
@@ -4669,22 +6119,31 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
   );
 }
 
-function ConfirmActionDialog({ cancelLabel, confirmLabel, description, isPending, itemLabel, onCancel, onConfirm, title }) {
+function ConfirmActionDialog({ cancelLabel, confirmLabel, description, isPending, itemLabel, onCancel, onConfirm, platform, title }) {
+  const modalLayoutStyles = getModalLayoutStyles(platform);
+
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-foreground/20 px-4 backdrop-blur-[2px]">
-      <div className="w-full max-w-sm rounded-2xl border border-border/80 bg-background p-5 shadow-xl">
-        <p className="text-sm font-semibold text-foreground">{title}</p>
-        <p className="mt-2 text-[13px] leading-6 text-muted-foreground">{description}</p>
-        <div className="mt-3 rounded-xl bg-secondary/70 px-3 py-2 text-[12px] font-medium text-foreground">
-          {itemLabel}
-        </div>
-        <div className="mt-5 flex justify-end gap-2">
-          <Button variant="ghost" onClick={onCancel} disabled={isPending}>
-            {cancelLabel}
-          </Button>
-          <Button variant="destructive" onClick={onConfirm} disabled={isPending}>
-            {confirmLabel}
-          </Button>
+    <div
+      className="absolute inset-0 z-50 overflow-y-auto bg-foreground/20 px-4 backdrop-blur-[2px]"
+      style={modalLayoutStyles.viewport}
+    >
+      <div className="flex min-h-full items-start justify-center pb-4">
+        <div
+          className="w-full max-w-sm rounded-2xl border border-border/80 bg-background p-5 shadow-xl"
+        >
+          <p className="text-sm font-semibold text-foreground">{title}</p>
+          <p className="mt-2 text-[13px] leading-6 text-muted-foreground">{description}</p>
+          <div className="mt-3 rounded-xl bg-secondary/70 px-3 py-2 text-[12px] font-medium text-foreground">
+            {itemLabel}
+          </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button variant="ghost" onClick={onCancel} disabled={isPending}>
+              {cancelLabel}
+            </Button>
+            <Button variant="destructive" onClick={onConfirm} disabled={isPending}>
+              {confirmLabel}
+            </Button>
+          </div>
         </div>
       </div>
     </div>
@@ -4722,8 +6181,10 @@ function ChatMessage({ approvalActionId, language, message, onApprovalDecision }
   const isUser = message.role === 'user';
   const messageAttachments = isUser ? getMessageAttachments(message) : [];
   const assistantSegments = isUser ? [] : getAssistantSegments(message);
-  const showThinkingIndicator = (message.streaming || message.pendingThinking)
-    && !assistantMessageHasText(message)
+  const showThinkingIndicator = (
+    (message.streaming && !assistantMessageHasText(message))
+    || message.pendingThinking
+  )
     && !assistantMessageHasRunningToolActivity(message)
     && !assistantMessageHasPendingApproval(message);
 
@@ -4870,10 +6331,10 @@ function AssistantApprovalCard({ approval, isSubmitting, language, onDecision })
   const actionLabel = formatPendingApprovalActionLabel(approval, language);
   const reason = (approval?.description || approval?.decisionReason || '').trim();
   const blockedPath = (approval?.blockedPath || '').trim();
-  const canAlwaysAllowCommand = approval?.category === 'command';
+  const decisionOptions = getApprovalDecisionOptions(approval, copy);
 
   return (
-    <div className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-3 text-[12px] leading-5 text-foreground/90">
+    <div className="rounded-xl border border-border/80 bg-background/70 px-3 py-3 text-[12px] leading-5 text-foreground/90 shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="font-medium text-foreground">{copy.approvalTitle}</p>
         {isSubmitting ? <span className="text-[11px] text-muted-foreground">{copy.approvalResponding}</span> : null}
@@ -4881,8 +6342,8 @@ function AssistantApprovalCard({ approval, isSubmitting, language, onDecision })
       <p className="mt-1 break-words text-muted-foreground">{actionLabel}</p>
       {blockedPath ? (
         <div className="mt-2">
-          <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground/80">{copy.approvalBlockedPath}</p>
-          <code className="mt-1 block break-all rounded-lg bg-background/80 px-2 py-1.5 text-[11px] text-foreground/90">{blockedPath}</code>
+          <p className="text-[11px] font-medium text-muted-foreground/80">{copy.approvalBlockedPath}</p>
+          <code className="mt-1 block break-all rounded-lg bg-muted/40 px-2 py-1.5 text-[11px] text-foreground/90">{blockedPath}</code>
         </div>
       ) : null}
       {reason ? (
@@ -4892,35 +6353,27 @@ function AssistantApprovalCard({ approval, isSubmitting, language, onDecision })
           {reason}
         </p>
       ) : null}
-      <div className="mt-3 flex flex-wrap gap-2">
-        <Button
-          size="sm"
-          onClick={() => onDecision?.(approval.requestId, 'allow')}
-          disabled={isSubmitting}
-          className="h-7 rounded-lg bg-foreground px-2.5 text-[11px] text-background hover:bg-foreground/90"
-        >
-          {copy.approvalAllow}
-        </Button>
-        {canAlwaysAllowCommand ? (
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => onDecision?.(approval.requestId, 'allow_always')}
+      <div className="mt-3 overflow-hidden rounded-xl border border-border/80 bg-background">
+        {decisionOptions.map((option, index) => (
+          <button
+            key={option.decision}
+            type="button"
+            onClick={() => onDecision?.(approval.requestId, option.decision)}
             disabled={isSubmitting}
-            className="h-7 rounded-lg border-border/80 px-2.5 text-[11px]"
+            className={cn(
+              'flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-50',
+              index > 0 && 'border-t border-border/70',
+            )}
           >
-            {copy.approvalAllowAlwaysCommand}
-          </Button>
-        ) : null}
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => onDecision?.(approval.requestId, 'deny')}
-          disabled={isSubmitting}
-          className="h-7 rounded-lg border-border/80 px-2.5 text-[11px]"
-        >
-          {copy.approvalDeny}
-        </Button>
+            <div className="min-w-0 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+              <span className="text-[12px] font-medium text-foreground">{option.label}</span>
+              {option.description ? (
+                <span className="text-[11px] leading-5 text-muted-foreground">{option.description}</span>
+              ) : null}
+            </div>
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -5055,6 +6508,60 @@ function hasRunningToolActivity(activity) {
   return Array.isArray(activity?.items) && activity.items.some((item) => item.status === 'running');
 }
 
+function getCommandEventSource(message) {
+  const explicitSource = typeof message?.commandSource === 'string' ? message.commandSource.trim().toLowerCase() : '';
+  if (explicitSource === 'slash' || explicitSource === 'tool' || explicitSource === 'system') {
+    return explicitSource;
+  }
+
+  if (
+    (typeof message?.toolUseId === 'string' && message.toolUseId.trim())
+    || message?.toolCategory === 'command'
+    || message?.toolName === 'command_execution'
+  ) {
+    return 'tool';
+  }
+
+  const title = typeof message?.title === 'string' ? message.title.trim() : '';
+  if (title.startsWith('/')) {
+    return 'slash';
+  }
+
+  return 'system';
+}
+
+function getCommandEventMeta(message, language) {
+  const source = getCommandEventSource(message);
+
+  if (source === 'tool') {
+    return {
+      badgeLabel: language === 'zh' ? '命令' : 'Command',
+      badgeToneClassName: 'bg-emerald-500/12 text-emerald-700',
+      containerToneClassName: 'border-emerald-500/20 bg-emerald-500/8',
+      icon: TerminalSquare,
+      titleClassName: 'min-w-0 flex-1 truncate whitespace-nowrap text-[12px] leading-5 text-foreground',
+    };
+  }
+
+  if (source === 'system') {
+    return {
+      badgeLabel: language === 'zh' ? '系统' : 'System',
+      badgeToneClassName: 'bg-amber-500/12 text-amber-700',
+      containerToneClassName: 'border-amber-500/20 bg-amber-500/8',
+      icon: Workflow,
+      titleClassName: 'min-w-0 flex-1 truncate text-[12px] leading-5 text-foreground',
+    };
+  }
+
+  return {
+    badgeLabel: 'Slash',
+    badgeToneClassName: 'bg-sky-500/12 text-sky-700',
+    containerToneClassName: 'border-sky-500/20 bg-sky-500/8',
+    icon: TerminalSquare,
+    titleClassName: 'min-w-0 flex-1 truncate whitespace-nowrap text-[12px] leading-5 text-foreground',
+  };
+}
+
 function EventMessage({ language, message }) {
   const copy = COPY[language];
   const meta = getEventMeta(message.kind, message.status);
@@ -5064,23 +6571,26 @@ function EventMessage({ language, message }) {
   const preview = createEventPreview(message.content);
 
   if (message.kind === 'command') {
+    const commandMeta = getCommandEventMeta(message, language);
+    const CommandIcon = commandMeta.icon;
+
     return (
       <div className="flex justify-end py-0.5">
-        <div className="max-w-[min(100%,42rem)] rounded-2xl border border-sky-500/20 bg-sky-500/8 px-3 py-2 shadow-sm">
+        <div className={cn('max-w-[min(100%,42rem)] rounded-2xl border px-3 py-2 shadow-sm', commandMeta.containerToneClassName)}>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <span className="inline-flex items-center gap-1 rounded-md bg-sky-500/12 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em] text-sky-700">
-              <TerminalSquare className="h-3 w-3" />
-              Slash
+            <span className={cn('inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]', commandMeta.badgeToneClassName)}>
+              <CommandIcon className="h-3 w-3" />
+              {commandMeta.badgeLabel}
             </span>
             <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80">{formatTime(message.createdAt, language)}</span>
           </div>
           <div className="mt-1.5 flex items-center gap-2">
-            <code
-              className="min-w-0 flex-1 truncate whitespace-nowrap text-[12px] leading-5 text-foreground"
+            <span
+              className={commandMeta.titleClassName}
               title={message.title}
             >
               {message.title}
-            </code>
+            </span>
             {message.content && collapsible ? (
               <button
                 type="button"
@@ -5282,7 +6792,15 @@ function createEventPreview(content) {
 }
 
 function isMergeableToolEvent(message) {
-  return message?.role === 'event' && ['mcp', 'skill', 'tool', 'tool_result'].includes(message.kind);
+  if (message?.role !== 'event') {
+    return false;
+  }
+
+  if (['mcp', 'skill', 'tool', 'tool_result'].includes(message.kind)) {
+    return true;
+  }
+
+  return message.kind === 'command' && getCommandEventSource(message) === 'tool';
 }
 
 function mergeRenderableMessages(messages, language, sessionRunning = false, pendingApprovals = []) {
@@ -5331,6 +6849,10 @@ function mergeRenderableMessages(messages, language, sessionRunning = false, pen
   };
 
   for (const message of normalizedMessages) {
+    if (message?.role === 'event' && message.kind === 'thinking') {
+      continue;
+    }
+
     if (isMergeableToolEvent(message)) {
       toolEventBuffer.push(message);
       continue;
@@ -5452,26 +6974,23 @@ function attachPendingApprovalsToRenderableMessages(messages, pendingApprovals) 
 }
 
 function markTrailingAssistantMessageAsPending(messages) {
-  const lastUserIndex = findLastMessageIndex(messages, 'user');
+  const lastUserIndex = findLastOutboundTurnIndex(messages);
   if (lastUserIndex === -1) {
     return;
   }
 
-  for (let index = messages.length - 1; index > lastUserIndex; index -= 1) {
-    const message = messages[index];
-    if (message?.role !== 'assistant') {
-      continue;
-    }
-
-    if (assistantMessageHasText(message)) {
-      return;
-    }
-
-    if (assistantMessageHasToolActivity(message)) {
-      message.pendingThinking = true;
-    }
-
+  const trailingMessage = messages[messages.length - 1];
+  if (trailingMessage?.role !== 'assistant') {
     return;
+  }
+
+  const hasToolActivity = assistantMessageHasToolActivity(trailingMessage);
+  if (assistantMessageHasText(trailingMessage) && !hasToolActivity) {
+    return;
+  }
+
+  if (hasToolActivity) {
+    trailingMessage.pendingThinking = true;
   }
 }
 
@@ -6144,6 +7663,19 @@ function normalizeToolActivityLabel(category, label) {
 }
 
 function formatPendingApprovalActionLabel(approval, language) {
+  const codexApprovalSandboxMode = getCodexPendingApprovalSandboxMode(approval);
+  if (codexApprovalSandboxMode === 'danger-full-access') {
+    return language === 'zh'
+      ? '允许 Codex 执行需要更高权限的受限操作'
+      : 'Allow Codex to run operations that need elevated permissions';
+  }
+
+  if (isCodexWriteApproval(approval)) {
+    return language === 'zh'
+      ? '允许 Codex 获取当前工作目录的写权限'
+      : 'Allow Codex to write inside the current workspace';
+  }
+
   const detail = formatPendingApprovalDetail(approval);
   const category = approval?.category || 'generic';
 
@@ -6194,6 +7726,65 @@ function formatPendingApprovalDetail(approval) {
   return (approval?.displayName || approval?.title || approval?.toolName || '').trim();
 }
 
+function isCodexWriteApproval(approval) {
+  const approvalKind = typeof approval?.approvalKind === 'string'
+    ? approval.approvalKind.trim()
+    : (typeof approval?.input?.approvalKind === 'string' ? approval.input.approvalKind.trim() : '');
+  return approvalKind === 'codex_write' || approvalKind === 'codex_permission';
+}
+
+function getCodexPendingApprovalSandboxMode(approval) {
+  const sandboxMode = typeof approval?.sandboxMode === 'string'
+    ? approval.sandboxMode.trim()
+    : (typeof approval?.input?.sandboxMode === 'string' ? approval.input.sandboxMode.trim() : '');
+  if (sandboxMode === 'danger-full-access' || sandboxMode === 'workspace-write' || sandboxMode === 'read-only') {
+    return sandboxMode;
+  }
+
+  const approvalKind = typeof approval?.approvalKind === 'string'
+    ? approval.approvalKind.trim()
+    : (typeof approval?.input?.approvalKind === 'string' ? approval.input.approvalKind.trim() : '');
+  return approvalKind === 'codex_write' ? 'workspace-write' : '';
+}
+
+function getApprovalDecisionOptions(approval, copy) {
+  const allowAlwaysOption = getApprovalAllowAlwaysOption(approval, copy);
+
+  return [
+    {
+      decision: 'allow',
+      description: copy.approvalAllowSummary,
+      label: copy.approvalAllow,
+    },
+    ...(allowAlwaysOption ? [allowAlwaysOption] : []),
+    {
+      decision: 'deny',
+      description: isCodexWriteApproval(approval) ? copy.approvalDenyReadonlySummary : copy.approvalDenySummary,
+      label: copy.approvalDeny,
+    },
+  ];
+}
+
+function getApprovalAllowAlwaysOption(approval, copy) {
+  if (isCodexWriteApproval(approval)) {
+    return {
+      decision: 'allow_always',
+      description: copy.approvalAllowAlwaysWorkspaceWriteSummary,
+      label: copy.approvalAllowAlwaysWorkspaceWrite,
+    };
+  }
+
+  if (approval?.category === 'command') {
+    return {
+      decision: 'allow_always',
+      description: copy.approvalAllowAlwaysCommandSummary,
+      label: copy.approvalAllowAlwaysCommand,
+    };
+  }
+
+  return null;
+}
+
 function createToolEventGroup(messages, language) {
   const copy = COPY[language];
   const errorCount = messages.filter((message) => message.status === 'error').length;
@@ -6239,8 +7830,10 @@ function matchesSessionSearch(session, query) {
   return haystacks.some((value) => value?.toLowerCase().includes(query));
 }
 
-function getSlashCommands(language, installedSkills = []) {
+function getSlashCommands(language, provider = 'claude', installedSkills = []) {
   const isChinese = language === 'zh';
+  const normalizedProvider = normalizeProviderKey(provider);
+  const providerLabel = normalizedProvider === 'codex' ? 'Codex' : 'Claude';
   const builtinCommands = [
     {
       aliases: [],
@@ -6252,7 +7845,7 @@ function getSlashCommands(language, installedSkills = []) {
     {
       aliases: [],
       description: isChinese ? '设置当前会话模型' : 'Set the current model',
-      detail: isChinese ? '设置当前会话模型，例如 /model sonnet、/model opus，或直接填写完整模型名' : 'Set the current model, for example /model sonnet, /model opus, or a full model name',
+      detail: isChinese ? `设置当前 ${providerLabel} 会话模型，例如 /model sonnet，或直接填写完整模型名` : `Set the current ${providerLabel} model, or provide a full model name`,
       name: 'model',
       template: '/model ',
     },
@@ -6273,21 +7866,35 @@ function getSlashCommands(language, installedSkills = []) {
     {
       aliases: [],
       description: isChinese ? '管理 MCP 服务' : 'Manage MCP servers',
-      detail: isChinese ? '透传到本机 Claude Code，例如 /mcp list、/mcp add ...、/mcp get <name>' : 'Runs local Claude Code MCP commands such as /mcp list, /mcp add ..., or /mcp get <name>',
+      detail: isChinese ? `透传到本机 ${providerLabel} CLI，例如 /mcp list、/mcp add ...、/mcp get <name>` : `Runs local ${providerLabel} CLI MCP commands such as /mcp list, /mcp add ..., or /mcp get <name>`,
       name: 'mcp',
       template: '/mcp ',
     },
     {
       aliases: ['skill'],
       description: isChinese ? '查看或安装本地 skills' : 'List or install local skills',
-      detail: isChinese ? '支持 /skills list 和 /skills install <path> [--scope user|project]' : 'Supports /skills list and /skills install <path> [--scope user|project]',
+      detail: isChinese ? `查看或安装当前 ${providerLabel} 的本地 skills` : `List or install local skills for ${providerLabel}`,
       name: 'skills',
       template: '/skills ',
     },
+    ...(normalizedProvider === 'claude' ? [{
+      aliases: [],
+      description: isChinese ? '切换 Claude 模式' : 'Switch Claude mode',
+      detail: isChinese ? '设置当前 Claude 会话模式，例如 /mode ask、/mode auto 或 /mode plan' : 'Set the current Claude mode, for example /mode ask, /mode auto, or /mode plan',
+      name: 'mode',
+      template: '/mode ',
+    }] : []),
+    ...(normalizedProvider === 'codex' ? [{
+      aliases: ['effort'],
+      description: isChinese ? '切换推理强度' : 'Adjust reasoning effort',
+      detail: isChinese ? '设置当前 Codex 推理强度，例如 /reasoning low、/reasoning high 或 /reasoning xhigh' : 'Set the current Codex reasoning effort, for example /reasoning low, /reasoning high, or /reasoning xhigh',
+      name: 'reasoning',
+      template: '/reasoning ',
+    }] : []),
     {
       aliases: ['?'],
       description: isChinese ? '查看可用命令' : 'Show available commands',
-      detail: isChinese ? '打开当前客户端支持的 Claude Code 风格命令列表' : 'Open the Claude Code-style commands supported in this client',
+      detail: isChinese ? `打开当前 ${providerLabel} 会话可用的本地命令列表` : `Open the local commands available for this ${providerLabel} conversation`,
       name: 'help',
       template: '/',
     },
@@ -6299,9 +7906,9 @@ function getSlashCommands(language, installedSkills = []) {
     .filter((command) => !builtinNames.has(command.name));
 
   return [
-    ...builtinCommands.slice(0, 6),
+    ...builtinCommands.slice(0, builtinCommands.length - 1),
     ...skillCommands,
-    builtinCommands[6],
+    builtinCommands[builtinCommands.length - 1],
   ];
 }
 
@@ -6327,7 +7934,7 @@ function getComposerModelOptions(copy, provider, selectedModel, currentModel, av
   const defaultCurrentLabel = !selectedModel ? getModelDisplayName(currentModel, availableProviderModels, provider) : '';
   const defaultOption = {
     commandValue: 'default',
-    label: copy.modelOptionDefault,
+    label: copy.modelOptionDefaultShort || copy.modelOptionDefault,
     summary: copy.modelSummaryDefault(defaultCurrentLabel, providerLabel),
     value: '',
   };
@@ -6381,6 +7988,97 @@ function getComposerModelOptions(copy, provider, selectedModel, currentModel, av
       label: getModelDisplayName(selectedModel, availableProviderModels, provider) || copy.modelOptionCustom,
       summary: copy.modelSummaryCustom(getModelDisplayName(currentModel || selectedModel, availableProviderModels, provider) || selectedModel),
       value: selectedModel,
+    },
+  ];
+}
+
+function getReasoningEffortLabel(value, copy) {
+  switch ((value || '').trim().toLowerCase()) {
+    case 'low':
+      return copy.reasoningEffortOptionLow;
+    case 'medium':
+      return copy.reasoningEffortOptionMedium;
+    case 'high':
+      return copy.reasoningEffortOptionHigh;
+    case 'xhigh':
+      return copy.reasoningEffortOptionXHigh;
+    case 'minimal':
+      return 'Minimal';
+    case '':
+      return copy.reasoningEffortOptionDefault;
+    default:
+      return value;
+  }
+}
+
+function getReasoningEffortDisplayLabel(value, copy) {
+  const normalizedValue = (value || '').trim().toLowerCase();
+  if (!normalizedValue) {
+    return copy.reasoningEffortOptionDefaultShort;
+  }
+
+  return getReasoningEffortLabel(normalizedValue, copy);
+}
+
+function getCurrentReasoningEffortDisplayLabel(configuredValue, effectiveValue, copy) {
+  const normalizedConfiguredValue = (configuredValue || '').trim().toLowerCase();
+  if (normalizedConfiguredValue) {
+    return getReasoningEffortLabel(normalizedConfiguredValue, copy);
+  }
+
+  const normalizedEffectiveValue = (effectiveValue || '').trim().toLowerCase();
+  if (normalizedEffectiveValue) {
+    return getReasoningEffortLabel(normalizedEffectiveValue, copy);
+  }
+
+  return copy.reasoningEffortOptionDefaultShort;
+}
+
+function getComposerReasoningEffortOptions(copy, selectedReasoningEffort = '') {
+  const presets = [
+    {
+      commandValue: 'default',
+      label: copy.reasoningEffortOptionDefaultShort || copy.reasoningEffortOptionDefault,
+      summary: copy.reasoningEffortSummaryDefault,
+      value: '',
+    },
+    {
+      commandValue: 'low',
+      label: copy.reasoningEffortOptionLow,
+      summary: copy.reasoningEffortSummaryLow,
+      value: 'low',
+    },
+    {
+      commandValue: 'medium',
+      label: copy.reasoningEffortOptionMedium,
+      summary: copy.reasoningEffortSummaryMedium,
+      value: 'medium',
+    },
+    {
+      commandValue: 'high',
+      label: copy.reasoningEffortOptionHigh,
+      summary: copy.reasoningEffortSummaryHigh,
+      value: 'high',
+    },
+    {
+      commandValue: 'xhigh',
+      label: copy.reasoningEffortOptionXHigh,
+      summary: copy.reasoningEffortSummaryXHigh,
+      value: 'xhigh',
+    },
+  ];
+
+  if (!selectedReasoningEffort || presets.some((option) => option.value === selectedReasoningEffort)) {
+    return presets;
+  }
+
+  return [
+    ...presets,
+    {
+      commandValue: selectedReasoningEffort,
+      label: getReasoningEffortLabel(selectedReasoningEffort, copy),
+      summary: copy.reasoningEffortSummaryCustom(getReasoningEffortLabel(selectedReasoningEffort, copy)),
+      value: selectedReasoningEffort,
     },
   ];
 }
@@ -6549,6 +8247,22 @@ function getEnabledProviderKeys(providerCatalog) {
 
 function getAvailableEnabledProviderKeys(providerCatalog) {
   return PROVIDER_KEYS.filter((provider) => isProviderSelectable(providerCatalog, provider));
+}
+
+function getNextAvailableProviderKey(providerCatalog, currentProvider, fallbackProvider = 'claude') {
+  const availableEnabledProviders = getAvailableEnabledProviderKeys(providerCatalog);
+  if (availableEnabledProviders.length <= 1) {
+    return '';
+  }
+
+  const normalizedCurrentProvider = normalizeProviderKey(currentProvider || fallbackProvider);
+  const currentIndex = availableEnabledProviders.indexOf(normalizedCurrentProvider);
+
+  if (currentIndex === -1) {
+    return availableEnabledProviders[0] || '';
+  }
+
+  return availableEnabledProviders[(currentIndex + 1) % availableEnabledProviders.length] || '';
 }
 
 function isProviderSelectable(providerCatalog, provider) {
@@ -6889,7 +8603,7 @@ function getComposerHistoryValue(message) {
     return typeof message.content === 'string' ? message.content.trim() : '';
   }
 
-  if (message.role === 'event' && message.kind === 'command') {
+  if (message.role === 'event' && message.kind === 'command' && getCommandEventSource(message) === 'slash') {
     const title = typeof message.title === 'string' ? message.title.trim() : '';
     return title || (typeof message.content === 'string' ? message.content.trim() : '');
   }
@@ -7011,8 +8725,9 @@ function tokenizeSlashArgs(rawArgs) {
   return tokens;
 }
 
-function resolveSlashCommandName(name) {
+function resolveSlashCommandName(name, provider = 'claude') {
   const normalized = typeof name === 'string' ? name.trim().toLowerCase() : '';
+  const normalizedProvider = normalizeProviderKey(provider);
   if (!normalized) {
     return '';
   }
@@ -7029,6 +8744,10 @@ function resolveSlashCommandName(name) {
     return 'model';
   }
 
+  if (normalized === 'provider') {
+    return 'provider';
+  }
+
   if (normalized === 'mcp') {
     return 'mcp';
   }
@@ -7039,6 +8758,14 @@ function resolveSlashCommandName(name) {
 
   if (normalized === 'theme') {
     return 'theme';
+  }
+
+  if (normalized === 'mode' && normalizedProvider === 'claude') {
+    return 'mode';
+  }
+
+  if ((normalized === 'reasoning' || normalized === 'effort') && normalizedProvider === 'codex') {
+    return 'reasoning';
   }
 
   return '';
@@ -7058,7 +8785,9 @@ function createInstalledSkillCommand(skill, language) {
 
   const scopeLabel = skill?.scope === 'project'
     ? (language === 'zh' ? '项目 skill' : 'Project skill')
-    : (language === 'zh' ? '用户 skill' : 'User skill');
+    : skill?.scope === 'system'
+      ? (language === 'zh' ? '系统 skill' : 'System skill')
+      : (language === 'zh' ? '用户 skill' : 'User skill');
   const summary = typeof skill?.description === 'string' ? skill.description.trim() : '';
 
   return {
@@ -7128,6 +8857,44 @@ function normalizeModelCommandArg(value) {
   }
 
   return ['clear', 'default', 'reset'].includes(normalized.toLowerCase()) ? '' : normalized;
+}
+
+function normalizeModeCommandArg(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) {
+    return '';
+  }
+
+  if (['ask', 'default', 'reset'].includes(normalized)) {
+    return 'default';
+  }
+
+  if (['auto', 'edit', 'accept-edits', 'acceptedits'].includes(normalized)) {
+    return 'acceptEdits';
+  }
+
+  if (normalized === 'plan') {
+    return 'plan';
+  }
+
+  return '';
+}
+
+function normalizeReasoningEffortCommandArg(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (['clear', 'default', 'reset'].includes(normalized)) {
+    return '';
+  }
+
+  if (['low', 'medium', 'high', 'xhigh', 'minimal'].includes(normalized)) {
+    return normalized;
+  }
+
+  return null;
 }
 
 function getInitialPaneLayout() {
@@ -7669,7 +9436,139 @@ function areSessionSnapshotsEqual(left, right) {
     && left.status === right.status
     && (left.messages?.length || 0) === (right.messages?.length || 0)
     && (left.pendingApprovals?.length || 0) === (right.pendingApprovals?.length || 0)
+    && getContextUsageSignature(left.contextUsage) === getContextUsageSignature(right.contextUsage)
   );
+}
+
+function getContextUsageSignature(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return '';
+  }
+
+  return [
+    usage.modelContextWindow || 0,
+    usage.usedTokens || 0,
+    usage.remainingTokens || 0,
+    Math.round(clampNumber(Number(usage.usedRatio) || 0, 0, 1) * 10000),
+    usage.updatedAt || '',
+    getCodexTokenUsageSignature(usage.lastTokenUsage),
+    getCodexTokenUsageSignature(usage.totalTokenUsage),
+  ].join('|');
+}
+
+function getCodexTokenUsageSignature(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return '';
+  }
+
+  return [
+    usage.inputTokens || 0,
+    usage.cachedInputTokens || 0,
+    usage.outputTokens || 0,
+    usage.reasoningOutputTokens || 0,
+    usage.totalTokens || 0,
+  ].join(':');
+}
+
+function resolvePaneSessionSnapshot(pane, activeSession, sessionViewCache) {
+  if (!pane?.workspaceId || !pane?.sessionId) {
+    return null;
+  }
+
+  if (
+    activeSession
+    && activeSession.workspaceId === pane.workspaceId
+    && activeSession.id === pane.sessionId
+  ) {
+    return activeSession;
+  }
+
+  const sessionCacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
+  return sessionViewCache[sessionCacheKey] || null;
+}
+
+function createPendingPaneTurn({
+  attachments,
+  displayKind,
+  displayPrompt,
+  displayTitle,
+  paneId,
+  prompt,
+  session,
+  workspaceId,
+}) {
+  const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
+  const normalizedDisplayPrompt = typeof displayPrompt === 'string' && displayPrompt.trim()
+    ? displayPrompt.trim()
+    : normalizedPrompt;
+  const normalizedDisplayTitle = typeof displayTitle === 'string' && displayTitle.trim()
+    ? displayTitle.trim()
+    : normalizedDisplayPrompt;
+  const createdAt = new Date().toISOString();
+  const messageId = `pending-turn-${paneId || 'pane'}-${createdAt}`;
+  const message = displayKind === 'command'
+    ? {
+      commandSource: 'slash',
+      content: '',
+      createdAt,
+      id: messageId,
+      kind: 'command',
+      role: 'event',
+      status: 'info',
+      title: normalizedDisplayTitle,
+    }
+    : {
+      attachments: normalizeComposerAttachments(attachments),
+      content: normalizedDisplayPrompt,
+      createdAt,
+      error: false,
+      id: messageId,
+      role: 'user',
+      streaming: false,
+    };
+
+  return {
+    baselineIsRunning: Boolean(session?.isRunning),
+    baselineMessageCount: Array.isArray(session?.messages) ? session.messages.length : 0,
+    baselineStatus: session?.status || '',
+    baselineUpdatedAt: session?.updatedAt || '',
+    message,
+    sessionId: session?.id || '',
+    workspaceId,
+  };
+}
+
+function hasSessionAppliedPendingTurn(session, pendingTurn) {
+  if (!session || !pendingTurn) {
+    return false;
+  }
+
+  return (
+    session.updatedAt !== pendingTurn.baselineUpdatedAt
+    || (session.status || '') !== pendingTurn.baselineStatus
+    || Boolean(session.isRunning) !== pendingTurn.baselineIsRunning
+    || (Array.isArray(session.messages) ? session.messages.length : 0) !== pendingTurn.baselineMessageCount
+  );
+}
+
+function getPendingTurnForPane(pane, pendingPaneTurns, session) {
+  const pendingTurn = pendingPaneTurns[pane.id];
+  if (!pendingTurn) {
+    return null;
+  }
+
+  if (pendingTurn.workspaceId !== pane.workspaceId || pendingTurn.sessionId !== pane.sessionId) {
+    return null;
+  }
+
+  return hasSessionAppliedPendingTurn(session, pendingTurn) ? null : pendingTurn;
+}
+
+function appendPendingTurnMessage(messages, pendingTurn) {
+  return [
+    ...(Array.isArray(messages) ? messages : []),
+    pendingTurn.message,
+  ];
 }
 
 function buildPaneViewModel({
@@ -7677,6 +9576,7 @@ function buildPaneViewModel({
   appState,
   copy,
   focusedPaneId,
+  pendingPaneTurns,
   sendingPaneIds,
   language,
   paneCount,
@@ -7685,40 +9585,61 @@ function buildPaneViewModel({
 }) {
   const workspace = appState.workspaces.find((entry) => entry.id === pane.workspaceId) || null;
   const sessionMeta = workspace?.sessions.find((entry) => entry.id === pane.sessionId) || null;
-  const sessionCacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
-  const isSelectedPaneSession = (
-    activeSession
-    && activeSession.workspaceId === pane.workspaceId
-    && activeSession.id === pane.sessionId
-  );
-  const session = isSelectedPaneSession
-    ? activeSession
-    : (sessionViewCache[sessionCacheKey] || null);
+  const session = resolvePaneSessionSnapshot(pane, activeSession, sessionViewCache);
+  const pendingTurn = getPendingTurnForPane(pane, pendingPaneTurns, session);
   const pendingApprovals = Array.isArray(session?.pendingApprovals)
     ? session.pendingApprovals.filter(Boolean)
     : [];
   const isPaneSending = Array.isArray(sendingPaneIds) && sendingPaneIds.includes(pane.id);
+  const hasPendingApprovals = pendingApprovals.length > 0;
+  const sessionRunning = Boolean(
+    session?.isRunning
+    || sessionMeta?.isRunning
+    || session?.status === 'running'
+    || sessionMeta?.status === 'running'
+  );
+  const isRunning = Boolean(pendingTurn || sessionRunning);
   const renderableMessages = session
     ? mergeRenderableMessages(
       session.messages || [],
       language,
-      Boolean(isPaneSending || session.status === 'running'),
+      sessionRunning,
       pendingApprovals,
     )
     : [];
-  const isRunning = Boolean(session?.isRunning || sessionMeta?.isRunning || session?.status === 'running');
+  const displayMessages = pendingTurn
+    ? appendPendingTurnMessage(renderableMessages, pendingTurn)
+    : renderableMessages;
+  const sessionForIndicator = pendingTurn
+    ? {
+      ...(session || {
+        id: pane.sessionId || pendingTurn?.sessionId || '',
+        messages: [],
+        status: 'running',
+        workspaceId: pane.workspaceId || pendingTurn?.workspaceId || '',
+      }),
+      isRunning: true,
+      status: 'running',
+    }
+    : session;
 
   return {
     id: pane.id,
-    isBusy: isRunning,
+    isBusy: isRunning || hasPendingApprovals,
     isFocused: pane.id === focusedPaneId,
     isLoading: Boolean(pane.sessionId && !session && sessionMeta),
     isOnlyPane: paneCount <= 1,
-    isSending: Boolean(isPaneSending),
+    isSending: Boolean(isPaneSending || pendingTurn),
+    displayMessages,
     renderableMessages,
     session,
     sessionMeta,
-    shouldShowRunIndicator: shouldRenderRunIndicator(session, renderableMessages, isPaneSending),
+    shouldShowRunIndicator: shouldRenderRunIndicator(
+      sessionForIndicator,
+      renderableMessages,
+      Boolean(isPaneSending || pendingTurn),
+      pendingTurn,
+    ),
     title: sessionMeta?.title || session?.title || copy.paneEmptyTitle,
     workspace,
     workspaceName: workspace?.name || '',
@@ -7735,14 +9656,24 @@ function getAdaptivePaneLimit(width, height) {
   return Math.max(1, maxColumns * maxRows);
 }
 
-function getAdaptivePaneGridSpec(count, width, height) {
+function getAdaptivePaneGridSpec(count, width, height, options = {}) {
   const paneCount = Math.max(1, count || 1);
+  const prioritizePaneWidth = options.prioritizePaneWidth === true;
   if (!width || !height) {
     return {
       columns: 1,
       rows: paneCount,
     };
   }
+
+  if (prioritizePaneWidth && paneCount >= 4) {
+    const columns = Math.min(paneCount, Math.max(2, Math.floor(Math.sqrt(paneCount))));
+    return {
+      columns,
+      rows: Math.ceil(paneCount / columns),
+    };
+  }
+
   const isLandscape = width >= height;
 
   if (paneCount === 1) {
@@ -7782,19 +9713,6 @@ function getAdaptivePaneGridSpec(count, width, height) {
     columns: Math.ceil(paneCount / rows),
     rows,
   };
-}
-
-function setPaneViewportNode(refStore, paneId, node) {
-  if (!refStore?.current || !paneId) {
-    return;
-  }
-
-  if (node) {
-    refStore.current.set(paneId, node);
-    return;
-  }
-
-  refStore.current.delete(paneId);
 }
 
 function normalizeToastMessage(value) {
@@ -7845,6 +9763,18 @@ function getInitialThemePreference() {
   }
 
   return 'system';
+}
+
+function getInitialPaneSizeLimitIgnored() {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(PANE_SIZE_LIMIT_IGNORED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
 }
 
 function getSystemTheme() {
@@ -7929,7 +9859,316 @@ function normalizeProviderVersion(value, providerLabel) {
     .trim();
 }
 
-function shouldRenderRunIndicator(session, renderableMessages, isSending) {
+function getProviderSettingsStatusMeta(provider, copy, language) {
+  const metaParts = [];
+  const versionLabel = normalizeProviderVersion(provider?.version, provider?.label);
+  const updatedAtLabel = formatProviderStatusUpdatedValue(provider?.status?.updatedAt, language);
+
+  if (versionLabel) {
+    metaParts.push(versionLabel);
+  }
+
+  if (updatedAtLabel) {
+    metaParts.push(copy.settingsProviderStatusUpdatedAt(updatedAtLabel));
+  }
+
+  return metaParts.join(' · ');
+}
+
+function getProviderSettingsStatusItems(provider, copy, language) {
+  const status = provider?.status;
+  if (!status || typeof status !== 'object') {
+    return [];
+  }
+
+  return normalizeProviderKey(provider?.key) === 'codex'
+    ? getCodexProviderSettingsStatusItems(status, provider, copy, language)
+    : getClaudeProviderSettingsStatusItems(status, provider, copy, language);
+}
+
+function getClaudeProviderSettingsStatusItems(status, provider, copy, language) {
+  const items = [];
+  const currentModel = formatProviderSettingsModelValue(status.currentModel, provider, copy);
+  const favoriteModel = formatFavoriteClaudeModelValue(status.favoriteModel, provider, copy, language);
+  const usageStreak = Number.isFinite(status.usageStreak) && status.usageStreak > 0
+    ? formatProviderStatusDuration(status.usageStreak, language)
+    : '';
+  const lastActive = formatClaudeLastActiveValue(status.lastActive, language);
+  const totalSessions = status.totalSessions > 0 ? formatLocalizedNumber(status.totalSessions, language) : '';
+  const totalMessages = status.totalMessages > 0 ? formatLocalizedNumber(status.totalMessages, language) : '';
+
+  if (currentModel) {
+    items.push({ label: copy.settingsProviderStatusCurrentModel, value: currentModel });
+  }
+
+  if (favoriteModel) {
+    items.push({ label: copy.settingsProviderStatusFavoriteModel, value: favoriteModel });
+  }
+
+  if (usageStreak) {
+    items.push({ label: copy.settingsProviderStatusUsageStreak, value: usageStreak });
+  }
+
+  if (lastActive) {
+    items.push({ label: copy.settingsProviderStatusLastActive, value: lastActive });
+  }
+
+  if (totalSessions) {
+    items.push({ label: copy.settingsProviderStatusTotalSessions, value: totalSessions });
+  }
+
+  if (totalMessages) {
+    items.push({ label: copy.settingsProviderStatusTotalMessages, value: totalMessages });
+  }
+
+  return items;
+}
+
+function getCodexProviderSettingsStatusItems(status, provider, copy, language) {
+  const items = [];
+  const authMode = formatCodexAuthMode(status.authMode, language);
+  const planType = formatCodexPlanType(status.planType);
+  const defaultModel = formatProviderSettingsModelValue(status.defaultModel, provider, copy);
+  const reasoning = status.reasoningEffort
+    ? getReasoningEffortDisplayLabel(status.reasoningEffort, copy)
+    : '';
+  const lastTokens = formatCodexTokenUsageValue(status.lastTokenUsage, language);
+  const contextWindow = status.modelContextWindow > 0
+    ? formatTokenCountValue(status.modelContextWindow, language)
+    : '';
+  const primaryLimit = formatCodexRateLimitValue(status.rateLimits?.primary, language);
+  const secondaryLimit = formatCodexRateLimitValue(status.rateLimits?.secondary, language);
+
+  if (authMode) {
+    items.push({ label: copy.settingsProviderStatusAuthMode, value: authMode });
+  }
+
+  if (planType) {
+    items.push({ label: copy.settingsProviderStatusPlanType, value: planType });
+  }
+
+  if (defaultModel) {
+    items.push({ label: copy.settingsProviderStatusDefaultModel, value: defaultModel });
+  }
+
+  if (reasoning) {
+    items.push({ label: copy.settingsProviderStatusReasoning, value: reasoning });
+  }
+
+  if (lastTokens) {
+    items.push({ label: copy.settingsProviderStatusLastTokens, value: lastTokens });
+  }
+
+  if (contextWindow) {
+    items.push({ label: copy.settingsProviderStatusContextWindow, value: contextWindow });
+  }
+
+  if (primaryLimit) {
+    items.push({ label: copy.settingsProviderStatusPrimaryLimit, value: primaryLimit });
+  }
+
+  if (secondaryLimit) {
+    items.push({ label: copy.settingsProviderStatusSecondaryLimit, value: secondaryLimit });
+  }
+
+  return items;
+}
+
+function formatProviderSettingsModelValue(model, provider, copy) {
+  if (typeof model !== 'string' || !model.trim()) {
+    return '';
+  }
+
+  return getModelDisplayName(model.trim(), provider?.models || [], provider?.key || 'claude') || model.trim();
+}
+
+function formatFavoriteClaudeModelValue(favoriteModel, provider, copy, language) {
+  if (!favoriteModel || typeof favoriteModel !== 'object') {
+    return '';
+  }
+
+  const modelLabel = formatProviderSettingsModelValue(favoriteModel.name, provider, copy);
+  if (!modelLabel) {
+    return '';
+  }
+
+  const tokenCount = Number.isFinite(favoriteModel.totalTokens) && favoriteModel.totalTokens > 0
+    ? formatTokenCountValue(favoriteModel.totalTokens, language)
+    : '';
+  return tokenCount ? `${modelLabel} · ${tokenCount}` : modelLabel;
+}
+
+function formatClaudeLastActiveValue(lastActive, language) {
+  if (!lastActive || typeof lastActive !== 'object' || !lastActive.date) {
+    return '';
+  }
+
+  const dateLabel = formatProviderStatusDateValue(lastActive.date, language);
+  if (!dateLabel) {
+    return '';
+  }
+
+  const messageCount = Number.isFinite(lastActive.messageCount) && lastActive.messageCount > 0
+    ? `${formatLocalizedNumber(lastActive.messageCount, language)}${language === 'zh' ? ' 条消息' : ' msgs'}`
+    : '';
+
+  return [dateLabel, messageCount].filter(Boolean).join(' · ');
+}
+
+function formatCodexAuthMode(value, language) {
+  const normalizedValue = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!normalizedValue) {
+    return '';
+  }
+
+  if (normalizedValue === 'chatgpt') {
+    return 'ChatGPT';
+  }
+
+  if (['api_key', 'api-key', 'apikey'].includes(normalizedValue)) {
+    return language === 'zh' ? 'API Key' : 'API key';
+  }
+
+  return formatStatusWord(normalizedValue);
+}
+
+function formatCodexPlanType(value) {
+  const normalizedValue = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return normalizedValue ? formatStatusWord(normalizedValue) : '';
+}
+
+function formatStatusWord(value) {
+  return String(value || '')
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function getCodexContextTokenCount(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return 0;
+  }
+
+  const totalTokens = Number.isFinite(usage.totalTokens) ? Math.max(Number(usage.totalTokens), 0) : 0;
+  if (totalTokens > 0) {
+    return totalTokens;
+  }
+
+  const inputTokens = Number.isFinite(usage.inputTokens) ? Math.max(Number(usage.inputTokens), 0) : 0;
+  const outputTokens = Number.isFinite(usage.outputTokens) ? Math.max(Number(usage.outputTokens), 0) : 0;
+  const contextTokens = inputTokens + outputTokens;
+  if (contextTokens > 0) {
+    return contextTokens;
+  }
+  return 0;
+}
+
+function formatCodexTokenUsageValue(usage, language) {
+  const tokenCount = getCodexContextTokenCount(usage);
+  if (!(tokenCount > 0)) {
+    return '';
+  }
+
+  return formatTokenCountValue(tokenCount, language);
+}
+
+function formatUsagePercentValue(value) {
+  if (!Number.isFinite(value)) {
+    return '0%';
+  }
+
+  return `${Math.round(clampNumber(value, 0, 1) * 100)}%`;
+}
+
+function formatCodexRateLimitValue(rateLimit, language) {
+  if (!rateLimit || typeof rateLimit !== 'object' || !Number.isFinite(rateLimit.usedPercent)) {
+    return '';
+  }
+
+  const remainingPercent = Math.round(clampNumber(1 - (Number(rateLimit.usedPercent) / 100), 0, 1) * 100);
+  const resetLabel = formatCodexRateLimitResetValue(rateLimit.resetsAt, language);
+  return resetLabel ? `${remainingPercent}% · ${resetLabel}` : `${remainingPercent}%`;
+}
+
+function formatCodexRateLimitResetValue(value, language) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return '';
+  }
+
+  const parsedDate = new Date(value);
+  if (Number.isNaN(parsedDate.getTime())) {
+    return '';
+  }
+
+  const now = new Date();
+  const isSameDay = parsedDate.getFullYear() === now.getFullYear()
+    && parsedDate.getMonth() === now.getMonth()
+    && parsedDate.getDate() === now.getDate();
+
+  if (isSameDay) {
+    return parsedDate.toLocaleTimeString(getIntlLocale(language), {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
+
+  return parsedDate.toLocaleDateString(getIntlLocale(language), {
+    day: 'numeric',
+    month: language === 'zh' ? 'long' : 'short',
+  });
+}
+
+function formatProviderStatusDuration(value, language) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return '';
+  }
+
+  return language === 'zh' ? `${value} 天` : `${value} days`;
+}
+
+function formatTokenCountValue(value, language, options = {}) {
+  const allowZero = options.allowZero === true;
+  if (!Number.isFinite(value) || value < 0 || (!allowZero && value <= 0)) {
+    return '';
+  }
+
+  return `${formatLocalizedNumber(value, language)} tokens`;
+}
+
+function formatLocalizedNumber(value, language) {
+  return new Intl.NumberFormat(getIntlLocale(language)).format(Number(value) || 0);
+}
+
+function formatProviderStatusUpdatedValue(value, language) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return '';
+  }
+
+  return value.includes('T')
+    ? formatDateTime(value, language)
+    : formatProviderStatusDateValue(value, language);
+}
+
+function formatProviderStatusDateValue(value, language) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return '';
+  }
+
+  const parsedDate = value.includes('T')
+    ? new Date(value)
+    : new Date(`${value}T00:00:00`);
+  if (Number.isNaN(parsedDate.getTime())) {
+    return value;
+  }
+
+  return parsedDate.toLocaleDateString(getIntlLocale(language), {
+    day: '2-digit',
+    month: '2-digit',
+  });
+}
+
+function shouldRenderRunIndicator(session, renderableMessages, isSending, pendingTurn = null) {
   if (!session) {
     return false;
   }
@@ -7941,39 +10180,62 @@ function shouldRenderRunIndicator(session, renderableMessages, isSending) {
   const messages = Array.isArray(renderableMessages) && renderableMessages.length > 0
     ? renderableMessages
     : session.messages;
-  const lastUserIndex = findLastMessageIndex(messages, 'user');
+  const pendingAwareMessages = pendingTurn
+    ? appendPendingTurnMessage(messages, pendingTurn)
+    : messages;
+  const lastUserIndex = findLastOutboundTurnIndex(pendingAwareMessages);
   if (lastUserIndex === -1) {
     return isSending;
   }
 
-  const trailingMessages = messages.slice(lastUserIndex + 1);
-  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasText(message))) {
+  const trailingMessages = pendingAwareMessages.slice(lastUserIndex + 1);
+  const trailingMessage = trailingMessages[trailingMessages.length - 1] || null;
+
+  if (!trailingMessage) {
+    return true;
+  }
+
+  if (trailingMessage.role !== 'assistant') {
+    return true;
+  }
+
+  if (assistantMessageHasPendingApproval(trailingMessage)) {
     return false;
   }
 
-  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasRunningToolActivity(message))) {
+  if (assistantMessageHasRunningToolActivity(trailingMessage)) {
     return false;
   }
 
-  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasToolActivity(message))) {
+  if (trailingMessage.pendingThinking) {
     return false;
   }
 
-  if (trailingMessages.some((message) => message.role === 'assistant' && assistantMessageHasPendingApproval(message))) {
+  if (trailingMessage.streaming && !assistantMessageHasText(trailingMessage)) {
     return false;
   }
 
   return true;
 }
 
-function findLastMessageIndex(messages, role) {
+function findLastOutboundTurnIndex(messages) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === role) {
+    if (isOutboundTurnMessage(messages[index])) {
       return index;
     }
   }
 
   return -1;
+}
+
+function isOutboundTurnMessage(message) {
+  if (message?.role === 'user') {
+    return true;
+  }
+
+  return message?.role === 'event'
+    && message.kind === 'command'
+    && getCommandEventSource(message) === 'slash';
 }
 
 function formatDateTime(value, language) {

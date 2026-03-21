@@ -33,6 +33,8 @@ const COPY = {
     gitChanges: 'Git 变更',
     modified: '修改',
     noFileSelected: '从左侧选择一个文件查看 diff',
+    openFileInEditor: '在编辑器中打开当前文件',
+    openWorkspaceInEditor: '在编辑器中打开工作目录',
     refresh: '刷新',
     refreshing: '刷新中...',
     renamed: '重命名',
@@ -52,6 +54,8 @@ const COPY = {
     gitChanges: 'Git Changes',
     modified: 'Modified',
     noFileSelected: 'Select a file on the left to inspect its diff',
+    openFileInEditor: 'Open current file in editor',
+    openWorkspaceInEditor: 'Open workspace in editor',
     refresh: 'Refresh',
     refreshing: 'Refreshing...',
     renamed: 'Renamed',
@@ -190,6 +194,33 @@ export default function GitDiffWindow({ desktopClient }) {
     }));
   }
 
+  async function openWorkspaceInEditor() {
+    if (!desktopClient || !workspaceId) {
+      return;
+    }
+
+    try {
+      await desktopClient.openWorkspaceInCodeEditor(workspaceId);
+    } catch (nextError) {
+      setError(nextError.message);
+    }
+  }
+
+  async function openSelectedFileInEditor() {
+    if (!desktopClient || !workspaceId || !selectedFile?.path) {
+      return;
+    }
+
+    try {
+      await desktopClient.openGitDiffFileInCodeEditor({
+        path: selectedFile.path,
+        workspaceId,
+      });
+    } catch (nextError) {
+      setError(nextError.message);
+    }
+  }
+
   return (
     <div className="relative flex h-full flex-col overflow-hidden bg-background">
       <ToastViewport items={toastItems} onDismiss={dismissToast} />
@@ -211,6 +242,19 @@ export default function GitDiffWindow({ desktopClient }) {
             <Badge variant="outline" className="h-6 bg-background/80 px-2 text-[10px] text-foreground">
               {copy.changedFiles(summary.filesChanged || 0)}
             </Badge>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => {
+                void openWorkspaceInEditor();
+              }}
+              disabled={!desktopClient || !workspaceId}
+              className="h-8 w-8 rounded-md text-muted-foreground hover:bg-background/80 hover:text-foreground"
+              aria-label={copy.openWorkspaceInEditor}
+              title={copy.openWorkspaceInEditor}
+            >
+              <FolderOpen className="h-3.5 w-3.5" />
+            </Button>
             <Button
               variant="ghost"
               size="icon"
@@ -261,19 +305,34 @@ export default function GitDiffWindow({ desktopClient }) {
           <section className="flex min-w-0 flex-1 flex-col bg-background/30">
             <div className="border-b border-border/70 px-4 py-3">
               {selectedFile ? (
-                <div className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="text-[12px] font-medium text-foreground">
-                      {selectedFile.oldPath ? `${selectedFile.oldPath} -> ${selectedFile.path}` : selectedFile.path}
-                    </p>
-                    <StatusBadge language={language} status={selectedFile.status} />
-                    <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
-                      +{selectedFile.addedLines || 0}
-                    </span>
-                    <span className="text-[11px] font-semibold text-rose-700 dark:text-rose-300">
-                      -{selectedFile.deletedLines || 0}
-                    </span>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-[12px] font-medium text-foreground">
+                        {selectedFile.oldPath ? `${selectedFile.oldPath} -> ${selectedFile.path}` : selectedFile.path}
+                      </p>
+                      <StatusBadge language={language} status={selectedFile.status} />
+                      <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                        +{selectedFile.addedLines || 0}
+                      </span>
+                      <span className="text-[11px] font-semibold text-rose-700 dark:text-rose-300">
+                        -{selectedFile.deletedLines || 0}
+                      </span>
+                    </div>
                   </div>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => {
+                      void openSelectedFileInEditor();
+                    }}
+                    disabled={!desktopClient || !selectedFile?.path}
+                    className="h-8 w-8 shrink-0 rounded-md text-muted-foreground hover:bg-background/80 hover:text-foreground"
+                    aria-label={copy.openFileInEditor}
+                    title={copy.openFileInEditor}
+                  >
+                    <FileSymlink className="h-3.5 w-3.5" />
+                  </Button>
                 </div>
               ) : (
                 <p className="text-[13px] text-muted-foreground">{copy.noFileSelected}</p>

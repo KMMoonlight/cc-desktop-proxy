@@ -13,9 +13,10 @@ const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const DEFAULT_PROVIDER = 'claude';
 const EMPTY_ASSISTANT_TEXT = '（本轮没有收到可展示的文本输出）';
 const EMPTY_TREE_HASH = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 8;
 const SAVE_DEBOUNCE_MS = 160;
 const CLAUDE_CHECK_TTL_MS = 30_000;
+const CODE_EDITOR_CHECK_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
 const WORKSPACE_GIT_INFO_TTL_MS = 10_000;
 const PASTED_ATTACHMENT_DIR_NAME = 'pasted-attachments';
@@ -27,8 +28,157 @@ const SESSION_PERMISSION_MODES = new Set([
   'dontAsk',
   'plan',
 ]);
+const SESSION_REASONING_EFFORTS = new Set([
+  '',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+]);
+const CODEX_SANDBOX_MODES = new Set([
+  'read-only',
+  'workspace-write',
+  'danger-full-access',
+]);
 const SESSION_PROVIDER_KEYS = ['claude', 'codex'];
 const SESSION_PROVIDERS = new Set(SESSION_PROVIDER_KEYS);
+const DEFAULT_CODE_EDITOR_KEY = 'vscode';
+const MAC_APPLICATION_SCAN_DEPTH = 3;
+let codexConfigDefaultsCache = {
+  mtimeMs: -1,
+  parsed: null,
+  path: '',
+};
+const CODE_EDITOR_CANDIDATES = [
+  {
+    commands: ['code'],
+    key: 'vscode',
+    label: 'Visual Studio Code',
+    macCliRelativePath: 'Contents/Resources/app/bin/code',
+    macAppNames: ['Visual Studio Code.app'],
+  },
+  {
+    commands: ['cursor'],
+    key: 'cursor',
+    label: 'Cursor',
+    macCliRelativePath: 'Contents/Resources/app/bin/cursor',
+    macAppNames: ['Cursor.app'],
+  },
+  {
+    commands: ['windsurf'],
+    key: 'windsurf',
+    label: 'Windsurf',
+    macCliRelativePath: 'Contents/Resources/app/bin/windsurf',
+    macAppNames: ['Windsurf.app'],
+  },
+  {
+    commands: ['zed'],
+    key: 'zed',
+    label: 'Zed',
+    macAppNames: ['Zed.app'],
+  },
+  {
+    commands: ['codium'],
+    key: 'vscodium',
+    label: 'VSCodium',
+    macCliRelativePath: 'Contents/Resources/app/bin/codium',
+    macAppNames: ['VSCodium.app'],
+  },
+  {
+    commands: ['code-insiders'],
+    key: 'vscode_insiders',
+    label: 'Visual Studio Code - Insiders',
+    macCliRelativePath: 'Contents/Resources/app/bin/code-insiders',
+    macAppNames: ['Visual Studio Code - Insiders.app'],
+  },
+  {
+    key: 'xcode',
+    label: 'Xcode',
+    macAppNames: ['Xcode.app'],
+  },
+  {
+    key: 'intellij_idea',
+    label: 'IntelliJ IDEA',
+    macAppNames: ['IntelliJ IDEA.app', 'IntelliJ IDEA CE.app'],
+  },
+  {
+    key: 'webstorm',
+    label: 'WebStorm',
+    macAppNames: ['WebStorm.app'],
+  },
+  {
+    key: 'pycharm',
+    label: 'PyCharm',
+    macAppNames: ['PyCharm.app', 'PyCharm CE.app'],
+  },
+  {
+    key: 'goland',
+    label: 'GoLand',
+    macAppNames: ['GoLand.app'],
+  },
+  {
+    key: 'clion',
+    label: 'CLion',
+    macAppNames: ['CLion.app'],
+  },
+  {
+    key: 'rider',
+    label: 'Rider',
+    macAppNames: ['Rider.app'],
+  },
+  {
+    key: 'rubymine',
+    label: 'RubyMine',
+    macAppNames: ['RubyMine.app'],
+  },
+  {
+    key: 'phpstorm',
+    label: 'PhpStorm',
+    macAppNames: ['PhpStorm.app'],
+  },
+  {
+    key: 'android_studio',
+    label: 'Android Studio',
+    macAppNames: ['Android Studio.app'],
+  },
+  {
+    commands: ['nova'],
+    key: 'nova',
+    label: 'Nova',
+    macAppNames: ['Nova.app'],
+  },
+  {
+    commands: ['subl'],
+    key: 'sublime_text',
+    label: 'Sublime Text',
+    macCliRelativePath: 'Contents/SharedSupport/bin/subl',
+    macAppNames: ['Sublime Text.app'],
+  },
+  {
+    commands: ['bbedit'],
+    key: 'bbedit',
+    label: 'BBEdit',
+    macAppNames: ['BBEdit.app'],
+  },
+];
+const CODE_EDITOR_KEY_ALIASES = new Map(
+  CODE_EDITOR_CANDIDATES.flatMap((editor) => ([
+    [editor.key, editor.key],
+    [editor.label.toLowerCase(), editor.key],
+  ])),
+);
+const VS_CODE_LIKE_EDITOR_KEYS = new Set([
+  'cursor',
+  'vscode',
+  'vscode_insiders',
+  'vscodium',
+  'windsurf',
+]);
+const MULTI_TARGET_GOTO_EDITOR_KEYS = new Set([
+  'sublime_text',
+  'zed',
+]);
 
 const workspaceGitInfoCache = new Map();
 let shellPathCache = {
@@ -106,6 +256,7 @@ class ClaudeDesktopRuntime {
       checkedAt: 0,
       executablePath: '',
       models: [],
+      status: null,
       version: '',
     };
     this.codexInfo = {
@@ -113,13 +264,19 @@ class ClaudeDesktopRuntime {
       checkedAt: 0,
       executablePath: '',
       models: [],
+      status: null,
       version: '',
+    };
+    this.codeEditorInfo = {
+      checkedAt: 0,
+      editors: [],
     };
 
     this.store = this.loadStore();
     this.gitDiffWindows = new Map();
     this.windowRuns = new Map();
     this.refreshProviderInfo(true);
+    this.refreshCodeEditors(true);
   }
 
   registerIpc() {
@@ -128,13 +285,18 @@ class ClaudeDesktopRuntime {
     }
 
     ipcMain.handle('desktop:get-app-state', () => this.getAppState());
+    ipcMain.handle('desktop:refresh-provider-status', () => this.getAppState({ forceProviderRefresh: true }));
     ipcMain.handle('desktop:get-git-diff-view-data', (_event, payload) => this.getGitDiffViewData(payload?.workspaceId));
+    ipcMain.handle('desktop:open-git-diff-file-in-code-editor', (_event, payload) => (
+      this.openGitDiffFileInCodeEditor(payload?.workspaceId, payload?.path)
+    ));
     ipcMain.handle('desktop:get-session', (_event, payload) => this.getSession(payload?.workspaceId, payload?.sessionId));
     ipcMain.handle('desktop:open-link', (_event, href) => this.openLink(href));
     ipcMain.handle('desktop:open-git-diff-window', (event, payload) => {
       const browserWindow = BrowserWindow.fromWebContents(event.sender);
       return this.openGitDiffWindow(browserWindow, payload?.workspaceId);
     });
+    ipcMain.handle('desktop:open-workspace-in-code-editor', (_event, workspaceId) => this.openWorkspaceInCodeEditor(workspaceId));
     ipcMain.handle('desktop:open-workspace-in-finder', (_event, workspaceId) => this.openWorkspaceInFinder(workspaceId));
     ipcMain.handle('desktop:prepare-pasted-attachments', (_event, payload) => this.preparePastedAttachments(payload));
     ipcMain.handle('desktop:pick-attachments', (event) => {
@@ -147,7 +309,12 @@ class ClaudeDesktopRuntime {
     });
     ipcMain.handle('desktop:add-workspace', (_event, workspacePath) => this.addWorkspace(workspacePath));
     ipcMain.handle('desktop:archive-session', (_event, payload) => this.archiveSession(payload?.workspaceId, payload?.sessionId));
-    ipcMain.handle('desktop:create-session', (_event, workspaceId) => this.createSession(workspaceId));
+    ipcMain.handle('desktop:create-session', (_event, payload) => (
+      this.createSession(
+        typeof payload === 'string' ? payload : payload?.workspaceId,
+        typeof payload === 'string' ? '' : payload?.preferredProvider,
+      )
+    ));
     ipcMain.handle('desktop:install-skill', (_event, payload) => (
       this.installSkill(payload?.workspaceId, payload?.sessionId, payload?.args)
     ));
@@ -168,11 +335,20 @@ class ClaudeDesktopRuntime {
     ipcMain.handle('desktop:update-session-provider', (_event, payload) => (
       this.updateSessionProvider(payload?.workspaceId, payload?.sessionId, payload?.provider)
     ));
+    ipcMain.handle('desktop:set-code-editor', (_event, payload) => (
+      this.setCodeEditor(payload?.codeEditor)
+    ));
     ipcMain.handle('desktop:set-provider-enabled', (_event, payload) => (
       this.setProviderEnabled(payload?.provider, payload?.enabled)
     ));
+    ipcMain.handle('desktop:set-provider-system-prompt', (_event, payload) => (
+      this.setProviderSystemPrompt(payload?.provider, payload?.systemPrompt)
+    ));
     ipcMain.handle('desktop:update-session-model', (_event, payload) => (
       this.updateSessionModel(payload?.workspaceId, payload?.sessionId, payload?.model)
+    ));
+    ipcMain.handle('desktop:update-session-reasoning-effort', (_event, payload) => (
+      this.updateSessionReasoningEffort(payload?.workspaceId, payload?.sessionId, payload?.reasoningEffort)
     ));
     ipcMain.handle('desktop:update-session-permission-mode', (_event, payload) => (
       this.updateSessionPermissionMode(payload?.workspaceId, payload?.sessionId, payload?.permissionMode)
@@ -181,8 +357,9 @@ class ClaudeDesktopRuntime {
     this.handlersRegistered = true;
   }
 
-  getAppState() {
-    this.refreshProviderInfo();
+  getAppState(options = {}) {
+    this.refreshProviderInfo(options?.forceProviderRefresh === true);
+    this.refreshCodeEditors();
     if (this.reconcileUnlockedSessionProviders()) {
       this.scheduleSave();
     }
@@ -190,12 +367,26 @@ class ClaudeDesktopRuntime {
     const selectedWorkspace = this.getSelectedWorkspace();
     const selectedSession = this.getSelectedSession();
     const activeRunLookup = this.getActiveRunLookup();
-    const hasActiveRun = activeRunLookup.size > 0;
+    const hasActiveRun = Array.from(activeRunLookup.values()).some((runState) => Boolean(runState?.process));
     const selectedWorkspacePath = selectedWorkspace?.path || '';
     const enabledProviders = new Set(this.getEnabledProviders());
+    const codeEditors = this.getAvailableCodeEditors();
+    const selectedCodeEditor = this.getSelectedCodeEditor(codeEditors);
     const providers = {
-      claude: serializeProviderInfo('claude', this.claudeInfo, collectInstalledSkills(selectedWorkspacePath, 'claude'), enabledProviders.has('claude')),
-      codex: serializeProviderInfo('codex', this.codexInfo, collectInstalledSkills(selectedWorkspacePath, 'codex'), enabledProviders.has('codex')),
+      claude: serializeProviderInfo(
+        'claude',
+        this.claudeInfo,
+        collectInstalledSkills(selectedWorkspacePath, 'claude'),
+        enabledProviders.has('claude'),
+        this.getProviderSystemPrompt('claude'),
+      ),
+      codex: serializeProviderInfo(
+        'codex',
+        this.codexInfo,
+        collectInstalledSkills(selectedWorkspacePath, 'codex'),
+        enabledProviders.has('codex'),
+        this.getProviderSystemPrompt('codex'),
+      ),
     };
 
     return {
@@ -203,11 +394,22 @@ class ClaudeDesktopRuntime {
         ...providers.claude,
         busy: hasActiveRun,
       },
+      appInfo: {
+        arch: process.arch || '',
+        chromeVersion: process.versions?.chrome || '',
+        electronVersion: process.versions?.electron || '',
+        name: app.getName(),
+        nodeVersion: process.versions?.node || '',
+        userDataPath: app.getPath('userData'),
+        version: app.getVersion(),
+      },
+      codeEditors,
       defaultProvider: this.getDefaultProvider(),
       expandedWorkspaceIds: this.store.expandedWorkspaceIds,
       paneLayout: this.store.paneLayout,
       platform: process.platform,
       providers,
+      selectedCodeEditor,
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
       workspaces: this.store.workspaces.map((workspace) => (
@@ -300,14 +502,28 @@ class ClaudeDesktopRuntime {
       return { ok: false };
     }
 
-    const localPath = resolveLinkToLocalPath(href);
-    if (localPath) {
-      const errorMessage = await shell.openPath(localPath);
-      if (errorMessage) {
-        throw new Error(errorMessage);
+    const localTarget = resolveLocalLinkTarget(href);
+    if (localTarget?.path) {
+      const localPathStats = getPathStats(localTarget.path);
+      if (!localPathStats) {
+        throw new Error('找不到链接对应的本地路径。');
       }
 
-      return { ok: true, target: 'path' };
+      const selectedCodeEditor = this.getSelectedCodeEditorInfo({ forceRefresh: true });
+      if (!selectedCodeEditor?.path) {
+        throw new Error('当前没有可用的代码编辑器。');
+      }
+
+      openPathInCodeEditor(selectedCodeEditor, localTarget.path, {
+        column: localTarget.column,
+        line: localTarget.line,
+        workspacePath: this.getCodeEditorWorkspacePath(localTarget.path),
+      });
+      return {
+        codeEditor: selectedCodeEditor.key,
+        ok: true,
+        target: 'editor',
+      };
     }
 
     await shell.openExternal(href);
@@ -337,6 +553,66 @@ class ClaudeDesktopRuntime {
     }
 
     return { ok: true };
+  }
+
+  async openWorkspaceInCodeEditor(workspaceId) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    this.assertDirectory(workspace.path);
+    const selectedCodeEditor = this.getSelectedCodeEditorInfo({ forceRefresh: true });
+    if (!selectedCodeEditor?.path) {
+      throw new Error('当前没有可用的代码编辑器。');
+    }
+
+    openPathInCodeEditor(selectedCodeEditor, workspace.path, {
+      workspacePath: workspace.path,
+    });
+    return {
+      codeEditor: selectedCodeEditor.key,
+      ok: true,
+    };
+  }
+
+  async openGitDiffFileInCodeEditor(workspaceId, relativeFilePath) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const gitInfo = getWorkspaceGitInfo(workspace.path);
+    if (!gitInfo?.root) {
+      throw new Error('当前工作目录不是 Git 仓库。');
+    }
+
+    const normalizedRelativeFilePath = typeof relativeFilePath === 'string'
+      ? relativeFilePath.trim().replace(/^[/\\]+/, '')
+      : '';
+    if (!normalizedRelativeFilePath) {
+      throw new Error('缺少要打开的文件路径。');
+    }
+
+    const targetPath = path.join(gitInfo.root, normalizedRelativeFilePath);
+    const targetStats = getPathStats(targetPath);
+    if (!targetStats?.isFile()) {
+      throw new Error('当前文件在工作目录中不存在，可能已被删除。');
+    }
+
+    const selectedCodeEditor = this.getSelectedCodeEditorInfo({ forceRefresh: true });
+    if (!selectedCodeEditor?.path) {
+      throw new Error('当前没有可用的代码编辑器。');
+    }
+
+    openPathInCodeEditor(selectedCodeEditor, targetPath, {
+      workspacePath: gitInfo.root,
+    });
+
+    return {
+      codeEditor: selectedCodeEditor.key,
+      ok: true,
+    };
   }
 
   getSession(workspaceId, sessionId) {
@@ -443,14 +719,14 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
-  createSession(workspaceId) {
+  createSession(workspaceId, preferredProvider = '') {
     const workspace = this.findWorkspace(workspaceId);
     if (!workspace) {
       throw new Error('找不到对应的工作目录。');
     }
 
     const now = new Date().toISOString();
-    const session = createWorkspaceSession(now, this.getDefaultProvider());
+    const session = createWorkspaceSession(now, this.getPreferredProvider(preferredProvider));
 
     workspace.sessions.unshift(session);
     this.touchWorkspace(workspace, now);
@@ -588,6 +864,29 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  updateSessionReasoningEffort(workspaceId, sessionId, reasoningEffort) {
+    const workspace = this.findWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error('找不到对应的工作目录。');
+    }
+
+    const session = workspace.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+      throw new Error('找不到对应的历史对话。');
+    }
+
+    const now = new Date().toISOString();
+
+    session.reasoningEffort = normalizeSessionReasoningEffort(reasoningEffort);
+    session.updatedAt = now;
+    this.touchWorkspace(workspace, now);
+    this.store.selectedWorkspaceId = workspace.id;
+    this.store.selectedSessionId = session.id;
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
   updateSessionProvider(workspaceId, sessionId, provider) {
     const workspace = this.findWorkspace(workspaceId);
     if (!workspace) {
@@ -625,8 +924,10 @@ class ClaudeDesktopRuntime {
     const previousProvider = normalizeSessionProvider(session.provider);
     session.provider = nextProvider;
     session.claudeSessionId = null;
+    session.codexPlanModeActive = false;
     session.currentModel = '';
     session.model = '';
+    session.reasoningEffort = '';
     session.permissionMode = nextProvider === 'claude' ? session.permissionMode : 'default';
     session.updatedAt = now;
     this.touchWorkspace(workspace, now);
@@ -635,6 +936,7 @@ class ClaudeDesktopRuntime {
 
     if (session.messages.length > 0) {
       this.appendEventMessage(workspace, session, {
+        commandSource: 'system',
         kind: 'command',
         status: 'info',
         title: `切换到 ${getProviderLabel(nextProvider)}`,
@@ -675,6 +977,10 @@ class ClaudeDesktopRuntime {
     return normalizeSessionProvider(provider) === 'codex' ? this.codexInfo : this.claudeInfo;
   }
 
+  getProviderSystemPrompt(provider) {
+    return getProviderSystemPromptValue(this.store.providerSystemPrompts, provider);
+  }
+
   getEnabledProviders() {
     return normalizeEnabledProviders(this.store.enabledProviders);
   }
@@ -693,8 +999,29 @@ class ClaudeDesktopRuntime {
   }
 
   getDefaultProvider() {
+    return this.getPreferredProvider();
+  }
+
+  getPreferredProvider(preferredProvider = '') {
+    const requestedProvider = typeof preferredProvider === 'string'
+      ? preferredProvider.trim().toLowerCase()
+      : '';
     const enabledProviders = this.getEnabledProviders();
     const availableEnabledProviders = enabledProviders.filter((provider) => this.getProviderInfo(provider).available);
+
+    if (SESSION_PROVIDERS.has(requestedProvider)) {
+      if (availableEnabledProviders.includes(requestedProvider)) {
+        return requestedProvider;
+      }
+
+      if (availableEnabledProviders.length > 0) {
+        return availableEnabledProviders[0];
+      }
+
+      if (enabledProviders.includes(requestedProvider)) {
+        return requestedProvider;
+      }
+    }
 
     if (availableEnabledProviders.length > 0) {
       return availableEnabledProviders[0];
@@ -731,8 +1058,10 @@ class ClaudeDesktopRuntime {
         const now = new Date().toISOString();
         session.provider = nextDefaultProvider;
         session.claudeSessionId = null;
+        session.codexPlanModeActive = false;
         session.currentModel = '';
         session.model = '';
+        session.reasoningEffort = '';
         session.permissionMode = nextDefaultProvider === 'claude'
           ? normalizeSessionPermissionMode(session.permissionMode)
           : 'default';
@@ -774,6 +1103,38 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  setProviderSystemPrompt(provider, systemPrompt) {
+    const nextProvider = normalizeSessionProvider(provider);
+    const nextSystemPrompt = normalizeProviderSystemPrompt(systemPrompt);
+    const currentSystemPrompts = normalizeProviderSystemPrompts(this.store.providerSystemPrompts);
+
+    if (currentSystemPrompts[nextProvider] === nextSystemPrompt) {
+      return this.getAppState();
+    }
+
+    this.store.providerSystemPrompts = {
+      ...currentSystemPrompts,
+      [nextProvider]: nextSystemPrompt,
+    };
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
+  setCodeEditor(codeEditor) {
+    this.refreshCodeEditors(true);
+
+    const nextCodeEditor = resolveSelectedCodeEditorKey(codeEditor, this.getAvailableCodeEditors());
+    if (nextCodeEditor === this.store.codeEditor) {
+      return this.getAppState();
+    }
+
+    this.store.codeEditor = nextCodeEditor;
+    this.scheduleSave();
+
+    return this.getAppState();
+  }
+
   runMcpCommand(workspaceId, sessionId, rawArgs) {
     const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
     const provider = this.assertProviderEnabled(session.provider);
@@ -796,6 +1157,7 @@ class ClaudeDesktopRuntime {
 
     const content = [result.stdout, result.stderr].filter(Boolean).join('\n').trim() || '命令已执行，但没有返回内容。';
     this.appendEventMessage(workspace, session, {
+      commandSource: 'slash',
       kind: 'command',
       status: result.status === 0 ? 'info' : 'error',
       title: `/mcp ${args.join(' ')}`,
@@ -819,6 +1181,7 @@ class ClaudeDesktopRuntime {
       : '当前没有发现可用的本地 skills。';
 
     this.appendEventMessage(workspace, session, {
+      commandSource: 'slash',
       kind: 'command',
       status: 'info',
       title: '/skills list',
@@ -870,6 +1233,7 @@ class ClaudeDesktopRuntime {
     fs.cpSync(sourcePath, targetPath, { recursive: true, errorOnExist: true, force: false });
 
     this.appendEventMessage(workspace, session, {
+      commandSource: 'slash',
       kind: 'command',
       status: 'completed',
       title: '/skills install',
@@ -895,6 +1259,7 @@ class ClaudeDesktopRuntime {
     const attachments = normalizeMessageAttachments(payload?.attachments, { verifyExists: true });
     const provider = this.assertProviderEnabled(session.provider || this.getDefaultProvider());
     const providerLabel = getProviderLabel(provider);
+    const providerSystemPrompt = this.getProviderSystemPrompt(provider);
     const providerPrompt = buildPromptWithAttachments(prompt, attachments);
     if (!providerPrompt) {
       throw new Error('消息内容不能为空。');
@@ -917,41 +1282,123 @@ class ClaudeDesktopRuntime {
     if (existingRun) {
       throw new Error(`当前已有正在运行的 ${providerLabel} 任务，请等待完成或先停止。`);
     }
-    const runState = this.getRunState(webContents.id, workspace.id, session.id);
 
     this.assertDirectory(workspace.path);
 
     this.store.selectedWorkspaceId = workspace.id;
     this.store.selectedSessionId = session.id;
 
-    const now = new Date().toISOString();
-    const userMessage = displayKind === 'command'
-      ? createEventMessage({
-        content: '',
-        createdAt: now,
-        kind: 'command',
-        role: 'event',
-        status: 'info',
-        title: displayTitle,
-      })
-      : createStoredMessage({
+    const autoApprovedCodexSandboxMode = getAutoApprovedCodexSandboxMode(workspace, session) || undefined;
+    if (
+      provider === 'codex'
+      && shouldQueueCodexWriteApproval(session)
+      && !autoApprovedCodexSandboxMode
+      && resolveCodexSandboxMode(session.permissionMode, autoApprovedCodexSandboxMode) === 'read-only'
+      && promptLikelyNeedsCodexWorkspaceWrite(prompt, displayPrompt, displayKind)
+    ) {
+      const runState = this.getRunState(webContents.id, workspace.id, session.id);
+      this.enqueueCodexWriteApproval(webContents, workspace, session, runState, {
         attachments,
-        content: displayPrompt,
-        createdAt: now,
-        role: 'user',
+        displayKind,
+        displayPrompt,
+        displayTitle,
+        prompt,
       });
-    runState.assistantMessageId = null;
-    runState.currentAssistantText = '';
-    runState.hasStreamedAssistantText = false;
-    runState.stderrBuffer = '';
-    runState.seenToolResultIds.clear();
-    runState.seenToolUseIds.clear();
-    runState.toolUses.clear();
-    runState.resultIsError = false;
-    runState.resultReceived = false;
-    runState.provider = provider;
-    runState.sessionId = session.id;
-    runState.workspaceId = workspace.id;
+      return this.getAppState();
+    }
+
+    return this.startSessionRun(webContents, workspace, session, {
+      attachments,
+      codexSandboxMode: autoApprovedCodexSandboxMode,
+      displayKind,
+      displayPrompt,
+      displayTitle,
+      prompt,
+    });
+  }
+
+  enqueueCodexWriteApproval(webContents, workspace, session, runState, options) {
+    const attachments = normalizeMessageAttachments(options?.attachments, { verifyExists: true });
+    const displayPrompt = typeof options?.displayPrompt === 'string' ? options.displayPrompt.trim() : '';
+    const displayKind = typeof options?.displayKind === 'string' ? options.displayKind.trim() : '';
+    const displayTitle = typeof options?.displayTitle === 'string' ? options.displayTitle.trim() : '';
+    const now = typeof options?.pendingApproval?.createdAt === 'string' && options.pendingApproval.createdAt
+      ? options.pendingApproval.createdAt
+      : new Date().toISOString();
+    const userMessage = createOutboundUserMessage({
+      attachments,
+      displayKind,
+      displayPrompt,
+      displayTitle,
+      now,
+    });
+    const pendingApproval = options?.pendingApproval && typeof options.pendingApproval === 'object'
+      ? options.pendingApproval
+      : createCodexWritePendingApproval(workspace, {
+        attachments,
+        displayKind,
+        displayPrompt,
+        displayTitle,
+        now,
+        prompt: typeof options?.prompt === 'string' ? options.prompt.trim() : '',
+      });
+
+    resetRunStateForExecution(runState, 'codex', workspace.id, session.id);
+    runState.pendingApprovalRequests.set(pendingApproval.requestId, pendingApproval);
+
+    session.messages.push(userMessage);
+    session.updatedAt = now;
+    session.model = session.model || '';
+
+    if (shouldRefreshSessionTitle(session, userMessage, displayPrompt, attachments)) {
+      session.title = createSessionTitleFromPrompt(displayPrompt || formatAttachmentTitle(attachments));
+    }
+
+    this.touchWorkspace(workspace, now);
+    this.scheduleSave();
+    this.emitState(webContents);
+    return { ok: true };
+  }
+
+  startSessionRun(webContents, workspace, session, options = {}) {
+    const attachments = normalizeMessageAttachments(options.attachments, { verifyExists: true });
+    const prompt = typeof options.prompt === 'string' ? options.prompt.trim() : '';
+    const provider = this.assertProviderEnabled(session.provider || this.getDefaultProvider());
+    const providerLabel = getProviderLabel(provider);
+    const providerSystemPrompt = this.getProviderSystemPrompt(provider);
+    const providerPrompt = buildPromptWithAttachments(prompt, attachments);
+    if (!providerPrompt) {
+      throw new Error('消息内容不能为空。');
+    }
+
+    const displayPrompt = typeof options.displayPrompt === 'string' && options.displayPrompt.trim()
+      ? options.displayPrompt.trim()
+      : prompt;
+    const displayKind = typeof options.displayKind === 'string' ? options.displayKind.trim() : '';
+    const displayTitle = typeof options.displayTitle === 'string' && options.displayTitle.trim()
+      ? options.displayTitle.trim()
+      : displayPrompt;
+    const appendUserMessage = options.appendUserMessage !== false;
+    const now = new Date().toISOString();
+
+    this.refreshProviderInfo(true);
+    const providerInfo = this.getProviderInfo(provider);
+    if (!providerInfo.available) {
+      throw new Error(`未检测到可用的 ${providerLabel} CLI。`);
+    }
+
+    const runState = this.getRunState(webContents.id, workspace.id, session.id);
+    const userMessage = appendUserMessage
+      ? createOutboundUserMessage({
+        attachments,
+        displayKind,
+        displayPrompt,
+        displayTitle,
+        now,
+      })
+      : null;
+
+    resetRunStateForExecution(runState, provider, workspace.id, session.id);
     runState.runToken = randomUUID();
     const runToken = runState.runToken;
 
@@ -962,12 +1409,19 @@ class ClaudeDesktopRuntime {
       throw new Error(`未检测到可用的 ${providerLabel} CLI。`);
     }
 
+    const codexTurn = provider === 'codex'
+      ? buildCodexTurnRequest(session, providerPrompt)
+      : { prompt: providerPrompt, targetPlanModeActive: null };
+
     const args = provider === 'codex'
       ? buildCodexExecArgs({
         attachments,
+        developerInstructions: providerSystemPrompt,
+        sandboxMode: resolveCodexSandboxMode(session.permissionMode, options.codexSandboxMode),
         extraAttachmentDirs,
         model: session.model,
-        prompt: providerPrompt,
+        prompt: codexTurn.prompt,
+        reasoningEffort: session.reasoningEffort,
         sessionId: session.claudeSessionId,
       })
       : buildClaudeExecArgs({
@@ -975,23 +1429,41 @@ class ClaudeDesktopRuntime {
         model: session.model,
         permissionMode: session.permissionMode,
         sessionId: session.claudeSessionId,
+        systemPrompt: providerSystemPrompt,
       });
 
     const proc = spawn(executablePath, args, {
       cwd: workspace.path,
       env: cliEnv,
     });
+    const codexSandboxMode = provider === 'codex'
+      ? resolveCodexSandboxMode(session.permissionMode, options.codexSandboxMode)
+      : '';
 
-    session.messages.push(userMessage);
+    if (userMessage) {
+      session.messages.push(userMessage);
+    }
     session.status = 'running';
     session.updatedAt = now;
     session.model = session.model || '';
 
-    if (isDefaultSessionTitle(session.title) && countInputMessages(session.messages) === 1) {
+    if (shouldRefreshSessionTitle(session, userMessage, displayPrompt, attachments)) {
       session.title = createSessionTitleFromPrompt(displayPrompt || formatAttachmentTitle(attachments));
     }
 
     runState.process = proc;
+    runState.responseStartIndex = session.messages.length;
+    runState.codexApprovalPayload = shouldQueueCodexWriteApproval(session)
+      ? {
+        prompt: typeof options.approvalPrompt === 'string' ? options.approvalPrompt.trim() : prompt,
+        attachments,
+        displayKind,
+        displayPrompt,
+        displayTitle,
+      }
+      : null;
+    runState.codexSandboxMode = codexSandboxMode;
+    runState.targetCodexPlanModeActive = codexTurn.targetPlanModeActive;
     this.touchWorkspace(workspace, now);
     this.scheduleSave();
     this.emitState(webContents);
@@ -1039,6 +1511,7 @@ class ClaudeDesktopRuntime {
       }
 
       const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
+      let postRunApproval = null;
       if (sessionRef) {
         finalizeRunningToolMessages(sessionRef.session, code === 0 ? 'completed' : 'error');
         let assistant = this.getAssistantMessage(sessionRef.session, runState);
@@ -1054,7 +1527,12 @@ class ClaudeDesktopRuntime {
           assistant.error = code !== 0 && !hadContent;
         }
 
-        if (code !== 0 && !hasRecentErrorEvent(sessionRef.session)) {
+        postRunApproval = maybeCreateCodexEscalationApproval(sessionRef.workspace, sessionRef.session, runState, assistant);
+        if (postRunApproval && assistant) {
+          assistant.error = false;
+        }
+
+        if (code !== 0 && !postRunApproval && !hasRecentErrorEvent(sessionRef.session)) {
           this.appendEventMessage(sessionRef.workspace, sessionRef.session, {
             kind: 'error',
             status: 'error',
@@ -1063,11 +1541,32 @@ class ClaudeDesktopRuntime {
           });
         }
 
-        sessionRef.session.status = runState.resultReceived
-          ? (runState.resultIsError ? 'error' : 'idle')
-          : (code === 0 ? 'idle' : 'error');
+        if (
+          normalizeSessionProvider(runState.provider || sessionRef.session.provider) === 'codex'
+          && code === 0
+          && !runState.resultIsError
+          && typeof runState.targetCodexPlanModeActive === 'boolean'
+        ) {
+          sessionRef.session.codexPlanModeActive = runState.targetCodexPlanModeActive;
+        }
+
+        sessionRef.session.status = postRunApproval
+          ? 'idle'
+          : (
+            runState.resultReceived
+              ? (runState.resultIsError ? 'error' : 'idle')
+              : (code === 0 ? 'idle' : 'error')
+          );
         sessionRef.session.updatedAt = new Date().toISOString();
         this.touchWorkspace(sessionRef.workspace, sessionRef.session.updatedAt);
+      }
+
+      if (postRunApproval) {
+        rewindSessionMessagesForPendingApproval(sessionRef.session, runState);
+        prepareRunStateForPendingApproval(runState, postRunApproval);
+        this.scheduleSave();
+        this.emitState(webContents);
+        return;
       }
 
       this.resetRunState(runState);
@@ -1121,17 +1620,6 @@ class ClaudeDesktopRuntime {
   respondToApproval(webContents, payload) {
     const requestId = typeof payload?.requestId === 'string' ? payload.requestId.trim() : '';
     const decision = typeof payload?.decision === 'string' ? payload.decision.trim().toLowerCase() : '';
-    const runState = this.findRunStateByApprovalRequest(
-      webContents.id,
-      requestId,
-      payload?.workspaceId,
-      payload?.sessionId,
-    );
-
-    if (!runState?.process) {
-      throw new Error('当前没有正在运行的任务。');
-    }
-
     if (!requestId) {
       throw new Error('缺少审批请求 ID。');
     }
@@ -1140,9 +1628,55 @@ class ClaudeDesktopRuntime {
       throw new Error('无效的审批结果。');
     }
 
+    const runState = this.findRunStateByApprovalRequest(
+      webContents.id,
+      requestId,
+      payload?.workspaceId,
+      payload?.sessionId,
+    );
+    if (!runState) {
+      throw new Error('当前没有正在运行的任务。');
+    }
+
     const pendingApproval = runState.pendingApprovalRequests.get(requestId);
     if (!pendingApproval) {
       throw new Error('找不到对应的审批请求。');
+    }
+
+    if (!runState.process) {
+      if (!isQueuedCodexWriteApproval(pendingApproval)) {
+        throw new Error('当前没有正在运行的任务。');
+      }
+
+      const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
+      if (!sessionRef) {
+        throw new Error('找不到对应的历史对话。');
+      }
+
+      runState.pendingApprovalRequests.delete(requestId);
+      if (decision === 'allow_always') {
+        addWorkspaceApprovalRule(sessionRef.workspace, createApprovalRuleFromPendingApproval(pendingApproval));
+        this.touchWorkspace(sessionRef.workspace);
+        this.scheduleSave();
+      }
+      if (decision === 'deny') {
+        this.resetRunState(runState);
+        this.deleteRunState(webContents.id, sessionRef.workspace.id, sessionRef.session.id);
+        this.scheduleSave();
+        this.emitState(webContents);
+        return this.getAppState();
+      }
+
+      const queuedApprovalOptions = getQueuedCodexWriteApprovalOptions(pendingApproval);
+      const approvedSandboxMode = getQueuedCodexApprovalSandboxMode(pendingApproval) || 'workspace-write';
+      this.startSessionRun(webContents, sessionRef.workspace, sessionRef.session, {
+        ...queuedApprovalOptions,
+        approvalPrompt: queuedApprovalOptions?.prompt || '',
+        appendUserMessage: false,
+        codexSandboxMode: approvedSandboxMode,
+        prompt: buildCodexApprovedPrompt(queuedApprovalOptions?.prompt || '', approvedSandboxMode),
+      });
+      return this.getAppState();
     }
 
     if (decision === 'allow_always') {
@@ -1364,12 +1898,15 @@ class ClaudeDesktopRuntime {
       session.status = 'error';
       session.updatedAt = now;
       this.touchWorkspace(workspace, now);
-      this.appendEventMessage(workspace, session, {
-        kind: 'error',
-        status: 'error',
-        title: 'Codex 返回错误',
-        content: formatCodexTurnFailure(event, runState.stderrBuffer),
-      });
+      const failureContent = formatCodexTurnFailure(event, runState.stderrBuffer);
+      if (!looksLikeCodexPermissionDenied(failureContent, runState.codexSandboxMode)) {
+        this.appendEventMessage(workspace, session, {
+          kind: 'error',
+          status: 'error',
+          title: 'Codex 返回错误',
+          content: failureContent,
+        });
+      }
       return;
     }
 
@@ -1378,12 +1915,15 @@ class ClaudeDesktopRuntime {
       session.status = 'error';
       session.updatedAt = now;
       this.touchWorkspace(workspace, now);
-      this.appendEventMessage(workspace, session, {
-        kind: 'error',
-        status: 'error',
-        title: 'Codex 返回错误',
-        content: formatCodexTurnFailure(event, runState.stderrBuffer),
-      });
+      const failureContent = formatCodexTurnFailure(event, runState.stderrBuffer);
+      if (!looksLikeCodexPermissionDenied(failureContent, runState.codexSandboxMode)) {
+        this.appendEventMessage(workspace, session, {
+          kind: 'error',
+          status: 'error',
+          title: 'Codex 返回错误',
+          content: failureContent,
+        });
+      }
       return;
     }
 
@@ -1432,6 +1972,7 @@ class ClaudeDesktopRuntime {
     this.finalizeAssistantSegment(session, runState);
 
     this.appendEventMessage(workspace, session, {
+      commandSource: itemSummary.commandSource || '',
       kind: itemSummary.kind,
       status: 'running',
       title: itemSummary.runningTitle,
@@ -1463,6 +2004,7 @@ class ClaudeDesktopRuntime {
       const updated = this.refreshCodexItemMessage(session, itemSummary.toolUseId, itemSummary, nextStatus);
       if (!updated) {
         this.appendEventMessage(workspace, session, {
+          commandSource: itemSummary.commandSource || '',
           kind: itemSummary.kind,
           status: nextStatus,
           title: nextStatus === 'error' ? itemSummary.errorTitle : itemSummary.completedTitle,
@@ -1479,6 +2021,7 @@ class ClaudeDesktopRuntime {
     }
 
     this.appendEventMessage(workspace, session, {
+      commandSource: itemSummary.commandSource || '',
       kind: itemSummary.kind,
       status: nextStatus,
       title: nextStatus === 'error' ? itemSummary.errorTitle : itemSummary.completedTitle,
@@ -1502,6 +2045,7 @@ class ClaudeDesktopRuntime {
       }
 
       message.kind = itemSummary.kind;
+      message.commandSource = itemSummary.commandSource || '';
       message.status = status;
       message.title = status === 'error' ? itemSummary.errorTitle : (status === 'running' ? itemSummary.runningTitle : itemSummary.completedTitle);
       message.content = status === 'running'
@@ -1801,12 +2345,14 @@ class ClaudeDesktopRuntime {
   appendEventMessage(workspace, session, partial) {
     const now = partial.createdAt || new Date().toISOString();
     const lastMessage = session.messages[session.messages.length - 1];
+    const partialCommandSource = inferCommandEventSource(partial);
 
     if (
       !partial.toolUseId &&
       lastMessage &&
       lastMessage.role === 'event' &&
       lastMessage.kind === partial.kind &&
+      inferCommandEventSource(lastMessage) === partialCommandSource &&
       lastMessage.status === partial.status &&
       lastMessage.title === partial.title &&
       partial.status === 'running'
@@ -1814,7 +2360,11 @@ class ClaudeDesktopRuntime {
       lastMessage.content = partial.content;
       lastMessage.createdAt = now;
     } else {
-      session.messages.push(createEventMessage({ ...partial, createdAt: now }));
+      session.messages.push(createEventMessage({
+        ...partial,
+        ...(partialCommandSource ? { commandSource: partialCommandSource } : {}),
+        createdAt: now,
+      }));
     }
 
     session.updatedAt = now;
@@ -1884,7 +2434,7 @@ class ClaudeDesktopRuntime {
 
     for (const windowRuns of this.windowRuns.values()) {
       for (const runState of windowRuns.values()) {
-        if (runState.process) {
+        if (runState.process || runState.pendingApprovalRequests.size > 0) {
           activeRuns.push(runState);
         }
       }
@@ -1915,14 +2465,18 @@ class ClaudeDesktopRuntime {
     }
 
     runState.assistantMessageId = null;
+    runState.codexApprovalPayload = null;
+    runState.codexSandboxMode = '';
     runState.currentAssistantText = '';
     runState.hasStreamedAssistantText = false;
     runState.process = null;
     runState.provider = DEFAULT_PROVIDER;
+    runState.responseStartIndex = 0;
     runState.runToken = null;
     runState.sessionId = null;
     runState.workspaceId = null;
     runState.stderrBuffer = '';
+    runState.targetCodexPlanModeActive = null;
     runState.seenToolResultIds.clear();
     runState.seenToolUseIds.clear();
     runState.toolUses.clear();
@@ -2005,7 +2559,9 @@ class ClaudeDesktopRuntime {
   refreshProviderInfo(force = false) {
     const cliEnv = getCliProcessEnv(force);
     this.claudeInfo = inspectProvider('claude', cliEnv, force, this.claudeInfo);
-    this.codexInfo = inspectProvider('codex', cliEnv, force, this.codexInfo);
+    this.codexInfo = inspectProvider('codex', cliEnv, force, this.codexInfo, {
+      refreshStatusOnly: !force && this.hasActiveProviderRun('codex'),
+    });
 
     return {
       claude: this.claudeInfo,
@@ -2013,11 +2569,84 @@ class ClaudeDesktopRuntime {
     };
   }
 
+  hasActiveProviderRun(provider) {
+    const normalizedProvider = normalizeSessionProvider(provider);
+    return this.getActiveRunStates().some((runState) => (
+      Boolean(runState?.process)
+      && normalizeSessionProvider(runState.provider) === normalizedProvider
+    ));
+  }
+
+  refreshCodeEditors(force = false) {
+    const now = Date.now();
+    if (!force && now - this.codeEditorInfo.checkedAt < CODE_EDITOR_CHECK_TTL_MS) {
+      return this.codeEditorInfo.editors;
+    }
+
+    this.codeEditorInfo = {
+      checkedAt: now,
+      editors: inspectCodeEditors(process.platform),
+    };
+
+    return this.codeEditorInfo.editors;
+  }
+
+  getAvailableCodeEditors() {
+    return Array.isArray(this.codeEditorInfo.editors)
+      ? this.codeEditorInfo.editors.slice()
+      : [];
+  }
+
+  getSelectedCodeEditor(availableEditors = this.getAvailableCodeEditors()) {
+    const nextCodeEditor = resolveSelectedCodeEditorKey(this.store.codeEditor, availableEditors);
+    if (nextCodeEditor !== this.store.codeEditor) {
+      this.store.codeEditor = nextCodeEditor;
+      this.scheduleSave();
+    }
+
+    return nextCodeEditor;
+  }
+
+  getSelectedCodeEditorInfo({ forceRefresh = false } = {}) {
+    if (forceRefresh) {
+      this.refreshCodeEditors(true);
+    }
+
+    const availableEditors = this.getAvailableCodeEditors();
+    const selectedCodeEditorKey = this.getSelectedCodeEditor(availableEditors);
+    return availableEditors.find((editor) => editor.key === selectedCodeEditorKey) || null;
+  }
+
+  getCodeEditorWorkspacePath(targetPath) {
+    const normalizedTargetPath = typeof targetPath === 'string' ? targetPath.trim() : '';
+    if (!normalizedTargetPath) {
+      return '';
+    }
+
+    const targetStats = getPathStats(normalizedTargetPath);
+    if (!targetStats) {
+      return '';
+    }
+
+    if (targetStats.isDirectory()) {
+      return normalizedTargetPath;
+    }
+
+    const matchingWorkspace = this.store.workspaces
+      .filter((workspace) => workspace?.path && directoryExists(workspace.path))
+      .filter((workspace) => isPathWithin(workspace.path, normalizedTargetPath))
+      .sort((left, right) => right.path.length - left.path.length)[0];
+
+    return matchingWorkspace?.path || path.dirname(normalizedTargetPath);
+  }
+
   loadStore() {
     const emptyStore = {
+      codeEditor: '',
       enabledProviders: SESSION_PROVIDER_KEYS.slice(),
       expandedWorkspaceIds: [],
       paneLayout: null,
+      providerSystemPrompts: normalizeProviderSystemPrompts(),
       schemaVersion: SCHEMA_VERSION,
       selectedSessionId: null,
       selectedWorkspaceId: null,
@@ -2045,9 +2674,11 @@ class ClaudeDesktopRuntime {
         };
 
         return {
+          codeEditor: '',
           enabledProviders: SESSION_PROVIDER_KEYS.slice(),
           expandedWorkspaceIds: [migratedWorkspace.id],
           paneLayout: null,
+          providerSystemPrompts: normalizeProviderSystemPrompts(),
           schemaVersion: SCHEMA_VERSION,
           selectedSessionId: null,
           selectedWorkspaceId: migratedWorkspace.id,
@@ -2080,9 +2711,11 @@ class ClaudeDesktopRuntime {
         : [];
 
       return {
+        codeEditor: normalizeCodeEditorKey(parsed.codeEditor),
         enabledProviders: normalizeEnabledProviders(parsed.enabledProviders),
         expandedWorkspaceIds,
         paneLayout: normalizePaneLayoutState(parsed.paneLayout),
+        providerSystemPrompts: normalizeProviderSystemPrompts(parsed.providerSystemPrompts),
         schemaVersion: SCHEMA_VERSION,
         selectedSessionId,
         selectedWorkspaceId,
@@ -2106,9 +2739,11 @@ class ClaudeDesktopRuntime {
     this.saveTimer = null;
 
     const payload = {
+      codeEditor: this.getSelectedCodeEditor(),
       enabledProviders: this.getEnabledProviders(),
       expandedWorkspaceIds: this.store.expandedWorkspaceIds,
       paneLayout: normalizePaneLayoutState(this.store.paneLayout),
+      providerSystemPrompts: normalizeProviderSystemPrompts(this.store.providerSystemPrompts),
       schemaVersion: SCHEMA_VERSION,
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
@@ -2180,12 +2815,14 @@ function normalizeSession(session) {
   return {
     archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId || null,
+    codexPlanModeActive: provider === 'codex' ? Boolean(session.codexPlanModeActive) : false,
     currentModel: session.currentModel || session.model || '',
     createdAt,
     id: session.id || randomUUID(),
     messages: normalizeStaleRunningEventMessages(normalizedMessages),
     model: session.model || '',
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    reasoningEffort: normalizeSessionReasoningEffort(session.reasoningEffort),
     provider,
     status: normalizedStatus,
     title: session.title || `新对话 ${formatShortTime(createdAt)}`,
@@ -2267,23 +2904,57 @@ function normalizeWorkspaceApprovalRule(rule) {
   }
 
   const kind = typeof rule.kind === 'string' ? rule.kind.trim() : '';
-  if (kind !== 'command') {
-    return null;
+  if (kind === 'command') {
+    const command = normalizeApprovalCommand(getToolInputString(rule.input, ['command', 'cmd']) || rule.command);
+    if (!command) {
+      return null;
+    }
+
+    return {
+      command,
+      createdAt: rule.createdAt || new Date().toISOString(),
+      input: rule.input && typeof rule.input === 'object' ? rule.input : { command },
+      key: `command:${command}`,
+      kind: 'command',
+      toolName: typeof rule.toolName === 'string' && rule.toolName.trim() ? rule.toolName.trim() : 'Bash',
+    };
   }
 
-  const command = normalizeApprovalCommand(getToolInputString(rule.input, ['command', 'cmd']) || rule.command);
-  if (!command) {
-    return null;
+  if (kind === 'codex_write' || kind === 'codex_permission') {
+    const blockedPath = normalizeApprovalBlockedPath(
+      rule.blockedPath
+      || getToolInputString(rule.input, ['workspacePath', 'blockedPath', 'path'])
+      || rule.path,
+    );
+    const sandboxMode = kind === 'codex_write'
+      ? 'workspace-write'
+      : getQueuedCodexApprovalSandboxMode(rule);
+    if (!blockedPath) {
+      return null;
+    }
+    if (!sandboxMode || sandboxMode === 'read-only') {
+      return null;
+    }
+
+    return {
+      blockedPath,
+      createdAt: rule.createdAt || new Date().toISOString(),
+      input: {
+        ...(rule.input && typeof rule.input === 'object' ? rule.input : {}),
+        approvalKind: 'codex_permission',
+        sandboxMode,
+        workspacePath: blockedPath,
+      },
+      key: createCodexPermissionApprovalKey(blockedPath, sandboxMode),
+      kind: 'codex_permission',
+      sandboxMode,
+      toolName: typeof rule.toolName === 'string' && rule.toolName.trim()
+        ? rule.toolName.trim()
+        : getCodexPermissionToolName(sandboxMode),
+    };
   }
 
-  return {
-    command,
-    createdAt: rule.createdAt || new Date().toISOString(),
-    input: rule.input && typeof rule.input === 'object' ? rule.input : { command },
-    key: `command:${command}`,
-    kind: 'command',
-    toolName: typeof rule.toolName === 'string' && rule.toolName.trim() ? rule.toolName.trim() : 'Bash',
-  };
+  return null;
 }
 
 function normalizeMessage(message) {
@@ -2298,6 +2969,7 @@ function normalizeMessage(message) {
     error: Boolean(message.error),
     id: message.id || randomUUID(),
     kind: message.kind || null,
+    commandSource: inferCommandEventSource(message),
     role: message.role || 'event',
     status: message.status || null,
     streaming: false,
@@ -2350,9 +3022,355 @@ function normalizeToolMeta(toolMeta) {
   return null;
 }
 
+function normalizeCodexSandboxMode(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return CODEX_SANDBOX_MODES.has(normalized) ? normalized : '';
+}
+
+function resolveCodexSandboxMode(permissionMode, overrideMode) {
+  const normalizedOverride = normalizeCodexSandboxMode(overrideMode);
+  if (normalizedOverride) {
+    return normalizedOverride;
+  }
+
+  const normalizedPermissionMode = normalizeSessionPermissionMode(permissionMode);
+  if (normalizedPermissionMode === 'bypassPermissions') {
+    return 'danger-full-access';
+  }
+
+  return normalizedPermissionMode === 'default' || normalizedPermissionMode === 'plan'
+    ? 'read-only'
+    : 'workspace-write';
+}
+
+function shouldQueueCodexWriteApproval(session) {
+  if (normalizeSessionProvider(session?.provider) !== 'codex') {
+    return false;
+  }
+
+  const permissionMode = normalizeSessionPermissionMode(session?.permissionMode);
+  return permissionMode !== 'bypassPermissions';
+}
+
+function promptLikelyNeedsCodexWorkspaceWrite(prompt, displayPrompt = '', displayKind = '') {
+  if (typeof displayKind === 'string' && displayKind.trim().toLowerCase() === 'command') {
+    return false;
+  }
+
+  const normalized = [prompt, displayPrompt]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join('\n')
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  const negativePattern = /不要修改|别修改|不要写入|不要落盘|仅分析|只分析|不要动代码|只读即可|don't edit|do not edit|read-only|readonly|analysis only|just explain|no changes/;
+  if (negativePattern.test(normalized)) {
+    return false;
+  }
+
+  const englishWritePattern = /\b(edit|modify|update|change|rewrite|refactor|patch|fix|implement|create|add|delete|remove|rename|save|write)\b[\s\S]{0,80}\b(file|files|code|project|component|function|bug|issue|workspace)\b|\bapply\s+patch\b|\bmake\s+the\s+change\b|\bship\s+it\b/;
+  const chineseWritePattern = /改一下|改下|修改|编辑|更新|补上|修复|实现|新增|添加|创建|新建|删除|移除|重命名|写入|落盘|保存|直接改|直接修改|改代码|改文件|修这个|修下|补这个|补一下/;
+  return englishWritePattern.test(normalized) || chineseWritePattern.test(normalized);
+}
+
+function isQueuedCodexWriteApproval(approval) {
+  const approvalKind = getQueuedCodexApprovalKind(approval);
+  return approvalKind === 'codex_write' || approvalKind === 'codex_permission';
+}
+
+function getQueuedCodexApprovalKind(approval) {
+  const topLevelKind = typeof approval?.approvalKind === 'string' ? approval.approvalKind.trim() : '';
+  if (topLevelKind) {
+    return topLevelKind;
+  }
+
+  return typeof approval?.input?.approvalKind === 'string' ? approval.input.approvalKind.trim() : '';
+}
+
+function getQueuedCodexApprovalSandboxMode(approval) {
+  const explicitSandboxMode = normalizeCodexSandboxMode(
+    approval?.sandboxMode
+    || approval?.input?.sandboxMode,
+  );
+  if (explicitSandboxMode) {
+    return explicitSandboxMode;
+  }
+
+  return getQueuedCodexApprovalKind(approval) === 'codex_write' ? 'workspace-write' : '';
+}
+
+function createCodexPermissionApprovalKey(blockedPath, sandboxMode) {
+  const normalizedBlockedPath = normalizeApprovalBlockedPath(blockedPath);
+  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode);
+  return normalizedBlockedPath && normalizedSandboxMode
+    ? `codex_permission:${normalizedSandboxMode}:${normalizedBlockedPath}`
+    : '';
+}
+
+function getCodexPermissionToolName(sandboxMode) {
+  return normalizeCodexSandboxMode(sandboxMode) === 'danger-full-access'
+    ? 'codex_full_access'
+    : 'codex_workspace_access';
+}
+
+function getAutoApprovedCodexSandboxMode(workspace, session) {
+  if (!workspace || !shouldQueueCodexWriteApproval(session)) {
+    return '';
+  }
+
+  const blockedPath = normalizeApprovalBlockedPath(workspace.path);
+  if (!blockedPath) {
+    return '';
+  }
+
+  const rules = normalizeWorkspaceApprovalRules(workspace.approvalRules);
+  if (Array.isArray(workspace.approvalRules) && rules.length !== workspace.approvalRules.length) {
+    workspace.approvalRules = rules;
+  }
+
+  if (rules.some((rule) => rule.kind === 'codex_permission' && rule.blockedPath === blockedPath && rule.sandboxMode === 'danger-full-access')) {
+    return 'danger-full-access';
+  }
+
+  if (rules.some((rule) => rule.kind === 'codex_permission' && rule.blockedPath === blockedPath && rule.sandboxMode === 'workspace-write')) {
+    return 'workspace-write';
+  }
+
+  return '';
+}
+
+function getQueuedCodexWriteApprovalOptions(approval) {
+  if (!isQueuedCodexWriteApproval(approval)) {
+    return null;
+  }
+
+  const input = approval.input && typeof approval.input === 'object' ? approval.input : {};
+  return {
+    attachments: Array.isArray(input.attachments) ? input.attachments : [],
+    displayKind: typeof input.displayKind === 'string' ? input.displayKind : '',
+    displayPrompt: typeof input.displayPrompt === 'string' ? input.displayPrompt : '',
+    displayTitle: typeof input.displayTitle === 'string' ? input.displayTitle : '',
+    prompt: typeof input.prompt === 'string' ? input.prompt : '',
+  };
+}
+
+function createOutboundUserMessage({ attachments, displayKind, displayPrompt, displayTitle, now }) {
+  return displayKind === 'command'
+    ? createEventMessage({
+      commandSource: 'slash',
+      content: '',
+      createdAt: now,
+      kind: 'command',
+      role: 'event',
+      status: 'info',
+      title: displayTitle,
+    })
+    : createStoredMessage({
+      attachments,
+      content: displayPrompt,
+      createdAt: now,
+      role: 'user',
+    });
+}
+
+function createCodexWritePendingApproval(workspace, options = {}) {
+  const attachments = Array.isArray(options.attachments) ? options.attachments : [];
+  const displayKind = typeof options.displayKind === 'string' ? options.displayKind.trim() : '';
+  const displayPrompt = typeof options.displayPrompt === 'string' ? options.displayPrompt.trim() : '';
+  const displayTitle = typeof options.displayTitle === 'string' ? options.displayTitle.trim() : '';
+  const prompt = typeof options.prompt === 'string' ? options.prompt.trim() : '';
+  const now = options.now || new Date().toISOString();
+  const blockedPath = normalizeApprovalBlockedPath(workspace?.path);
+  const sandboxMode = normalizeCodexSandboxMode(options.sandboxMode) || 'workspace-write';
+  const needsDangerousAccess = sandboxMode === 'danger-full-access';
+
+  return {
+    approvalKind: 'codex_permission',
+    blockedPath,
+    category: 'generic',
+    createdAt: now,
+    description: needsDangerousAccess
+      ? 'Codex 需要更高权限才能继续执行当前受限操作。允许后会放宽当前会话的沙箱限制，并自动重试本轮请求。'
+      : 'Codex 在当前只读权限下无法继续。允许后会提升当前工作目录权限，并自动重试本轮请求。',
+    detail: blockedPath,
+    displayName: needsDangerousAccess ? 'Codex elevated permission' : 'Codex workspace permission',
+    input: {
+      approvalKind: 'codex_permission',
+      attachments,
+      displayKind,
+      displayPrompt,
+      displayTitle,
+      prompt,
+      sandboxMode,
+      workspacePath: blockedPath,
+    },
+    requestId: typeof options.requestId === 'string' && options.requestId.trim() ? options.requestId.trim() : randomUUID(),
+    sandboxMode,
+    title: needsDangerousAccess ? 'Codex 更高权限审批' : 'Codex 权限升级',
+    toolName: getCodexPermissionToolName(sandboxMode),
+    toolUseId: '',
+  };
+}
+
+function maybeCreateCodexEscalationApproval(workspace, session, runState, assistantMessage) {
+  if (!workspace || !session || !runState || runState.pendingApprovalRequests.size > 0) {
+    return null;
+  }
+
+  if (!shouldQueueCodexWriteApproval(session)) {
+    return null;
+  }
+
+  const targetSandboxMode = inferCodexEscalationSandboxMode(
+    [
+      typeof assistantMessage?.content === 'string' ? assistantMessage.content : '',
+      runState.stderrBuffer,
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    runState.codexSandboxMode,
+  );
+  if (!targetSandboxMode) {
+    return null;
+  }
+
+  if (!runState.codexApprovalPayload || typeof runState.codexApprovalPayload !== 'object') {
+    return null;
+  }
+
+  return createCodexWritePendingApproval(workspace, {
+    ...runState.codexApprovalPayload,
+    sandboxMode: targetSandboxMode,
+  });
+}
+
+function inferCodexEscalationSandboxMode(text, currentSandboxMode) {
+  const normalized = String(text || '').trim().toLowerCase();
+  if (!normalized) {
+    return '';
+  }
+
+  const normalizedSandboxMode = normalizeCodexSandboxMode(currentSandboxMode);
+  if (normalizedSandboxMode === 'danger-full-access') {
+    return '';
+  }
+
+  const englishRestrictionPattern = /read-only|readonly|operation not permitted|permission denied|write attempt failed|mounted read-only|filesystem is read-only|workspace is mounted read-only|write to .* was denied|sandbox denied|requires workspace-write|requires a writable workspace|needs workspace-write/;
+  const englishFailurePattern = /can't|cannot|couldn't|unable to|failed to|denied|not permitted|could not|requires|needs/;
+  const chineseRestrictionPattern = /当前环境不能落盘|当前环境没法落盘|无法落盘|不能落盘|没法落盘|没有写权限|无写权限|写权限受限|可写会话|可写权限|可写环境|可写工作区|可写目录|只读环境|当前环境只读|工作区只读|只读沙箱|只读权限|无法写入|不能写入|无法修改文件|不能修改文件|无法编辑文件|不能编辑文件|工作目录权限/;
+  const chineseFailurePattern = /无法|不能|没法|未能|受限|拒绝|需要|请切到|切到|才能|才可以/;
+  const englishWriteApprovalHintPattern = /writable environment|writable workspace|write access|workspace write access|workspace-write/;
+  const englishWriteActionPattern = /edit|modify|update|change|patch|fix|implement|create|delete|rename|continue|complete/;
+  const chineseWriteApprovalHintPattern = /可写环境|可写工作区|可写目录|可写权限|工作区只读|只读沙箱|只读权限/;
+  const chineseWriteActionPattern = /修改|编辑|写入|落盘|补上|修复|创建|删除|重命名|继续|完成|处理/;
+  const writePermissionDenied = (
+    englishRestrictionPattern.test(normalized) && englishFailurePattern.test(normalized)
+  ) || (
+    chineseRestrictionPattern.test(normalized) && chineseFailurePattern.test(normalized)
+  ) || (
+    englishWriteApprovalHintPattern.test(normalized) && englishWriteActionPattern.test(normalized)
+  ) || (
+    chineseWriteApprovalHintPattern.test(normalized) && chineseWriteActionPattern.test(normalized)
+  );
+
+  const englishDangerRestrictionPattern = /network access|internet access|outbound network|socket access|dns resolution|resolve host|connection timed out|connection refused|tls handshake|certificate verify failed|outside the workspace|outside current workspace|outside of the workspace|outside the current working directory|outside the repo|not in writable roots|requires full access|dangerously-bypass-approvals-and-sandbox|blocked by sandbox|sandbox restriction|sandbox blocked|requires network|needs network|external path|outside allowed directories/;
+  const chineseDangerRestrictionPattern = /无法联网|不能联网|没法联网|网络受限|网络访问受限|无法访问网络|不能访问网络|无法访问外网|不能访问外网|无法解析域名|不能解析域名|dns|无法下载依赖|不能下载依赖|无法访问工作目录外|不能访问工作目录外|工作目录之外|当前工作目录之外|外部路径|沙箱限制|受沙箱限制|解除沙箱|完全访问|更高系统权限|更高权限的操作/;
+  const dangerPermissionDenied = (
+    englishDangerRestrictionPattern.test(normalized) && englishFailurePattern.test(normalized)
+  ) || (
+    chineseDangerRestrictionPattern.test(normalized) && chineseFailurePattern.test(normalized)
+  );
+
+  if (dangerPermissionDenied) {
+    return 'danger-full-access';
+  }
+
+  if (normalizedSandboxMode === 'workspace-write') {
+    return writePermissionDenied ? 'danger-full-access' : '';
+  }
+
+  return writePermissionDenied ? 'workspace-write' : '';
+}
+
+function looksLikeCodexPermissionDenied(text, currentSandboxMode) {
+  return Boolean(inferCodexEscalationSandboxMode(text, currentSandboxMode));
+}
+
+function prepareRunStateForPendingApproval(runState, approval) {
+  if (!runState || !approval) {
+    return;
+  }
+
+  runState.assistantMessageId = null;
+  runState.currentAssistantText = '';
+  runState.hasStreamedAssistantText = false;
+  runState.process = null;
+  runState.runToken = null;
+  runState.stderrBuffer = '';
+  runState.targetCodexPlanModeActive = null;
+  runState.seenToolResultIds.clear();
+  runState.seenToolUseIds.clear();
+  runState.toolUses.clear();
+  runState.pendingApprovalRequests.clear();
+  runState.pendingApprovalRequests.set(approval.requestId, approval);
+  runState.responseStartIndex = 0;
+  runState.resultIsError = false;
+  runState.resultReceived = false;
+}
+
+function rewindSessionMessagesForPendingApproval(session, runState) {
+  if (!session || !Array.isArray(session.messages) || !runState) {
+    return;
+  }
+
+  const responseStartIndex = Number.isInteger(runState.responseStartIndex)
+    ? runState.responseStartIndex
+    : session.messages.length;
+  if (responseStartIndex < 0 || responseStartIndex > session.messages.length) {
+    return;
+  }
+
+  session.messages = session.messages.slice(0, responseStartIndex);
+  session.updatedAt = new Date().toISOString();
+}
+
+function resetRunStateForExecution(runState, provider, workspaceId, sessionId) {
+  if (!runState) {
+    return;
+  }
+
+  runState.assistantMessageId = null;
+  runState.codexApprovalPayload = null;
+  runState.codexSandboxMode = '';
+  runState.currentAssistantText = '';
+  runState.hasStreamedAssistantText = false;
+  runState.process = null;
+  runState.provider = provider;
+  runState.runToken = null;
+  runState.responseStartIndex = 0;
+  runState.sessionId = sessionId;
+  runState.workspaceId = workspaceId;
+  runState.stderrBuffer = '';
+  runState.targetCodexPlanModeActive = null;
+  runState.seenToolResultIds.clear();
+  runState.seenToolUseIds.clear();
+  runState.toolUses.clear();
+  runState.pendingApprovalRequests.clear();
+  runState.resultIsError = false;
+  runState.resultReceived = false;
+}
+
 function normalizeSessionPermissionMode(value) {
   const normalized = typeof value === 'string' ? value.trim() : '';
   return SESSION_PERMISSION_MODES.has(normalized) ? normalized : 'default';
+}
+
+function normalizeSessionReasoningEffort(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return SESSION_REASONING_EFFORTS.has(normalized) ? normalized : '';
 }
 
 function normalizeSessionProvider(value) {
@@ -2374,6 +3392,28 @@ function normalizeEnabledProviders(value) {
   const normalizedProviders = SESSION_PROVIDER_KEYS.filter((provider) => requestedProviders.has(provider));
 
   return normalizedProviders.length > 0 ? normalizedProviders : SESSION_PROVIDER_KEYS.slice();
+}
+
+function normalizeProviderSystemPrompt(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeProviderSystemPrompts(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return SESSION_PROVIDER_KEYS.reduce((prompts, provider) => {
+    prompts[provider] = normalizeProviderSystemPrompt(source[provider]);
+    return prompts;
+  }, {});
+}
+
+function getProviderSystemPromptValue(systemPrompts, provider = DEFAULT_PROVIDER) {
+  const normalizedProvider = normalizeSessionProvider(provider);
+  const prompts = normalizeProviderSystemPrompts(systemPrompts);
+  return prompts[normalizedProvider];
+}
+
+function encodeTomlString(value) {
+  return JSON.stringify(typeof value === 'string' ? value : '');
 }
 
 function normalizeLineCount(value) {
@@ -2487,11 +3527,14 @@ function createRunKey(workspaceId, sessionId) {
 function createRunState(workspaceId = null, sessionId = null) {
   return {
     assistantMessageId: null,
+    codexApprovalPayload: null,
+    codexSandboxMode: '',
     currentAssistantText: '',
     hasStreamedAssistantText: false,
     pendingApprovalRequests: new Map(),
     process: null,
     provider: DEFAULT_PROVIDER,
+    responseStartIndex: 0,
     resultIsError: false,
     resultReceived: false,
     runToken: null,
@@ -2499,6 +3542,7 @@ function createRunState(workspaceId = null, sessionId = null) {
     seenToolUseIds: new Set(),
     sessionId,
     stderrBuffer: '',
+    targetCodexPlanModeActive: null,
     toolUses: new Map(),
     workspaceId,
   };
@@ -2535,12 +3579,18 @@ function serializeSession(workspace, session, activeRunLookup) {
         .map((approval) => serializePendingApproval(approval))
         .filter(Boolean)
       : [];
+  const effectiveDefaults = getEffectiveSessionDefaults(workspace.path, session);
+  const configuredReasoningEffort = normalizeSessionReasoningEffort(session.reasoningEffort);
+  const contextUsage = inspectSessionContextUsage(session, workspace.path);
 
   return {
     archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId,
+    contextUsage,
     currentModel: session.currentModel || session.model || '',
     createdAt: session.createdAt,
+    effectiveModel: session.currentModel || session.model || effectiveDefaults.model,
+    effectiveReasoningEffort: configuredReasoningEffort || effectiveDefaults.reasoningEffort,
     id: session.id,
     isRunning: Boolean(activeRun?.process),
     messages: session.messages,
@@ -2548,6 +3598,7 @@ function serializeSession(workspace, session, activeRunLookup) {
     pendingApprovals,
     path: workspace.path,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    reasoningEffort: configuredReasoningEffort,
     provider: normalizeSessionProvider(session.provider),
     providerLocked: isSessionProviderLocked(session),
     status: session.status,
@@ -2561,15 +3612,20 @@ function serializeSession(workspace, session, activeRunLookup) {
 function serializeSessionMeta(workspace, session, activeRunLookup) {
   const previewSource = getLatestPreviewMessage(session.messages);
   const activeRun = activeRunLookup.get(createRunKey(workspace.id, session.id)) || null;
+  const effectiveDefaults = getEffectiveSessionDefaults(workspace.path, session);
+  const configuredReasoningEffort = normalizeSessionReasoningEffort(session.reasoningEffort);
 
   return {
     archived: Boolean(session.archived),
     claudeSessionId: session.claudeSessionId,
     currentModel: session.currentModel || session.model || '',
+    effectiveModel: session.currentModel || session.model || effectiveDefaults.model,
+    effectiveReasoningEffort: configuredReasoningEffort || effectiveDefaults.reasoningEffort,
     id: session.id,
     isRunning: Boolean(activeRun?.process),
     messageCount: session.messages.filter((message) => message.role !== 'event').length,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+    reasoningEffort: configuredReasoningEffort,
     provider: normalizeSessionProvider(session.provider),
     providerLocked: isSessionProviderLocked(session),
     preview: previewSource ? (truncateText(getMessagePreviewText(previewSource), 80) || '还没有消息') : '还没有消息',
@@ -2623,6 +3679,7 @@ function createStoredMessage(partial) {
 function createWorkspaceSession(createdAt = new Date().toISOString(), provider = DEFAULT_PROVIDER) {
   return {
     claudeSessionId: null,
+    codexPlanModeActive: false,
     currentModel: '',
     createdAt,
     archived: false,
@@ -2630,6 +3687,7 @@ function createWorkspaceSession(createdAt = new Date().toISOString(), provider =
     messages: [],
     model: '',
     permissionMode: 'default',
+    reasoningEffort: '',
     provider: normalizeSessionProvider(provider),
     status: 'idle',
     title: `新对话 ${formatShortTime(createdAt)}`,
@@ -2653,7 +3711,36 @@ function ensureWorkspaceHasVisibleSession(workspace) {
 }
 
 function createApprovalRuleFromPendingApproval(approval) {
-  if (!approval || inferApprovalCategory(approval) !== 'command') {
+  if (!approval) {
+    return null;
+  }
+
+  if (isQueuedCodexWriteApproval(approval)) {
+    const blockedPath = normalizeApprovalBlockedPath(approval.blockedPath || approval.input?.workspacePath);
+    const sandboxMode = getQueuedCodexApprovalSandboxMode(approval) || 'workspace-write';
+    if (!blockedPath) {
+      return null;
+    }
+
+    return {
+      blockedPath,
+      createdAt: new Date().toISOString(),
+      input: {
+        ...(approval.input && typeof approval.input === 'object' ? approval.input : {}),
+        approvalKind: 'codex_permission',
+        sandboxMode,
+        workspacePath: blockedPath,
+      },
+      key: createCodexPermissionApprovalKey(blockedPath, sandboxMode),
+      kind: 'codex_permission',
+      sandboxMode,
+      toolName: typeof approval.toolName === 'string' && approval.toolName.trim()
+        ? approval.toolName.trim()
+        : getCodexPermissionToolName(sandboxMode),
+    };
+  }
+
+  if (inferApprovalCategory(approval) !== 'command') {
     return null;
   }
 
@@ -2688,16 +3775,15 @@ function addWorkspaceApprovalRule(workspace, rule) {
 }
 
 function workspaceHasMatchingApprovalRule(workspace, approval) {
-  if (!workspace || !approval || inferApprovalCategory(approval) !== 'command') {
+  if (!workspace || !approval) {
     return false;
   }
 
-  const command = normalizeApprovalCommand(getToolInputString(approval.input, ['command', 'cmd']));
-  if (!command) {
+  const targetKey = getApprovalRuleKey(approval);
+  if (!targetKey) {
     return false;
   }
 
-  const targetKey = `command:${command}`;
   const rules = normalizeWorkspaceApprovalRules(workspace.approvalRules);
   if (rules.length !== (Array.isArray(workspace.approvalRules) ? workspace.approvalRules.length : 0)) {
     workspace.approvalRules = rules;
@@ -2710,6 +3796,26 @@ function normalizeApprovalCommand(value) {
   return String(value || '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeApprovalBlockedPath(value) {
+  const normalized = String(value || '').trim();
+  return normalized ? path.resolve(normalized) : '';
+}
+
+function getApprovalRuleKey(approval) {
+  if (isQueuedCodexWriteApproval(approval)) {
+    const blockedPath = normalizeApprovalBlockedPath(approval.blockedPath || approval.input?.workspacePath);
+    const sandboxMode = getQueuedCodexApprovalSandboxMode(approval) || 'workspace-write';
+    return createCodexPermissionApprovalKey(blockedPath, sandboxMode);
+  }
+
+  if (inferApprovalCategory(approval) !== 'command') {
+    return '';
+  }
+
+  const command = normalizeApprovalCommand(getToolInputString(approval.input, ['command', 'cmd']));
+  return command ? `command:${command}` : '';
 }
 
 function inferApprovalCategory(approval) {
@@ -2754,6 +3860,7 @@ function serializePendingApproval(approval) {
   }
 
   return {
+    approvalKind: getQueuedCodexApprovalKind(approval),
     blockedPath: typeof approval.blockedPath === 'string' ? approval.blockedPath : '',
     category: inferApprovalCategory(approval),
     createdAt: approval.createdAt || new Date().toISOString(),
@@ -2762,6 +3869,7 @@ function serializePendingApproval(approval) {
     detail: typeof approval.detail === 'string' ? approval.detail : '',
     displayName: typeof approval.displayName === 'string' ? approval.displayName : '',
     requestId: typeof approval.requestId === 'string' ? approval.requestId : '',
+    sandboxMode: getQueuedCodexApprovalSandboxMode(approval),
     title: typeof approval.title === 'string' ? approval.title : '',
     toolName: typeof approval.toolName === 'string' ? approval.toolName : '',
     toolUseId: typeof approval.toolUseId === 'string' ? approval.toolUseId : '',
@@ -2781,9 +3889,51 @@ function createEventMessage(partial) {
   };
 }
 
+function normalizeCommandEventSource(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return ['slash', 'tool', 'system'].includes(normalized) ? normalized : '';
+}
+
+function inferCommandEventSource(message) {
+  if (!message || message.kind !== 'command') {
+    return '';
+  }
+
+  const explicitSource = normalizeCommandEventSource(message.commandSource);
+  if (explicitSource) {
+    return explicitSource;
+  }
+
+  if (
+    (typeof message.toolUseId === 'string' && message.toolUseId.trim())
+    || message.toolCategory === 'command'
+    || message.toolName === 'command_execution'
+  ) {
+    return 'tool';
+  }
+
+  const title = typeof message.title === 'string' ? message.title.trim() : '';
+  if (title.startsWith('/')) {
+    return 'slash';
+  }
+
+  return 'system';
+}
+
 function createSessionTitleFromPrompt(prompt) {
   const sanitized = prompt.replace(/\s+/g, ' ').trim();
   return truncateText(sanitized, 26) || `新对话 ${formatShortTime(new Date().toISOString())}`;
+}
+
+function shouldRefreshSessionTitle(session, userMessage, displayPrompt, attachments) {
+  if (!isDefaultSessionTitle(session?.title) || userMessage?.role !== 'user') {
+    return false;
+  }
+
+  return Boolean(
+    (typeof displayPrompt === 'string' && displayPrompt.trim())
+    || formatAttachmentTitle(attachments),
+  );
 }
 
 function formatAttachmentTitle(attachments) {
@@ -2833,24 +3983,117 @@ function isPathWithin(basePath, candidatePath) {
   return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
 }
 
-function resolveLinkToLocalPath(href) {
+function resolveLocalLinkTarget(href) {
   if (typeof href !== 'string' || !href) {
-    return '';
+    return null;
   }
 
-  if (href.startsWith('file://')) {
+  let resolvedPath = href.trim();
+  let fragmentTarget = {
+    column: null,
+    line: null,
+  };
+
+  if (resolvedPath.startsWith('file://')) {
     try {
-      return fileURLToPath(href);
+      const fileUrl = new URL(resolvedPath);
+      fragmentTarget = parseCodeEditorLinkFragment(fileUrl.hash);
+      resolvedPath = fileURLToPath(fileUrl);
     } catch {
-      return '';
+      return null;
     }
+  } else {
+    fragmentTarget = parseCodeEditorLinkFragment(extractPathHash(resolvedPath));
   }
 
-  if (!path.isAbsolute(href)) {
+  if (!path.isAbsolute(resolvedPath)) {
+    return null;
+  }
+
+  const strippedPath = stripPathHashAndQuery(resolvedPath);
+  const { column, line, path: normalizedPath } = stripPathLineAndColumnSuffix(strippedPath);
+  if (!normalizedPath) {
+    return null;
+  }
+
+  return {
+    column: column || fragmentTarget.column,
+    line: line || fragmentTarget.line,
+    path: normalizedPath,
+  };
+}
+
+function extractPathHash(value) {
+  if (typeof value !== 'string') {
     return '';
   }
 
-  return stripPathHashAndQuery(href);
+  const hashIndex = value.indexOf('#');
+  if (hashIndex < 0) {
+    return '';
+  }
+
+  const queryIndex = value.indexOf('?', hashIndex);
+  return queryIndex >= 0
+    ? value.slice(hashIndex, queryIndex)
+    : value.slice(hashIndex);
+}
+
+function parseCodeEditorLinkFragment(value) {
+  const fragment = typeof value === 'string' ? value.trim() : '';
+  if (!fragment) {
+    return {
+      column: null,
+      line: null,
+    };
+  }
+
+  const match = fragment.match(/^#L(\d+)(?:C(\d+))?(?:-L?\d+(?:C\d+)?)?$/i);
+  if (!match) {
+    return {
+      column: null,
+      line: null,
+    };
+  }
+
+  return {
+    column: match[2] ? Number.parseInt(match[2], 10) : null,
+    line: Number.parseInt(match[1], 10),
+  };
+}
+
+function stripPathLineAndColumnSuffix(value) {
+  if (typeof value !== 'string' || !value) {
+    return {
+      column: null,
+      line: null,
+      path: '',
+    };
+  }
+
+  const lineColumnMatch = value.match(/^(.*):(\d+)(?::(\d+))?$/);
+  if (!lineColumnMatch) {
+    return {
+      column: null,
+      line: null,
+      path: value,
+    };
+  }
+
+  const candidatePath = lineColumnMatch[1];
+  if (!candidatePath || !fs.existsSync(candidatePath)) {
+    return {
+      column: null,
+      line: null,
+      path: value,
+    };
+  }
+
+  return {
+    column: lineColumnMatch[3] ? Number.parseInt(lineColumnMatch[3], 10) : null,
+    line: Number.parseInt(lineColumnMatch[2], 10),
+    path: candidatePath,
+  };
 }
 
 function stripPathHashAndQuery(value) {
@@ -2863,17 +4106,20 @@ function stripPathHashAndQuery(value) {
 
 function buildPromptWithAttachments(prompt, attachments) {
   const trimmedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
-  if (!Array.isArray(attachments) || attachments.length === 0) {
-    return trimmedPrompt;
+  const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+  if (!trimmedPrompt && !hasAttachments) {
+    return '';
   }
 
-  const fileReferences = attachments
+  const sections = [];
+  const normalizedAttachments = hasAttachments ? attachments : [];
+
+  const fileReferences = normalizedAttachments
     .filter((attachment) => attachment.kind !== 'image')
     .map((attachment) => `@${attachment.path}`);
-  const imageReferences = attachments
+  const imageReferences = normalizedAttachments
     .filter((attachment) => attachment.kind === 'image')
     .map((attachment) => attachment.path);
-  const sections = [];
 
   if (fileReferences.length > 0) {
     sections.push(`Attached files:\n${fileReferences.join('\n')}`);
@@ -2887,7 +4133,7 @@ function buildPromptWithAttachments(prompt, attachments) {
   return sections.join('\n\n').trim();
 }
 
-function buildClaudeExecArgs({ extraAttachmentDirs, model, permissionMode, sessionId }) {
+function buildClaudeExecArgs({ extraAttachmentDirs, model, permissionMode, sessionId, systemPrompt }) {
   const args = [
     '-p',
     '--input-format',
@@ -2909,6 +4155,11 @@ function buildClaudeExecArgs({ extraAttachmentDirs, model, permissionMode, sessi
     args.push('--model', model);
   }
 
+  const normalizedSystemPrompt = normalizeProviderSystemPrompt(systemPrompt);
+  if (normalizedSystemPrompt) {
+    args.push('--append-system-prompt', normalizedSystemPrompt);
+  }
+
   args.push('--permission-mode', normalizeSessionPermissionMode(permissionMode));
 
   if (sessionId) {
@@ -2918,13 +4169,48 @@ function buildClaudeExecArgs({ extraAttachmentDirs, model, permissionMode, sessi
   return args;
 }
 
-function buildCodexExecArgs({ attachments, extraAttachmentDirs, model, prompt, sessionId }) {
+function buildCodexExecArgs({
+  attachments,
+  developerInstructions,
+  extraAttachmentDirs,
+  model,
+  prompt,
+  reasoningEffort,
+  sandboxMode,
+  sessionId,
+}) {
   const options = ['--json', '--skip-git-repo-check'];
   if (model) {
     options.push('--model', model);
   }
 
-  if (Array.isArray(extraAttachmentDirs) && extraAttachmentDirs.length > 0) {
+  const normalizedDeveloperInstructions = normalizeProviderSystemPrompt(developerInstructions);
+  if (normalizedDeveloperInstructions) {
+    options.push('-c', `developer_instructions=${encodeTomlString(normalizedDeveloperInstructions)}`);
+  }
+
+  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode);
+  if (sessionId) {
+    if (normalizedSandboxMode === 'workspace-write') {
+      options.push('--full-auto');
+    } else if (normalizedSandboxMode === 'danger-full-access') {
+      options.push('--dangerously-bypass-approvals-and-sandbox');
+    }
+  } else if (normalizedSandboxMode) {
+    options.push('--sandbox', normalizedSandboxMode);
+  }
+
+  const normalizedReasoningEffort = normalizeSessionReasoningEffort(reasoningEffort);
+  if (normalizedReasoningEffort) {
+    options.push(
+      '-c',
+      `model_reasoning_effort="${normalizedReasoningEffort}"`,
+      '-c',
+      `plan_mode_reasoning_effort="${normalizedReasoningEffort}"`,
+    );
+  }
+
+  if (!sessionId && Array.isArray(extraAttachmentDirs) && extraAttachmentDirs.length > 0) {
     options.push('--add-dir', ...extraAttachmentDirs);
   }
 
@@ -2932,14 +4218,64 @@ function buildCodexExecArgs({ attachments, extraAttachmentDirs, model, prompt, s
     ? attachments.filter((attachment) => attachment?.kind === 'image' && attachment.path)
     : [];
   if (imageAttachments.length > 0) {
-    options.push('-i', ...imageAttachments.map((attachment) => attachment.path));
+    for (const attachment of imageAttachments) {
+      options.push('-i', attachment.path);
+    }
   }
 
   if (sessionId) {
-    return ['exec', 'resume', ...options, sessionId, prompt];
+    return [
+      'exec',
+      'resume',
+      ...options,
+      // `--image` is greedy in `codex exec`; without an explicit option terminator
+      // the trailing session/prompt arguments can be parsed as more image paths.
+      '--',
+      sessionId,
+      prompt,
+    ];
   }
 
-  return ['exec', ...options, prompt];
+  return [
+    'exec',
+    ...options,
+    // Keep the prompt positional separate from any preceding `--image` values.
+    '--',
+    prompt,
+  ];
+}
+
+function buildCodexTurnRequest(session, prompt) {
+  const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
+  const desiredPlanModeActive = normalizeSessionPermissionMode(session?.permissionMode) === 'plan';
+  const currentPlanModeActive = Boolean(session?.codexPlanModeActive);
+
+  if (!normalizedPrompt || desiredPlanModeActive === currentPlanModeActive) {
+    return {
+      prompt: normalizedPrompt,
+      targetPlanModeActive: null,
+    };
+  }
+
+  return {
+    // The official Codex CLI docs expose `/plan` as the conversation-level
+    // switch for plan mode, optionally followed by an inline prompt.
+    prompt: `/plan ${normalizedPrompt}`,
+    targetPlanModeActive: desiredPlanModeActive,
+  };
+}
+
+function buildCodexApprovedPrompt(prompt, sandboxMode) {
+  const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
+  if (!normalizedPrompt) {
+    return normalizedPrompt;
+  }
+
+  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode);
+  const note = normalizedSandboxMode === 'danger-full-access'
+    ? 'System note: Permission escalation has already been approved for this request. Continue directly with the task and do not re-check whether elevated permissions are available unless an operation still fails.'
+    : 'System note: Workspace write permission has already been approved for this request. Continue directly with the task and do not re-check whether the workspace is writable unless a write still fails.';
+  return `${note}\n\n${normalizedPrompt}`;
 }
 
 function createStreamJsonUserMessage(prompt, sessionId, providerLabel = 'Claude') {
@@ -3584,6 +4920,7 @@ function describeCodexItem(item) {
     const output = truncateText(item.aggregated_output || item.output || '', STDERR_BUFFER_LIMIT);
     return {
       category: 'command',
+      commandSource: 'tool',
       completedDetail: output ? `${command}\n\n${output}` : command,
       completedTitle: '命令已完成',
       detail: command,
@@ -3732,6 +5069,14 @@ function directoryExists(directoryPath) {
     return fs.existsSync(directoryPath) && fs.statSync(directoryPath).isDirectory();
   } catch {
     return false;
+  }
+}
+
+function getPathStats(targetPath) {
+  try {
+    return fs.statSync(targetPath);
+  } catch {
+    return null;
   }
 }
 
@@ -4219,11 +5564,18 @@ function stripAnsi(value) {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
 }
 
-function inspectProvider(provider, env, force, previousInfo = null) {
+function inspectProvider(provider, env, force, previousInfo = null, options = {}) {
   const normalizedProvider = normalizeSessionProvider(provider);
   const previousCheckedAt = Number.isFinite(previousInfo?.checkedAt) ? previousInfo.checkedAt : 0;
+  const refreshStatusOnly = options?.refreshStatusOnly === true;
   const now = Date.now();
   if (!force && previousCheckedAt && now - previousCheckedAt < CLAUDE_CHECK_TTL_MS) {
+    if (refreshStatusOnly && previousInfo && typeof previousInfo === 'object') {
+      return {
+        ...previousInfo,
+        status: inspectLocalProviderStatus(normalizedProvider),
+      };
+    }
     return previousInfo;
   }
 
@@ -4238,11 +5590,13 @@ function inspectProvider(provider, env, force, previousInfo = null) {
       env,
     });
     const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    const status = inspectLocalProviderStatus(normalizedProvider);
     return {
       available: result.status === 0,
       checkedAt: now,
       executablePath: result.status === 0 ? executablePath : '',
       models: result.status === 0 ? extractProviderModelCatalog(normalizedProvider, executablePath, env) : [],
+      status,
       version: output || 'unknown',
     };
   } catch {
@@ -4256,11 +5610,12 @@ function createUnavailableProviderInfo(provider, checkedAt = Date.now()) {
     checkedAt,
     executablePath: '',
     models: [],
+    status: inspectLocalProviderStatus(provider),
     version: '',
   };
 }
 
-function serializeProviderInfo(provider, info, skills = [], enabled = true) {
+function serializeProviderInfo(provider, info, skills = [], enabled = true, systemPrompt = '') {
   return {
     available: Boolean(info?.available),
     enabled: Boolean(enabled),
@@ -4268,8 +5623,828 @@ function serializeProviderInfo(provider, info, skills = [], enabled = true) {
     label: getProviderLabel(provider),
     models: Array.isArray(info?.models) ? info.models : [],
     skills: Array.isArray(skills) ? skills : [],
+    status: info?.status && typeof info.status === 'object' ? info.status : null,
+    systemPrompt: normalizeProviderSystemPrompt(systemPrompt),
     version: typeof info?.version === 'string' ? info.version : '',
   };
+}
+
+function inspectLocalProviderStatus(provider) {
+  const normalizedProvider = normalizeSessionProvider(provider);
+
+  try {
+    return normalizedProvider === 'codex'
+      ? inspectCodexLocalStatus()
+      : inspectClaudeLocalStatus();
+  } catch {
+    return null;
+  }
+}
+
+function inspectClaudeLocalStatus() {
+  const claudeHome = getProviderHome('claude');
+  const stats = readJsonFileSafe(path.join(claudeHome, 'stats-cache.json'));
+  if (!stats || typeof stats !== 'object') {
+    return null;
+  }
+
+  const dailyActivity = Array.isArray(stats.dailyActivity)
+    ? stats.dailyActivity.filter((entry) => isIsoDateString(entry?.date))
+    : [];
+  const favoriteModel = getFavoriteClaudeModel(stats.dailyModelTokens, stats.modelUsage);
+  const lastActive = getLatestClaudeActivityEntry(dailyActivity);
+  const currentModelSettings = readJsonFileSafe(path.join(claudeHome, 'settings.json'));
+  const currentModel = typeof currentModelSettings?.model === 'string'
+    ? currentModelSettings.model.trim()
+    : '';
+  const status = {
+    currentModel,
+    favoriteModel,
+    kind: 'claude',
+    lastActive,
+    totalMessages: normalizeNonNegativeNumber(stats.totalMessages),
+    totalSessions: normalizeNonNegativeNumber(stats.totalSessions),
+    updatedAt: typeof stats.lastComputedDate === 'string' ? stats.lastComputedDate : '',
+    usageStreak: calculateClaudeActivityStreak(dailyActivity),
+  };
+
+  return hasClaudeLocalStatus(status) ? status : null;
+}
+
+function inspectCodexLocalStatus() {
+  const codexHome = getProviderHome('codex');
+  const auth = readJsonFileSafe(path.join(codexHome, 'auth.json'));
+  const latestTokenEvent = findLatestCodexTokenCountEvent(path.join(codexHome, 'sessions'));
+  const authClaims = getCodexAuthClaims(auth);
+  const defaults = readCodexConfigDefaults('');
+  const status = {
+    authMode: typeof auth?.auth_mode === 'string' ? auth.auth_mode.trim() : '',
+    defaultModel: typeof defaults?.model === 'string' ? defaults.model.trim() : '',
+    kind: 'codex',
+    lastTokenUsage: normalizeCodexTokenUsage(latestTokenEvent?.payload?.info?.last_token_usage),
+    modelContextWindow: normalizeNonNegativeNumber(latestTokenEvent?.payload?.info?.model_context_window),
+    planType: normalizeCodexPlanType(latestTokenEvent?.payload?.rate_limits?.plan_type || authClaims?.chatgpt_plan_type),
+    rateLimits: normalizeCodexRateLimits(latestTokenEvent?.payload?.rate_limits),
+    reasoningEffort: normalizeSessionReasoningEffort(defaults?.reasoningEffort),
+    totalTokenUsage: normalizeCodexTokenUsage(latestTokenEvent?.payload?.info?.total_token_usage),
+    updatedAt: latestTokenEvent?.timestamp || (typeof auth?.last_refresh === 'string' ? auth.last_refresh : ''),
+  };
+
+  return hasCodexLocalStatus(status) ? status : null;
+}
+
+function inspectSessionContextUsage(session, workspacePath = '') {
+  const provider = normalizeSessionProvider(session?.provider);
+  if (provider === 'codex') {
+    const threadId = typeof session?.claudeSessionId === 'string'
+      ? session.claudeSessionId.trim()
+      : '';
+    if (!threadId) {
+      return null;
+    }
+
+    const tokenEvent = findLatestCodexTokenCountEventForThreadId(
+      path.join(getProviderHome('codex'), 'sessions'),
+      threadId,
+    );
+
+    return normalizeCodexContextUsage(
+      tokenEvent?.payload?.info,
+      typeof tokenEvent?.timestamp === 'string' ? tokenEvent.timestamp : '',
+    );
+  }
+
+  if (provider === 'claude') {
+    return inspectClaudeSessionContextUsage(session, workspacePath);
+  }
+
+  return null;
+}
+
+function inspectClaudeSessionContextUsage(session, workspacePath = '') {
+  const sessionId = typeof session?.claudeSessionId === 'string'
+    ? session.claudeSessionId.trim()
+    : '';
+  if (!sessionId) {
+    return null;
+  }
+
+  const latestUsage = findLatestClaudeAssistantUsageForSessionId(
+    path.join(getProviderHome('claude'), 'projects'),
+    sessionId,
+    workspacePath,
+  );
+  if (!latestUsage) {
+    return null;
+  }
+
+  const modelContextWindow = inferClaudeModelContextWindow(
+    session?.currentModel,
+    session?.model,
+    latestUsage.model,
+  );
+
+  return normalizeClaudeContextUsage(
+    latestUsage.usage,
+    modelContextWindow,
+    typeof latestUsage.timestamp === 'string' ? latestUsage.timestamp : '',
+  );
+}
+
+function readJsonFileSafe(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function hasClaudeLocalStatus(status) {
+  return Boolean(
+    status
+    && (
+      status.currentModel
+      || status.favoriteModel
+      || status.lastActive
+      || status.totalMessages > 0
+      || status.totalSessions > 0
+      || status.updatedAt
+      || status.usageStreak > 0
+    )
+  );
+}
+
+function hasCodexLocalStatus(status) {
+  return Boolean(
+    status
+    && (
+      status.authMode
+      || status.defaultModel
+      || status.lastTokenUsage
+      || status.modelContextWindow > 0
+      || status.planType
+      || status.rateLimits
+      || status.reasoningEffort
+      || status.totalTokenUsage
+      || status.updatedAt
+    )
+  );
+}
+
+function getFavoriteClaudeModel(dailyModelTokens, modelUsage) {
+  const totals = new Map();
+
+  for (const entry of Array.isArray(dailyModelTokens) ? dailyModelTokens : []) {
+    const tokensByModel = entry?.tokensByModel && typeof entry.tokensByModel === 'object'
+      ? entry.tokensByModel
+      : null;
+    if (!tokensByModel) {
+      continue;
+    }
+
+    for (const [modelName, tokenCount] of Object.entries(tokensByModel)) {
+      if (typeof modelName !== 'string' || !modelName.trim()) {
+        continue;
+      }
+
+      const normalizedTokenCount = normalizeNonNegativeNumber(tokenCount);
+      if (!normalizedTokenCount) {
+        continue;
+      }
+
+      totals.set(modelName.trim(), (totals.get(modelName.trim()) || 0) + normalizedTokenCount);
+    }
+  }
+
+  if (totals.size === 0 && modelUsage && typeof modelUsage === 'object') {
+    for (const [modelName, usage] of Object.entries(modelUsage)) {
+      if (typeof modelName !== 'string' || !modelName.trim() || !usage || typeof usage !== 'object') {
+        continue;
+      }
+
+      const totalTokens = [
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.cacheReadInputTokens,
+        usage.cacheCreationInputTokens,
+      ].reduce((sum, value) => sum + normalizeNonNegativeNumber(value), 0);
+      if (!totalTokens) {
+        continue;
+      }
+
+      totals.set(modelName.trim(), totalTokens);
+    }
+  }
+
+  let favoriteModel = '';
+  let favoriteModelTokens = 0;
+  for (const [modelName, totalTokens] of totals.entries()) {
+    if (totalTokens <= favoriteModelTokens) {
+      continue;
+    }
+
+    favoriteModel = modelName;
+    favoriteModelTokens = totalTokens;
+  }
+
+  if (!favoriteModel) {
+    return null;
+  }
+
+  return {
+    name: favoriteModel,
+    totalTokens: favoriteModelTokens,
+  };
+}
+
+function getLatestClaudeActivityEntry(dailyActivity) {
+  if (!Array.isArray(dailyActivity) || dailyActivity.length === 0) {
+    return null;
+  }
+
+  const latestEntry = dailyActivity.reduce((current, entry) => {
+    if (!entry || !isIsoDateString(entry.date)) {
+      return current;
+    }
+
+    if (!current || entry.date > current.date) {
+      return entry;
+    }
+
+    return current;
+  }, null);
+
+  if (!latestEntry) {
+    return null;
+  }
+
+  return {
+    date: latestEntry.date,
+    messageCount: normalizeNonNegativeNumber(latestEntry.messageCount),
+    sessionCount: normalizeNonNegativeNumber(latestEntry.sessionCount),
+    toolCallCount: normalizeNonNegativeNumber(latestEntry.toolCallCount),
+  };
+}
+
+function calculateClaudeActivityStreak(dailyActivity) {
+  const dates = Array.from(new Set(
+    (Array.isArray(dailyActivity) ? dailyActivity : [])
+      .map((entry) => (isIsoDateString(entry?.date) ? entry.date : ''))
+      .filter(Boolean),
+  )).sort();
+
+  if (dates.length === 0) {
+    return 0;
+  }
+
+  let streak = 1;
+  let expectedDate = dates[dates.length - 1];
+
+  for (let index = dates.length - 2; index >= 0; index -= 1) {
+    const previousDate = shiftIsoDate(expectedDate, -1);
+    if (dates[index] !== previousDate) {
+      break;
+    }
+
+    streak += 1;
+    expectedDate = dates[index];
+  }
+
+  return streak;
+}
+
+function shiftIsoDate(value, offsetDays) {
+  if (!isIsoDateString(value) || !Number.isFinite(offsetDays)) {
+    return '';
+  }
+
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + offsetDays);
+  return date.toISOString().slice(0, 10);
+}
+
+function isIsoDateString(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function normalizeNonNegativeNumber(value) {
+  return Number.isFinite(value) && value > 0
+    ? Math.max(0, Math.round(value))
+    : 0;
+}
+
+function getCodexAuthClaims(auth) {
+  const idTokenClaims = parseJwtPayload(auth?.tokens?.id_token);
+  if (idTokenClaims?.['https://api.openai.com/auth']) {
+    return idTokenClaims['https://api.openai.com/auth'];
+  }
+
+  const accessTokenClaims = parseJwtPayload(auth?.tokens?.access_token);
+  return accessTokenClaims?.['https://api.openai.com/auth'] || null;
+}
+
+function parseJwtPayload(token) {
+  if (typeof token !== 'string' || !token.trim()) {
+    return null;
+  }
+
+  const parts = token.trim().split('.');
+  if (parts.length < 2) {
+    return null;
+  }
+
+  try {
+    const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const paddedPayload = payload.padEnd(Math.ceil(payload.length / 4) * 4, '=');
+    return JSON.parse(Buffer.from(paddedPayload, 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+const codexSessionFilePathCache = new Map();
+const codexTokenCountEventCache = new Map();
+const claudeSessionFilePathCache = new Map();
+const claudeAssistantUsageCache = new Map();
+
+function findLatestCodexTokenCountEvent(sessionRoot) {
+  const latestSessionFile = findLatestCodexSessionFile(sessionRoot);
+  return findLatestCodexTokenCountEventInFile(latestSessionFile);
+}
+
+function findLatestCodexTokenCountEventForThreadId(sessionRoot, threadId) {
+  const sessionFile = findCodexSessionFileByThreadId(sessionRoot, threadId);
+  return findLatestCodexTokenCountEventInFile(sessionFile);
+}
+
+function findLatestCodexTokenCountEventInFile(sessionFile) {
+  if (!sessionFile) {
+    return null;
+  }
+
+  try {
+    const stats = fs.statSync(sessionFile);
+    const cachedEvent = codexTokenCountEventCache.get(sessionFile);
+    if (cachedEvent && cachedEvent.mtimeMs === stats.mtimeMs) {
+      return cachedEvent.event;
+    }
+
+    const content = fs.readFileSync(sessionFile, 'utf8');
+    const lines = content.split(/\r?\n/);
+    let latestTokenEvent = null;
+
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index]?.trim();
+      if (!line) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed?.type === 'event_msg' && parsed?.payload?.type === 'token_count') {
+          latestTokenEvent = parsed;
+          break;
+        }
+      } catch {
+        // Ignore malformed lines and keep scanning backwards.
+      }
+    }
+
+    codexTokenCountEventCache.set(sessionFile, {
+      event: latestTokenEvent,
+      mtimeMs: stats.mtimeMs,
+    });
+    return latestTokenEvent;
+  } catch {
+    return null;
+  }
+}
+
+function findCodexSessionFileByThreadId(sessionRoot, threadId) {
+  if (!directoryExists(sessionRoot) || typeof threadId !== 'string' || !threadId.trim()) {
+    return '';
+  }
+
+  const normalizedThreadId = threadId.trim();
+  const cachedPath = codexSessionFilePathCache.get(normalizedThreadId);
+  if (cachedPath && fs.existsSync(cachedPath)) {
+    return cachedPath;
+  }
+
+  const queue = [sessionRoot];
+  while (queue.length > 0) {
+    const currentDirectory = queue.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDirectory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentDirectory, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(entryPath);
+        continue;
+      }
+
+      if (!entry.isFile() || !entry.name.endsWith(`${normalizedThreadId}.jsonl`)) {
+        continue;
+      }
+
+      codexSessionFilePathCache.set(normalizedThreadId, entryPath);
+      return entryPath;
+    }
+  }
+
+  return '';
+}
+
+function findLatestCodexSessionFile(sessionRoot) {
+  if (!directoryExists(sessionRoot)) {
+    return '';
+  }
+
+  let latestMatch = '';
+  let latestMtimeMs = 0;
+  const queue = [sessionRoot];
+
+  while (queue.length > 0) {
+    const currentDirectory = queue.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDirectory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentDirectory, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(entryPath);
+        continue;
+      }
+
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) {
+        continue;
+      }
+
+      try {
+        const stats = fs.statSync(entryPath);
+        if (!stats.isFile() || stats.mtimeMs <= latestMtimeMs) {
+          continue;
+        }
+
+        latestMatch = entryPath;
+        latestMtimeMs = stats.mtimeMs;
+      } catch {
+        // Ignore files that disappear during the scan.
+      }
+    }
+  }
+
+  return latestMatch;
+}
+
+function findLatestClaudeAssistantUsageForSessionId(projectsRoot, sessionId, workspacePath = '') {
+  const sessionFile = findClaudeSessionFileBySessionId(projectsRoot, sessionId, workspacePath);
+  return findLatestClaudeAssistantUsageInFile(sessionFile);
+}
+
+function findLatestClaudeAssistantUsageInFile(sessionFile) {
+  if (!sessionFile) {
+    return null;
+  }
+
+  try {
+    const stats = fs.statSync(sessionFile);
+    const cachedUsage = claudeAssistantUsageCache.get(sessionFile);
+    if (cachedUsage && cachedUsage.mtimeMs === stats.mtimeMs) {
+      return cachedUsage.entry;
+    }
+
+    const content = fs.readFileSync(sessionFile, 'utf8');
+    const lines = content.split(/\r?\n/);
+    let latestUsage = null;
+
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index]?.trim();
+      if (!line) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(line);
+        const message = parsed?.message;
+        if (
+          parsed?.type === 'assistant'
+          && message?.role === 'assistant'
+          && message?.usage
+          && typeof message.usage === 'object'
+        ) {
+          latestUsage = {
+            model: typeof message.model === 'string' ? message.model.trim() : '',
+            timestamp: typeof parsed.timestamp === 'string' ? parsed.timestamp : '',
+            usage: message.usage,
+          };
+          break;
+        }
+      } catch {
+        // Ignore malformed lines and keep scanning backwards.
+      }
+    }
+
+    claudeAssistantUsageCache.set(sessionFile, {
+      entry: latestUsage,
+      mtimeMs: stats.mtimeMs,
+    });
+    return latestUsage;
+  } catch {
+    return null;
+  }
+}
+
+function findClaudeSessionFileBySessionId(projectsRoot, sessionId, workspacePath = '') {
+  if (!directoryExists(projectsRoot) || typeof sessionId !== 'string' || !sessionId.trim()) {
+    return '';
+  }
+
+  const normalizedSessionId = sessionId.trim();
+  const cachedPath = claudeSessionFilePathCache.get(normalizedSessionId);
+  if (cachedPath && fs.existsSync(cachedPath)) {
+    return cachedPath;
+  }
+
+  const directPath = getClaudeProjectSessionFilePath(projectsRoot, normalizedSessionId, workspacePath);
+  if (directPath) {
+    claudeSessionFilePathCache.set(normalizedSessionId, directPath);
+    return directPath;
+  }
+
+  const queue = [projectsRoot];
+  while (queue.length > 0) {
+    const currentDirectory = queue.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDirectory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentDirectory, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(entryPath);
+        continue;
+      }
+
+      if (!entry.isFile() || entry.name !== `${normalizedSessionId}.jsonl`) {
+        continue;
+      }
+
+      claudeSessionFilePathCache.set(normalizedSessionId, entryPath);
+      return entryPath;
+    }
+  }
+
+  return '';
+}
+
+function getClaudeProjectSessionFilePath(projectsRoot, sessionId, workspacePath = '') {
+  if (typeof workspacePath !== 'string' || !workspacePath.trim()) {
+    return '';
+  }
+
+  const projectDirectory = normalizeClaudeProjectDirectoryName(workspacePath);
+  if (!projectDirectory) {
+    return '';
+  }
+
+  const sessionFile = path.join(projectsRoot, projectDirectory, `${sessionId}.jsonl`);
+  return fs.existsSync(sessionFile) ? sessionFile : '';
+}
+
+function normalizeClaudeProjectDirectoryName(workspacePath) {
+  if (typeof workspacePath !== 'string' || !workspacePath.trim()) {
+    return '';
+  }
+
+  return workspacePath.trim().replace(/[\\/]/g, '-');
+}
+
+function normalizeCodexContextUsage(info, updatedAt = '') {
+  if (!info || typeof info !== 'object') {
+    return null;
+  }
+
+  const totalTokenUsage = normalizeCodexTokenUsage(info.total_token_usage);
+  const lastTokenUsage = normalizeCodexTokenUsage(info.last_token_usage);
+  const modelContextWindow = normalizeNonNegativeNumber(info.model_context_window);
+  const contextTokenUsage = buildCodexContextTokenUsage(lastTokenUsage);
+  const usedTokens = normalizeNonNegativeNumber(
+    contextTokenUsage?.totalTokens || totalTokenUsage?.totalTokens,
+  );
+  const remainingTokens = modelContextWindow > 0
+    ? Math.max(modelContextWindow - usedTokens, 0)
+    : 0;
+  const usedRatio = modelContextWindow > 0
+    ? Math.min(Math.max(usedTokens / modelContextWindow, 0), 1)
+    : 0;
+
+  if (!modelContextWindow && !totalTokenUsage && !lastTokenUsage) {
+    return null;
+  }
+
+  return {
+    lastTokenUsage,
+    modelContextWindow,
+    remainingTokens,
+    totalTokenUsage: contextTokenUsage || totalTokenUsage,
+    updatedAt,
+    usedRatio,
+    usedTokens,
+  };
+}
+
+function normalizeClaudeContextUsage(usage, modelContextWindow, updatedAt = '') {
+  const lastTokenUsage = normalizeClaudeTokenUsage(usage);
+  const usedTokens = normalizeNonNegativeNumber(
+    (lastTokenUsage?.inputTokens || 0) + (lastTokenUsage?.cachedInputTokens || 0),
+  );
+  const totalTokenUsage = usedTokens > 0
+    ? {
+      cachedInputTokens: lastTokenUsage?.cachedInputTokens || 0,
+      inputTokens: lastTokenUsage?.inputTokens || 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      totalTokens: usedTokens,
+    }
+    : null;
+  const remainingTokens = modelContextWindow > 0
+    ? Math.max(modelContextWindow - usedTokens, 0)
+    : 0;
+  const usedRatio = modelContextWindow > 0
+    ? Math.min(Math.max(usedTokens / modelContextWindow, 0), 1)
+    : 0;
+
+  if (!modelContextWindow && !lastTokenUsage) {
+    return null;
+  }
+
+  return {
+    lastTokenUsage,
+    modelContextWindow,
+    remainingTokens,
+    totalTokenUsage,
+    updatedAt,
+    usedRatio,
+    usedTokens,
+  };
+}
+
+function normalizeCodexTokenUsage(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return null;
+  }
+
+  const normalizedUsage = {
+    cachedInputTokens: normalizeNonNegativeNumber(usage.cached_input_tokens),
+    inputTokens: normalizeNonNegativeNumber(usage.input_tokens),
+    outputTokens: normalizeNonNegativeNumber(usage.output_tokens),
+    reasoningOutputTokens: normalizeNonNegativeNumber(usage.reasoning_output_tokens),
+    totalTokens: normalizeNonNegativeNumber(usage.total_tokens),
+  };
+
+  return Object.values(normalizedUsage).some((value) => value > 0)
+    ? normalizedUsage
+    : null;
+}
+
+function buildCodexContextTokenUsage(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return null;
+  }
+
+  const inputTokens = normalizeNonNegativeNumber(usage.inputTokens);
+  const cachedInputTokens = normalizeNonNegativeNumber(usage.cachedInputTokens);
+  const outputTokens = normalizeNonNegativeNumber(usage.outputTokens);
+  const totalTokens = normalizeNonNegativeNumber(usage.totalTokens) || (inputTokens + outputTokens);
+
+  if (totalTokens <= 0) {
+    return null;
+  }
+
+  return {
+    cachedInputTokens,
+    inputTokens,
+    outputTokens,
+    reasoningOutputTokens: 0,
+    totalTokens,
+  };
+}
+
+function normalizeClaudeTokenUsage(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return null;
+  }
+
+  const inputTokens = normalizeNonNegativeNumber(usage.input_tokens);
+  const cachedInputTokens = normalizeNonNegativeNumber(usage.cache_read_input_tokens)
+    + normalizeNonNegativeNumber(usage.cache_creation_input_tokens);
+  const outputTokens = normalizeNonNegativeNumber(usage.output_tokens);
+  const totalTokens = inputTokens + cachedInputTokens + outputTokens;
+
+  if (!totalTokens) {
+    return null;
+  }
+
+  return {
+    cachedInputTokens,
+    inputTokens,
+    outputTokens,
+    reasoningOutputTokens: 0,
+    totalTokens,
+  };
+}
+
+function inferClaudeModelContextWindow(...candidates) {
+  let sawClaudeModel = false;
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || !candidate.trim()) {
+      continue;
+    }
+
+    const normalizedCandidate = candidate.trim().toLowerCase();
+    if (
+      normalizedCandidate === 'opus[1m]'
+      || normalizedCandidate === 'sonnet[1m]'
+      || normalizedCandidate.includes('[1m]')
+      || normalizedCandidate.includes('1m context')
+    ) {
+      return 1_000_000;
+    }
+
+    if (
+      normalizedCandidate === 'haiku'
+      || normalizedCandidate === 'sonnet'
+      || normalizedCandidate === 'opus'
+      || normalizedCandidate.includes('claude-haiku-')
+      || normalizedCandidate.includes('claude-sonnet-')
+      || normalizedCandidate.includes('claude-opus-')
+    ) {
+      sawClaudeModel = true;
+    }
+  }
+
+  return sawClaudeModel ? 200_000 : 0;
+}
+
+function normalizeCodexRateLimits(rateLimits) {
+  if (!rateLimits || typeof rateLimits !== 'object') {
+    return null;
+  }
+
+  const normalizedRateLimits = {
+    primary: normalizeCodexRateLimitWindow(rateLimits.primary),
+    secondary: normalizeCodexRateLimitWindow(rateLimits.secondary),
+  };
+
+  return normalizedRateLimits.primary || normalizedRateLimits.secondary
+    ? normalizedRateLimits
+    : null;
+}
+
+function normalizeCodexRateLimitWindow(window) {
+  if (!window || typeof window !== 'object') {
+    return null;
+  }
+
+  const usedPercent = Number.isFinite(window.used_percent)
+    ? Number(window.used_percent)
+    : null;
+  const windowMinutes = normalizeNonNegativeNumber(window.window_minutes);
+  const resetsAt = Number.isFinite(window.resets_at) && window.resets_at > 0
+    ? new Date(window.resets_at * 1000).toISOString()
+    : '';
+
+  if (!Number.isFinite(usedPercent) && !windowMinutes && !resetsAt) {
+    return null;
+  }
+
+  return {
+    resetsAt,
+    usedPercent,
+    windowMinutes,
+  };
+}
+
+function normalizeCodexPlanType(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
 function extractProviderModelCatalog(provider, executablePath, env) {
@@ -4324,6 +6499,526 @@ function extractCodexModelCatalog(codexHome) {
   } catch {
     return [];
   }
+}
+
+function getEffectiveSessionDefaults(workspacePath, session) {
+  if (normalizeSessionProvider(session?.provider) !== 'codex') {
+    return {
+      model: '',
+      reasoningEffort: '',
+    };
+  }
+
+  return readCodexConfigDefaults(workspacePath);
+}
+
+function readCodexConfigDefaults(workspacePath = '') {
+  const configPath = path.join(getProviderHome('codex'), 'config.toml');
+  let stats;
+
+  try {
+    stats = fs.statSync(configPath);
+  } catch {
+    return {
+      model: '',
+      reasoningEffort: '',
+    };
+  }
+
+  if (
+    codexConfigDefaultsCache.path !== configPath
+    || codexConfigDefaultsCache.mtimeMs !== stats.mtimeMs
+    || !codexConfigDefaultsCache.parsed
+  ) {
+    codexConfigDefaultsCache = {
+      mtimeMs: stats.mtimeMs,
+      parsed: parseCodexConfigDefaults(fs.readFileSync(configPath, 'utf8')),
+      path: configPath,
+    };
+  }
+
+  return resolveCodexConfigDefaultsForWorkspace(codexConfigDefaultsCache.parsed, workspacePath);
+}
+
+function parseCodexConfigDefaults(source) {
+  const root = {};
+  const projects = [];
+  let activeSection = 'root';
+  let activeProject = null;
+
+  for (const rawLine of String(source || '').split(/\r?\n/)) {
+    const line = stripTomlComment(rawLine).trim();
+    if (!line) {
+      continue;
+    }
+
+    const projectSectionMatch = line.match(/^\[projects\."((?:\\.|[^"])*)"\]$/);
+    if (projectSectionMatch) {
+      activeSection = 'project';
+      activeProject = {
+        path: unescapeTomlBasicString(projectSectionMatch[1]),
+        values: {},
+      };
+      projects.push(activeProject);
+      continue;
+    }
+
+    if (/^\[.*\]$/.test(line)) {
+      activeSection = 'other';
+      activeProject = null;
+      continue;
+    }
+
+    const assignmentMatch = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*"((?:\\.|[^"])*)"$/);
+    if (!assignmentMatch) {
+      continue;
+    }
+
+    const [, key, rawValue] = assignmentMatch;
+    if (key !== 'model' && key !== 'model_reasoning_effort') {
+      continue;
+    }
+
+    const target = activeSection === 'project' && activeProject
+      ? activeProject.values
+      : (activeSection === 'root' ? root : null);
+    if (!target) {
+      continue;
+    }
+
+    target[key] = unescapeTomlBasicString(rawValue);
+  }
+
+  return {
+    projects,
+    root,
+  };
+}
+
+function resolveCodexConfigDefaultsForWorkspace(parsedConfig, workspacePath = '') {
+  const root = parsedConfig?.root && typeof parsedConfig.root === 'object'
+    ? parsedConfig.root
+    : {};
+  const projectValues = findBestMatchingCodexProjectConfig(parsedConfig?.projects, workspacePath);
+
+  return {
+    model: typeof projectValues?.model === 'string' && projectValues.model.trim()
+      ? projectValues.model.trim()
+      : (typeof root.model === 'string' ? root.model.trim() : ''),
+    reasoningEffort: normalizeSessionReasoningEffort(
+      typeof projectValues?.model_reasoning_effort === 'string' && projectValues.model_reasoning_effort.trim()
+        ? projectValues.model_reasoning_effort.trim()
+        : root.model_reasoning_effort,
+    ),
+  };
+}
+
+function findBestMatchingCodexProjectConfig(projects, workspacePath = '') {
+  if (!Array.isArray(projects) || projects.length === 0 || !workspacePath) {
+    return null;
+  }
+
+  const normalizedWorkspacePath = normalizeComparablePath(workspacePath);
+  if (!normalizedWorkspacePath) {
+    return null;
+  }
+
+  let bestMatch = null;
+  let bestMatchLength = -1;
+
+  for (const project of projects) {
+    const normalizedProjectPath = normalizeComparablePath(project?.path);
+    if (!normalizedProjectPath || !isComparablePathPrefix(normalizedProjectPath, normalizedWorkspacePath)) {
+      continue;
+    }
+
+    if (normalizedProjectPath.length <= bestMatchLength) {
+      continue;
+    }
+
+    bestMatch = project.values || null;
+    bestMatchLength = normalizedProjectPath.length;
+  }
+
+  return bestMatch;
+}
+
+function normalizeComparablePath(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return '';
+  }
+
+  return path.resolve(value.trim());
+}
+
+function isComparablePathPrefix(prefixPath, targetPath) {
+  if (!prefixPath || !targetPath) {
+    return false;
+  }
+
+  return targetPath === prefixPath || targetPath.startsWith(`${prefixPath}${path.sep}`);
+}
+
+function stripTomlComment(line) {
+  let result = '';
+  let inString = false;
+  let escaping = false;
+
+  for (const character of String(line || '')) {
+    if (escaping) {
+      result += character;
+      escaping = false;
+      continue;
+    }
+
+    if (character === '\\') {
+      result += character;
+      escaping = inString;
+      continue;
+    }
+
+    if (character === '"') {
+      inString = !inString;
+      result += character;
+      continue;
+    }
+
+    if (character === '#' && !inString) {
+      break;
+    }
+
+    result += character;
+  }
+
+  return result;
+}
+
+function unescapeTomlBasicString(value) {
+  return String(value || '')
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+}
+
+function inspectCodeEditors(platform = process.platform) {
+  const macApplications = platform === 'darwin'
+    ? collectMacApplicationsByName(
+      CODE_EDITOR_CANDIDATES.flatMap((editor) => editor.macAppNames || []),
+    )
+    : new Map();
+
+  return CODE_EDITOR_CANDIDATES.reduce((editors, candidate) => {
+    const matchedApplicationPath = platform === 'darwin'
+      ? pickFirstDetectedPath(
+        (candidate.macAppNames || []).flatMap((appName) => (
+          macApplications.get(appName.toLowerCase()) || []
+        )),
+      )
+      : '';
+
+    if (matchedApplicationPath) {
+      editors.push({
+        key: candidate.key,
+        label: candidate.label,
+        path: matchedApplicationPath,
+      });
+      return editors;
+    }
+
+    const executablePath = resolveCodeEditorExecutablePath(candidate.commands || []);
+    if (executablePath) {
+      editors.push({
+        key: candidate.key,
+        label: candidate.label,
+        path: executablePath,
+      });
+    }
+
+    return editors;
+  }, []);
+}
+
+function normalizeCodeEditorKey(value) {
+  const normalizedValue = typeof value === 'string'
+    ? value.trim().toLowerCase()
+    : '';
+
+  if (!normalizedValue) {
+    return '';
+  }
+
+  return CODE_EDITOR_KEY_ALIASES.get(normalizedValue) || '';
+}
+
+function getCodeEditorCandidate(editorKey) {
+  const normalizedEditorKey = normalizeCodeEditorKey(editorKey);
+  return CODE_EDITOR_CANDIDATES.find((editor) => editor.key === normalizedEditorKey) || null;
+}
+
+function resolveSelectedCodeEditorKey(storedKey, availableEditors = []) {
+  const normalizedStoredKey = normalizeCodeEditorKey(storedKey);
+  const availableKeys = new Set(
+    (Array.isArray(availableEditors) ? availableEditors : [])
+      .map((editor) => normalizeCodeEditorKey(editor?.key))
+      .filter(Boolean),
+  );
+
+  if (normalizedStoredKey && availableKeys.has(normalizedStoredKey)) {
+    return normalizedStoredKey;
+  }
+
+  if (availableKeys.has(DEFAULT_CODE_EDITOR_KEY)) {
+    return DEFAULT_CODE_EDITOR_KEY;
+  }
+
+  return normalizeCodeEditorKey(availableEditors[0]?.key);
+}
+
+function collectMacApplicationsByName(appNames = []) {
+  const names = Array.from(new Set(
+    appNames
+      .filter((appName) => typeof appName === 'string' && appName.trim())
+      .map((appName) => appName.trim().toLowerCase()),
+  ));
+
+  if (names.length === 0) {
+    return new Map();
+  }
+
+  const matches = new Map(names.map((name) => [name, []]));
+  for (const rootPath of getMacApplicationSearchRoots()) {
+    scanMacApplicationDirectory(rootPath, matches, 0);
+  }
+
+  return matches;
+}
+
+function scanMacApplicationDirectory(directoryPath, matches, depth) {
+  if (!directoryExists(directoryPath)) {
+    return;
+  }
+
+  let entries = [];
+  try {
+    entries = fs.readdirSync(directoryPath, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  entries
+    .slice()
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .forEach((entry) => {
+      const entryPath = path.join(directoryPath, entry.name);
+      const lowerName = entry.name.toLowerCase();
+
+      if (lowerName.endsWith('.app')) {
+        const resolvedAppPath = resolveApplicationBundlePath(entryPath);
+        if (resolvedAppPath && matches.has(lowerName)) {
+          pushUniqueValue(matches.get(lowerName), resolvedAppPath);
+        }
+        return;
+      }
+
+      if (depth >= MAC_APPLICATION_SCAN_DEPTH || !isDirectoryLike(entry, entryPath)) {
+        return;
+      }
+
+      scanMacApplicationDirectory(entryPath, matches, depth + 1);
+    });
+}
+
+function getMacApplicationSearchRoots() {
+  return [
+    '/Applications',
+    path.join(os.homedir(), 'Applications'),
+    '/System/Applications',
+  ];
+}
+
+function isDirectoryLike(entry, entryPath) {
+  if (entry?.isDirectory()) {
+    return true;
+  }
+
+  if (!entry?.isSymbolicLink()) {
+    return false;
+  }
+
+  try {
+    return fs.statSync(entryPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function resolveApplicationBundlePath(appPath) {
+  if (!appPath || typeof appPath !== 'string') {
+    return '';
+  }
+
+  try {
+    const stats = fs.statSync(appPath);
+    if (!stats.isDirectory()) {
+      return '';
+    }
+
+    return fs.realpathSync(appPath);
+  } catch {
+    return '';
+  }
+}
+
+function resolveCodeEditorExecutablePath(commands = []) {
+  for (const commandName of commands) {
+    if (!commandName) {
+      continue;
+    }
+
+    const pathResolved = findExecutableInPath(commandName, process.env.PATH || '');
+    if (pathResolved) {
+      return pathResolved;
+    }
+
+    for (const candidate of getCommonExecutableCandidates(commandName)) {
+      const resolved = resolveExecutableCandidate(candidate);
+      if (resolved) {
+        return resolved;
+      }
+    }
+  }
+
+  return '';
+}
+
+function openPathInCodeEditor(editor, targetPath, options = {}) {
+  const editorPath = typeof editor?.path === 'string' ? editor.path.trim() : '';
+  const editorKey = normalizeCodeEditorKey(editor?.key);
+  if (!editorPath || !targetPath) {
+    throw new Error('缺少编辑器或目标路径。');
+  }
+
+  const launchPath = resolveCodeEditorLaunchPath(editor, editorKey);
+  const launchArgs = buildCodeEditorLaunchArgs(editorKey, targetPath, options);
+  const fallbackTargets = getCodeEditorFallbackTargets(targetPath, options.workspacePath);
+
+  if (launchPath) {
+    try {
+      const proc = spawn(launchPath, launchArgs.length > 0 ? launchArgs : fallbackTargets, {
+        detached: true,
+        stdio: 'ignore',
+      });
+      proc.unref();
+      return;
+    } catch (error) {
+      if (!editorPath.toLowerCase().endsWith('.app')) {
+        throw new Error(error?.message || '无法使用所选编辑器打开目标路径。');
+      }
+    }
+  }
+
+  if (process.platform === 'darwin' && editorPath.toLowerCase().endsWith('.app')) {
+    const result = spawnSync('open', [
+      '-a',
+      editorPath,
+      ...(launchArgs.length > 0 ? ['--args', ...launchArgs] : fallbackTargets),
+    ], {
+      encoding: 'utf8',
+    });
+
+    if (result.error) {
+      throw result.error;
+    }
+
+    if (result.status !== 0) {
+      throw new Error((result.stderr || result.stdout || '无法使用所选编辑器打开目标路径。').trim());
+    }
+
+    return;
+  }
+
+  throw new Error('无法使用所选编辑器打开目标路径。');
+}
+
+function buildCodeEditorLaunchArgs(editorKey, targetPath, options = {}) {
+  const workspacePath = typeof options.workspacePath === 'string' ? options.workspacePath.trim() : '';
+  const gotoTarget = formatCodeEditorGotoTarget(targetPath, options.line, options.column);
+
+  if (VS_CODE_LIKE_EDITOR_KEYS.has(editorKey)) {
+    const args = [];
+    if (workspacePath && workspacePath !== targetPath) {
+      args.push('--reuse-window', workspacePath);
+    }
+
+    if (gotoTarget) {
+      args.push('--goto', gotoTarget);
+    } else {
+      args.push(targetPath);
+    }
+
+    return args;
+  }
+
+  if (MULTI_TARGET_GOTO_EDITOR_KEYS.has(editorKey)) {
+    return [
+      ...getCodeEditorFallbackTargets(targetPath, workspacePath).filter((entry) => entry !== targetPath),
+      gotoTarget || targetPath,
+    ];
+  }
+
+  return [];
+}
+
+function getCodeEditorFallbackTargets(targetPath, workspacePath) {
+  return Array.from(new Set(
+    [workspacePath, targetPath]
+      .filter((entry) => typeof entry === 'string' && entry.trim()),
+  ));
+}
+
+function formatCodeEditorGotoTarget(targetPath, line, column) {
+  const normalizedLine = Number.isInteger(line) && line > 0 ? line : null;
+  const normalizedColumn = Number.isInteger(column) && column > 0 ? column : null;
+  if (!normalizedLine) {
+    return '';
+  }
+
+  return `${targetPath}:${normalizedLine}${normalizedColumn ? `:${normalizedColumn}` : ''}`;
+}
+
+function resolveCodeEditorLaunchPath(editor, editorKey) {
+  const editorPath = typeof editor?.path === 'string' ? editor.path.trim() : '';
+  if (!editorPath) {
+    return '';
+  }
+
+  if (!editorPath.toLowerCase().endsWith('.app')) {
+    return editorPath;
+  }
+
+  const candidate = getCodeEditorCandidate(editorKey);
+  if (candidate?.macCliRelativePath) {
+    const bundledCliPath = resolveExecutableCandidate(path.join(editorPath, candidate.macCliRelativePath));
+    if (bundledCliPath) {
+      return bundledCliPath;
+    }
+  }
+
+  return resolveCodeEditorExecutablePath(candidate?.commands || []);
+}
+
+function pickFirstDetectedPath(paths = []) {
+  return Array.from(new Set((Array.isArray(paths) ? paths : []).filter(Boolean)))[0] || '';
+}
+
+function pushUniqueValue(target, value) {
+  if (!Array.isArray(target) || !value || target.includes(value)) {
+    return;
+  }
+
+  target.push(value);
 }
 
 function resolveProviderExecutablePath(provider, env = process.env) {
@@ -4681,11 +7376,15 @@ function parseSkillInstallArgs(args) {
 
 function collectInstalledSkills(workspacePath, provider = DEFAULT_PROVIDER) {
   const normalizedProvider = normalizeSessionProvider(provider);
+  const providerSkillRoot = path.join(getProviderHome(normalizedProvider), 'skills');
   const roots = [
-    { path: path.join(getProviderHome(normalizedProvider), 'skills'), scope: 'user' },
+    { path: providerSkillRoot, scope: 'user' },
+    { path: path.join(providerSkillRoot, '.system'), scope: 'system' },
   ];
   if (workspacePath) {
-    roots.push({ path: path.join(workspacePath, getProjectProviderDirectoryName(normalizedProvider), 'skills'), scope: 'project' });
+    const projectSkillRoot = path.join(workspacePath, getProjectProviderDirectoryName(normalizedProvider), 'skills');
+    roots.push({ path: projectSkillRoot, scope: 'project' });
+    roots.push({ path: path.join(projectSkillRoot, '.system'), scope: 'system' });
   }
   const entries = [];
   const seen = new Set();

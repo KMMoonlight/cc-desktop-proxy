@@ -1,7 +1,7 @@
 {
   "name": "cli_proxy",
   "version": "1.0.0",
-  "productName": "CLI Proxy",
+  "productName": "CC Desktop Proxy",
   "main": "electron/main.cjs",
   "scripts": {
     "build": "vite build",
@@ -46,7 +46,7 @@
   },
   "build": {
     "appId": "com.sai.cli-proxy",
-    "productName": "CLI Proxy",
+    "productName": "CC Desktop Proxy",
     "asar": true,
     "directories": {
       "output": "release",

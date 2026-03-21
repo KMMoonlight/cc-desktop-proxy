@@ -19,20 +19,30 @@ CC Desktop Proxy 不是一个云端代理服务，而是一个运行在你本机
 
 如果你希望同时管理多个仓库、多个 agent 会话，并且希望用 GUI 来查看 diff、审批请求和 provider 状态，这个项目就是为这类场景准备的。
 
+![CC Desktop Proxy overview](example_img/overview.png)
+
 ### 核心功能
 
 - 双 Provider 会话
   在同一个应用里使用 `Claude` 和 `Codex`。每个会话都可以在真正开始对话前切换 provider，并分别维护模型、模式和推理强度。
+
+  ![Provider switching](example_img/provider_change.png)
 - 多工作区、多分屏
   支持添加多个本地仓库，在一个窗口中拆分多个 conversation pane，并通过快捷键快速聚焦、关闭或新建 pane。
+
+  ![Sidebar](example_img/sidebar.png)
 - Git 变更窗口
   可以查看工作区当前的 Git 变更、文件树、patch、增删行统计，并直接把工作区或当前文件交给代码编辑器打开。
+
+  ![Git diff window](example_img/git_diff.png)
 - 代码编辑器联动
   应用会检测本机常见编辑器，并允许你在设置中选择默认编辑器。消息里的本地路径链接也会优先在选定编辑器中打开。
 - 会话级控制
   支持 provider、model、Claude mode、Codex reasoning effort、Codex plan mode 等会话级选项。
 - Provider 设置
   支持为每个 provider 单独配置启用状态、system prompt 和本地状态刷新。
+
+  ![Settings dialog](example_img/settings.png)
 - Slash 命令
   内置 `/clear`、`/model`、`/provider`、`/theme`、`/mcp`、`/skills`，以及 Claude 专属 `/mode`、Codex 专属 `/reasoning`（兼容 `/effort`）。
 - Skills 管理
@@ -151,6 +161,8 @@ macOS 发布相关变量见：
 | `/mode ...` | Claude 会话模式切换 |
 | `/reasoning ...` | Codex 推理强度切换 |
 | `/effort ...` | `/reasoning` 的兼容别名 |
+
+![Slash commands](example_img/slash.png)
 
 ### 项目结构
 

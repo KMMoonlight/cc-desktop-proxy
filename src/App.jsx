@@ -21,6 +21,8 @@ import {
   Image as ImageIcon,
   Info,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   MoreHorizontal,
   MessageSquarePlus,
   Paperclip,
@@ -286,6 +288,7 @@ const COPY = {
     claudeCodeUnavailable: 'Claude 不可用',
     collapseSidebar: '折叠侧边栏',
     collapseDetails: '收起详情',
+    collapseComposer: '收起输入框',
     collapseWorkspace: '收起工作目录',
     conversationEmpty: '这个会话还没有内容',
     contextWindowUsageTooltip: (used, total, percent, lastTokens) => (
@@ -298,8 +301,10 @@ const COPY = {
     emptyWorkspaces: '还没有工作目录，先添加一个本地目录。',
     expandSidebar: '展开侧边栏',
     expandDetails: '展开详情',
+    expandComposer: '展开输入框',
     expandWorkspace: '展开工作目录',
     inputPlaceholder: '输入消息或 / 指令，Enter 发送，Shift+Enter 换行...',
+    inputPlaceholderExpanded: '输入消息或 / 指令，Enter 换行，点击发送按钮发送...',
     languageLabel: '语言',
     languageChinese: '🇨🇳 中文',
     languageEnglish: '🇺🇸 English',
@@ -382,6 +387,7 @@ const COPY = {
     paneSplitLimitReached: '当前窗口尺寸下已达到最大分屏数',
     paneLoading: '正在载入对话...',
     noSessionCommandHint: '输入 /clear 新建对话，或先在左侧选择一个历史会话',
+    noSessionCommandHintExpanded: '输入 /clear 新建对话，Enter 换行，点击发送按钮发送',
     noConversationsInWorkspace: '还没有对话',
     noSessionsYet: '先在左侧创建或选择一个历史会话',
     noWorkspaceSelected: '选择一个工作目录',
@@ -521,6 +527,7 @@ const COPY = {
     claudeCodeUnavailable: 'Claude unavailable',
     collapseSidebar: 'Collapse sidebar',
     collapseDetails: 'Hide details',
+    collapseComposer: 'Collapse composer',
     collapseWorkspace: 'Collapse workspace',
     conversationEmpty: 'This conversation is empty',
     contextWindowUsageTooltip: (used, total, percent, lastTokens) => (
@@ -533,8 +540,10 @@ const COPY = {
     emptyWorkspaces: 'No workspaces yet. Add a local folder to get started.',
     expandSidebar: 'Expand sidebar',
     expandDetails: 'Show details',
+    expandComposer: 'Expand composer',
     expandWorkspace: 'Expand workspace',
     inputPlaceholder: 'Type a message or / command, press Enter to send, Shift+Enter for a new line...',
+    inputPlaceholderExpanded: 'Type a message or / command, press Enter for a new line, then click Send to submit...',
     languageLabel: 'Language',
     languageChinese: '🇨🇳 Chinese',
     languageEnglish: '🇺🇸 English',
@@ -617,6 +626,7 @@ const COPY = {
     paneSplitLimitReached: 'Maximum split count reached for this window size',
     paneLoading: 'Loading conversation...',
     noSessionCommandHint: 'Type /clear to start a conversation, or pick one from the sidebar',
+    noSessionCommandHintExpanded: 'Type /clear to start a conversation, press Enter for a new line, then click Send',
     noConversationsInWorkspace: 'No conversations yet',
     noSessionsYet: 'Create or select a conversation from the sidebar first',
     noWorkspaceSelected: 'Select a workspace',
@@ -3878,6 +3888,7 @@ function ConversationPane({
   const [composerAttachments, setComposerAttachments] = useState([]);
   const [composerHistoryIndex, setComposerHistoryIndex] = useState(-1);
   const [isComposerTextareaFocused, setIsComposerTextareaFocused] = useState(false);
+  const [isComposerExpanded, setIsComposerExpanded] = useState(false);
   const [isProviderPickerOpen, setIsProviderPickerOpen] = useState(false);
   const [isModePickerOpen, setIsModePickerOpen] = useState(false);
   const [isReasoningPickerOpen, setIsReasoningPickerOpen] = useState(false);
@@ -3919,7 +3930,7 @@ function ConversationPane({
   );
   const highlightedSlashCommand = visibleSlashCommands[selectedSlashCommandIndex] || visibleSlashCommands[0] || null;
   const isSlashCommandMenuOpen = pane.isFocused && slashCommandQuery !== null;
-  const hasFloatingOverlayOpen = isSlashCommandMenuOpen || isProviderPickerOpen || isModePickerOpen || isReasoningPickerOpen || isModelPickerOpen;
+  const hasFloatingOverlayOpen = isComposerExpanded || isSlashCommandMenuOpen || isProviderPickerOpen || isModePickerOpen || isReasoningPickerOpen || isModelPickerOpen;
   const hasComposerAttachments = composerAttachments.length > 0;
   const composerHistoryEntries = useMemo(
     () => getComposerHistoryEntries(pane.session?.messages || []),
@@ -3983,6 +3994,7 @@ function ConversationPane({
   useEffect(() => {
     setComposerAttachments([]);
     setComposerHistoryIndex(-1);
+    setIsComposerExpanded(false);
     setIsComposerTextareaFocused(false);
     setInputValue('');
   }, [pane.session?.id]);
@@ -4104,9 +4116,35 @@ function ConversationPane({
       return;
     }
 
+    if (isComposerExpanded) {
+      textarea.style.height = '100%';
+      return;
+    }
+
     textarea.style.height = '0px';
     textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
-  }, [inputValue]);
+  }, [inputValue, isComposerExpanded]);
+
+  useEffect(() => {
+    if (!isComposerExpanded) {
+      return undefined;
+    }
+
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return undefined;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      textarea.focus();
+      const cursorPosition = textarea.value.length;
+      textarea.setSelectionRange(cursorPosition, cursorPosition);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [isComposerExpanded]);
 
   // Each pane maintains its own scroll position, including background panes that
   // continue receiving messages while another pane is focused.
@@ -4209,7 +4247,7 @@ function ConversationPane({
   }
 
   async function handleSend() {
-    if (!canUseSessionProvider) {
+    if (pane.isBusy || !canUseSessionProvider) {
       return;
     }
 
@@ -4241,6 +4279,7 @@ function ConversationPane({
       clearComposer();
       const result = await onRunSlashCommand?.(pane.id, draftInputValue);
       if (result?.handled) {
+        setIsComposerExpanded(false);
         if (typeof result.nextInputValue === 'string') {
           setInputValue(result.nextInputValue);
           if (result.nextInputValue !== '') {
@@ -4262,6 +4301,10 @@ function ConversationPane({
     const didSend = await onSendMessage?.(pane.id, draftInputValue, {
       attachments: draftAttachments,
     });
+
+    if (didSend) {
+      setIsComposerExpanded(false);
+    }
 
     if (!didSend) {
       restoreComposer();
@@ -4369,343 +4412,385 @@ function ConversationPane({
         </div>
       </div>
 
-      <div className="relative z-[1] min-h-0 flex-1">
-        {pane.isLoading ? (
-          <div className="flex h-full items-center justify-center px-5">
-            <div className="px-4 py-3 text-[13px] text-muted-foreground">
-              {copy.paneLoading}
-            </div>
-          </div>
-        ) : pane.session ? (
-          <ScrollArea
-            viewportRef={viewportRef}
-            className="h-full px-3"
-            viewportClassName="[&>div]:!block [&>div]:min-w-0 [&>div]:w-full [&>div]:max-w-full"
-          >
-            <div className="flex w-full min-w-0 flex-col gap-3 py-3">
-              {pane.displayMessages.length === 0 ? (
-                <ConversationEmptyState
-                  icon={Bot}
-                  title={copy.conversationEmpty}
-                />
-              ) : (
-                <>
-                  {pane.displayMessages.map((message) => (
-                    <ChatMessage
-                      key={message.id}
-                      approvalActionId={pendingApprovalActionId}
-                      language={language}
-                      message={message}
-                      onApprovalDecision={onApprovalDecision}
-                    />
-                  ))}
-                  {pane.shouldShowRunIndicator && <RunIndicator language={language} />}
-                </>
-              )}
-            </div>
-          </ScrollArea>
-        ) : (
-          <div className="flex h-full items-center justify-center px-5">
-            <div className="max-w-sm px-5 py-6 text-center">
-              <div className="mx-auto flex h-10 w-10 items-center justify-center text-secondary-foreground">
-                <MessageSquarePlus className="h-5 w-5" />
-              </div>
-              <p className="mt-3 text-sm font-medium text-foreground">{copy.paneEmptyTitle}</p>
-              <p className="mt-1.5 text-[13px] leading-6 text-muted-foreground">{copy.paneEmptyDescription}</p>
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div className="relative z-[1] bg-background/75 p-3">
+      <div className="relative z-[1] flex min-h-0 flex-1 flex-col">
         <div
+          aria-hidden={isComposerExpanded}
           className={cn(
-            'relative rounded-xl border bg-background shadow-sm transition-[border-color,box-shadow]',
-            isComposerTextareaFocused
-              ? 'border-ring/35 shadow-[0_0_0_1px_hsl(var(--ring)/0.14)]'
-              : 'border-input',
+            'min-h-0 flex-1 transition-opacity duration-150',
+            isComposerExpanded && 'pointer-events-none opacity-0',
           )}
         >
-          {hasComposerAttachments && (
-            <div className="absolute left-3 right-32 top-3 z-10 overflow-x-auto pb-1">
-              <div className="flex min-w-max items-center gap-2 pr-2">
-                {composerAttachments.map((attachment) => (
-                  <ComposerAttachmentChip
-                    key={attachment.path}
-                    attachment={attachment}
-                    removeLabel={copy.removeAttachment}
-                    onRemove={(attachmentPath) => {
-                      setComposerAttachments((current) => current.filter((attachment) => attachment.path !== attachmentPath));
-                    }}
+          {pane.isLoading ? (
+            <div className="flex h-full items-center justify-center px-5">
+              <div className="px-4 py-3 text-[13px] text-muted-foreground">
+                {copy.paneLoading}
+              </div>
+            </div>
+          ) : pane.session ? (
+            <ScrollArea
+              viewportRef={viewportRef}
+              className="h-full px-3"
+              viewportClassName="[&>div]:!block [&>div]:min-w-0 [&>div]:w-full [&>div]:max-w-full"
+            >
+              <div className="flex w-full min-w-0 flex-col gap-3 py-3">
+                {pane.displayMessages.length === 0 ? (
+                  <ConversationEmptyState
+                    icon={Bot}
+                    title={copy.conversationEmpty}
                   />
-                ))}
+                ) : (
+                  <>
+                    {pane.displayMessages.map((message) => (
+                      <ChatMessage
+                        key={message.id}
+                        approvalActionId={pendingApprovalActionId}
+                        language={language}
+                        message={message}
+                        onApprovalDecision={onApprovalDecision}
+                      />
+                    ))}
+                    {pane.shouldShowRunIndicator && <RunIndicator language={language} />}
+                  </>
+                )}
+              </div>
+            </ScrollArea>
+          ) : (
+            <div className="flex h-full items-center justify-center px-5">
+              <div className="max-w-sm px-5 py-6 text-center">
+                <div className="mx-auto flex h-10 w-10 items-center justify-center text-secondary-foreground">
+                  <MessageSquarePlus className="h-5 w-5" />
+                </div>
+                <p className="mt-3 text-sm font-medium text-foreground">{copy.paneEmptyTitle}</p>
+                <p className="mt-1.5 text-[13px] leading-6 text-muted-foreground">{copy.paneEmptyDescription}</p>
               </div>
             </div>
           )}
-          <Textarea
-            ref={textareaRef}
-            value={inputValue}
-            onChange={(event) => {
-              if (composerHistoryIndex !== -1) {
-                setComposerHistoryIndex(-1);
-              }
+        </div>
 
-              setInputValue(event.target.value);
-            }}
-            onFocus={() => {
-              setIsComposerTextareaFocused(true);
-            }}
-            onBlur={() => {
-              setIsComposerTextareaFocused(false);
-            }}
-            onPaste={(event) => {
-              const clipboardData = event.clipboardData;
-              if (!clipboardData || getClipboardFiles(clipboardData).length === 0) {
-                return;
-              }
-
-              event.preventDefault();
-              void handlePasteAttachments(clipboardData);
-            }}
-            onKeyDown={(event) => {
-              if (isSlashCommandMenuOpen && visibleSlashCommands.length > 0) {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault();
-                  setSelectedSlashCommandIndex((current) => (
-                    current >= visibleSlashCommands.length - 1 ? 0 : current + 1
-                  ));
-                  return;
-                }
-
-                if (event.key === 'ArrowUp') {
-                  event.preventDefault();
-                  setSelectedSlashCommandIndex((current) => (
-                    current <= 0 ? visibleSlashCommands.length - 1 : current - 1
-                  ));
-                  return;
-                }
-
-                if (event.key === 'Tab') {
-                  event.preventDefault();
-                  applySlashCommand(highlightedSlashCommand);
-                  return;
-                }
-
-                if (event.key === 'Enter' && !event.shiftKey && !resolveSlashCommandName(slashCommandQuery, sessionProvider)) {
-                  event.preventDefault();
-                  applySlashCommand(highlightedSlashCommand);
-                  return;
-                }
-              }
-
-              const canNavigateComposerHistory = !event.altKey
-                && !event.ctrlKey
-                && !event.metaKey
-                && !event.shiftKey
-                && (composerHistoryIndex !== -1 || inputValue.trim() === '');
-
-              if (canNavigateComposerHistory && event.key === 'ArrowUp') {
-                if (applyComposerHistory('previous')) {
-                  event.preventDefault();
-                  return;
-                }
-              }
-
-              if (canNavigateComposerHistory && event.key === 'ArrowDown') {
-                if (applyComposerHistory('next')) {
-                  event.preventDefault();
-                  return;
-                }
-              }
-
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                void handleSend();
-              }
-            }}
-            placeholder={
-              pane.session && !canUseSessionProvider
-                ? copy.providerSessionDisabledHint(currentProviderDisplay)
-                : (pane.session ? copy.inputPlaceholder : copy.noSessionCommandHint)
-            }
+        <div
+          className={cn(
+            'relative z-[1] bg-background/75 p-3',
+            isComposerExpanded && 'absolute inset-0 z-[25] flex min-h-0 flex-col bg-background/95 p-3 backdrop-blur-sm',
+          )}
+        >
+          <div
             className={cn(
-              'resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-32 text-[13px] shadow-none focus-visible:ring-0',
-              hasComposerAttachments ? 'min-h-[148px] pt-16' : 'min-h-[108px]',
+              'relative rounded-xl border bg-background shadow-sm transition-[border-color,box-shadow]',
+              isComposerExpanded && 'flex min-h-0 flex-1 flex-col',
+              isComposerTextareaFocused
+                ? 'border-ring/35 shadow-[0_0_0_1px_hsl(var(--ring)/0.14)]'
+                : 'border-input',
             )}
-            disabled={!pane.workspace || pane.isBusy || !canUseSessionProvider}
-          />
-          <div className="absolute bottom-3 left-3 right-32 z-10 pb-1">
-            <div className="flex items-center gap-2 pr-2">
-              {supportsClaudeModePicker ? (
-                <ComposerSelectPicker
-                  ariaLabel={copy.modeLabel}
-                  containerClassName="basis-auto max-w-[132px] shrink-0"
-                  currentLabel={currentModeDisplay}
-                  disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !canUseSessionProvider}
-                  isOpen={isModePickerOpen}
-                  menuDescription={copy.modeMenuDescription}
-                  menuHint={copy.modeMenuHint}
-                  menuTitle={copy.modeMenuTitle}
-                  options={modeOptions}
-                  pickerRef={modePickerRef}
-                  selectedValue={sessionPermissionMode}
-                  triggerVariant="minimal"
-                  onOpenChange={(nextOpen) => {
-                    setIsProviderPickerOpen(false);
-                    setIsReasoningPickerOpen(false);
-                    setIsModelPickerOpen(false);
-                    setIsModePickerOpen(nextOpen);
-                  }}
-                  onSelect={async (nextPermissionMode) => {
-                    if (nextPermissionMode === sessionPermissionMode) {
-                      setIsModePickerOpen(false);
-                      return;
-                    }
+          >
+            {hasComposerAttachments && (
+              <div className="absolute left-3 right-44 top-3 z-10 overflow-x-auto pb-1">
+                <div className="flex min-w-max items-center gap-2 pr-2">
+                  {composerAttachments.map((attachment) => (
+                    <ComposerAttachmentChip
+                      key={attachment.path}
+                      attachment={attachment}
+                      removeLabel={copy.removeAttachment}
+                      onRemove={(attachmentPath) => {
+                        setComposerAttachments((current) => current.filter((attachment) => attachment.path !== attachmentPath));
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="absolute right-3 top-3 z-10">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                  setIsComposerExpanded((current) => !current);
+                }}
+                disabled={!pane.workspace || !canUseSessionProvider}
+                aria-label={isComposerExpanded ? copy.collapseComposer : copy.expandComposer}
+                title={isComposerExpanded ? copy.collapseComposer : copy.expandComposer}
+                className="h-8 w-8 rounded-md"
+              >
+                {isComposerExpanded ? (
+                  <Minimize2 className="h-3.5 w-3.5" />
+                ) : (
+                  <Maximize2 className="h-3.5 w-3.5" />
+                )}
+              </Button>
+            </div>
+            <Textarea
+              ref={textareaRef}
+              value={inputValue}
+              onChange={(event) => {
+                if (composerHistoryIndex !== -1) {
+                  setComposerHistoryIndex(-1);
+                }
 
-                    try {
-                      await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
-                      setIsModePickerOpen(false);
-                    } catch (error) {
-                      console.error(error);
-                    }
-                  }}
-                />
-              ) : null}
-              {showsCodexPlanToggle ? (
-                <ComposerInlineSwitch
-                  ariaLabel={copy.modeOptionPlanMode}
-                  checked={isCodexPlanMode}
-                  disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !canUseSessionProvider}
-                  label={copy.modeOptionPlanMode}
-                  title={copy.codexPlanModeHint}
-                  onToggle={async () => {
-                    const nextPermissionMode = isCodexPlanMode ? 'default' : 'plan';
+                setInputValue(event.target.value);
+              }}
+              onFocus={() => {
+                setIsComposerTextareaFocused(true);
+              }}
+              onBlur={() => {
+                setIsComposerTextareaFocused(false);
+              }}
+              onPaste={(event) => {
+                const clipboardData = event.clipboardData;
+                if (!clipboardData || getClipboardFiles(clipboardData).length === 0) {
+                  return;
+                }
 
-                    try {
-                      await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
-                    } catch (error) {
-                      console.error(error);
-                    }
-                  }}
-                />
-              ) : null}
-              {showsCodexReasoningPicker ? (
+                event.preventDefault();
+                void handlePasteAttachments(clipboardData);
+              }}
+              onKeyDown={(event) => {
+                if (isSlashCommandMenuOpen && visibleSlashCommands.length > 0) {
+                  if (event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    setSelectedSlashCommandIndex((current) => (
+                      current >= visibleSlashCommands.length - 1 ? 0 : current + 1
+                    ));
+                    return;
+                  }
+
+                  if (event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    setSelectedSlashCommandIndex((current) => (
+                      current <= 0 ? visibleSlashCommands.length - 1 : current - 1
+                    ));
+                    return;
+                  }
+
+                  if (event.key === 'Tab') {
+                    event.preventDefault();
+                    applySlashCommand(highlightedSlashCommand);
+                    return;
+                  }
+
+                  if (!isComposerExpanded && event.key === 'Enter' && !event.shiftKey && !resolveSlashCommandName(slashCommandQuery, sessionProvider)) {
+                    event.preventDefault();
+                    applySlashCommand(highlightedSlashCommand);
+                    return;
+                  }
+                }
+
+                const canNavigateComposerHistory = !event.altKey
+                  && !event.ctrlKey
+                  && !event.metaKey
+                  && !event.shiftKey
+                  && (composerHistoryIndex !== -1 || inputValue.trim() === '');
+
+                if (canNavigateComposerHistory && event.key === 'ArrowUp') {
+                  if (applyComposerHistory('previous')) {
+                    event.preventDefault();
+                    return;
+                  }
+                }
+
+                if (canNavigateComposerHistory && event.key === 'ArrowDown') {
+                  if (applyComposerHistory('next')) {
+                    event.preventDefault();
+                    return;
+                  }
+                }
+
+                if (!isComposerExpanded && !pane.isBusy && event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  void handleSend();
+                }
+              }}
+              placeholder={
+                pane.session && !canUseSessionProvider
+                  ? copy.providerSessionDisabledHint(currentProviderDisplay)
+                  : (pane.session
+                    ? (isComposerExpanded ? copy.inputPlaceholderExpanded : copy.inputPlaceholder)
+                    : (isComposerExpanded ? copy.noSessionCommandHintExpanded : copy.noSessionCommandHint))
+              }
+              className={cn(
+                'resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-44 text-[13px] shadow-none focus-visible:ring-0',
+                hasComposerAttachments ? 'pt-16' : 'pt-3',
+                isComposerExpanded
+                  ? 'h-full min-h-0 flex-1 overflow-y-auto'
+                  : (hasComposerAttachments ? 'min-h-[148px]' : 'min-h-[108px]'),
+              )}
+              disabled={!pane.workspace || !canUseSessionProvider}
+            />
+            <div className="absolute bottom-3 left-3 right-44 z-10 pb-1">
+              <div className="flex items-center gap-2 pr-2">
+                {supportsClaudeModePicker ? (
+                  <ComposerSelectPicker
+                    ariaLabel={copy.modeLabel}
+                    containerClassName="basis-auto max-w-[132px] shrink-0"
+                    currentLabel={currentModeDisplay}
+                    disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !canUseSessionProvider}
+                    isOpen={isModePickerOpen}
+                    menuDescription={copy.modeMenuDescription}
+                    menuHint={copy.modeMenuHint}
+                    menuTitle={copy.modeMenuTitle}
+                    options={modeOptions}
+                    pickerRef={modePickerRef}
+                    selectedValue={sessionPermissionMode}
+                    triggerVariant="minimal"
+                    onOpenChange={(nextOpen) => {
+                      setIsProviderPickerOpen(false);
+                      setIsReasoningPickerOpen(false);
+                      setIsModelPickerOpen(false);
+                      setIsModePickerOpen(nextOpen);
+                    }}
+                    onSelect={async (nextPermissionMode) => {
+                      if (nextPermissionMode === sessionPermissionMode) {
+                        setIsModePickerOpen(false);
+                        return;
+                      }
+
+                      try {
+                        await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
+                        setIsModePickerOpen(false);
+                      } catch (error) {
+                        console.error(error);
+                      }
+                    }}
+                  />
+                ) : null}
+                {showsCodexPlanToggle ? (
+                  <ComposerInlineSwitch
+                    ariaLabel={copy.modeOptionPlanMode}
+                    checked={isCodexPlanMode}
+                    disabled={!pane.session || pane.isBusy || isUpdatingPermissionMode || !canUseSessionProvider}
+                    label={copy.modeOptionPlanMode}
+                    title={copy.codexPlanModeHint}
+                    onToggle={async () => {
+                      const nextPermissionMode = isCodexPlanMode ? 'default' : 'plan';
+
+                      try {
+                        await onUpdateSessionPermissionMode?.(pane.id, nextPermissionMode);
+                      } catch (error) {
+                        console.error(error);
+                      }
+                    }}
+                  />
+                ) : null}
+                {showsCodexReasoningPicker ? (
+                  <ComposerSelectPicker
+                    ariaLabel={copy.reasoningEffortLabel}
+                    containerClassName="basis-auto max-w-[112px] shrink-0"
+                    currentLabel={currentReasoningEffortDisplay}
+                    disabled={!pane.session || pane.isBusy || isUpdatingReasoningEffort || !canUseSessionProvider}
+                    isOpen={isReasoningPickerOpen}
+                    menuDescription={copy.reasoningEffortMenuDescription}
+                    menuHint={copy.reasoningEffortMenuHint}
+                    menuTitle={copy.reasoningEffortMenuTitle}
+                    options={reasoningEffortOptions}
+                    pickerRef={reasoningPickerRef}
+                    selectedValue={sessionReasoningEffort}
+                    triggerVariant="minimal"
+                    onOpenChange={(nextOpen) => {
+                      setIsProviderPickerOpen(false);
+                      setIsModePickerOpen(false);
+                      setIsModelPickerOpen(false);
+                      setIsReasoningPickerOpen(nextOpen);
+                    }}
+                    onSelect={async (nextReasoningEffort) => {
+                      if (nextReasoningEffort === sessionReasoningEffort) {
+                        setIsReasoningPickerOpen(false);
+                        return;
+                      }
+
+                      try {
+                        await onUpdateSessionReasoningEffort?.(pane.id, nextReasoningEffort);
+                        setIsReasoningPickerOpen(false);
+                      } catch (error) {
+                        console.error(error);
+                      }
+                    }}
+                  />
+                ) : null}
                 <ComposerSelectPicker
-                  ariaLabel={copy.reasoningEffortLabel}
-                  containerClassName="basis-auto max-w-[112px] shrink-0"
-                  currentLabel={currentReasoningEffortDisplay}
-                  disabled={!pane.session || pane.isBusy || isUpdatingReasoningEffort || !canUseSessionProvider}
-                  isOpen={isReasoningPickerOpen}
-                  menuDescription={copy.reasoningEffortMenuDescription}
-                  menuHint={copy.reasoningEffortMenuHint}
-                  menuTitle={copy.reasoningEffortMenuTitle}
-                  options={reasoningEffortOptions}
-                  pickerRef={reasoningPickerRef}
-                  selectedValue={sessionReasoningEffort}
+                  ariaLabel={copy.modelLabel}
+                  containerClassName="basis-auto max-w-[148px] shrink-0"
+                  currentLabel={currentModelDisplay}
+                  disabled={!pane.session || pane.isBusy || isUpdatingModel || !canUseSessionProvider}
+                  isOpen={isModelPickerOpen}
+                  menuDescription={copy.modelMenuDescription}
+                  menuHint={copy.modelMenuHint}
+                  menuTitle={copy.modelMenuTitle}
+                  options={modelOptions}
+                  pickerRef={modelPickerRef}
+                  selectedValue={pane.session?.model || ''}
                   triggerVariant="minimal"
                   onOpenChange={(nextOpen) => {
                     setIsProviderPickerOpen(false);
                     setIsModePickerOpen(false);
-                    setIsModelPickerOpen(false);
-                    setIsReasoningPickerOpen(nextOpen);
+                    setIsReasoningPickerOpen(false);
+                    setIsModelPickerOpen(nextOpen);
                   }}
-                  onSelect={async (nextReasoningEffort) => {
-                    if (nextReasoningEffort === sessionReasoningEffort) {
-                      setIsReasoningPickerOpen(false);
+                  onSelect={async (nextModel) => {
+                    if (nextModel === (pane.session?.model || '')) {
+                      setIsModelPickerOpen(false);
                       return;
                     }
 
                     try {
-                      await onUpdateSessionReasoningEffort?.(pane.id, nextReasoningEffort);
-                      setIsReasoningPickerOpen(false);
+                      await onUpdateSessionModel?.(pane.id, nextModel);
+                      setIsModelPickerOpen(false);
                     } catch (error) {
                       console.error(error);
                     }
                   }}
                 />
-              ) : null}
-              <ComposerSelectPicker
-                ariaLabel={copy.modelLabel}
-                containerClassName="basis-auto max-w-[148px] shrink-0"
-                currentLabel={currentModelDisplay}
-                disabled={!pane.session || pane.isBusy || isUpdatingModel || !canUseSessionProvider}
-                isOpen={isModelPickerOpen}
-                menuDescription={copy.modelMenuDescription}
-                menuHint={copy.modelMenuHint}
-                menuTitle={copy.modelMenuTitle}
-                options={modelOptions}
-                pickerRef={modelPickerRef}
-                selectedValue={pane.session?.model || ''}
-                triggerVariant="minimal"
-                onOpenChange={(nextOpen) => {
-                  setIsProviderPickerOpen(false);
-                  setIsModePickerOpen(false);
-                  setIsReasoningPickerOpen(false);
-                  setIsModelPickerOpen(nextOpen);
-                }}
-                onSelect={async (nextModel) => {
-                  if (nextModel === (pane.session?.model || '')) {
-                    setIsModelPickerOpen(false);
-                    return;
-                  }
-
-                  try {
-                    await onUpdateSessionModel?.(pane.id, nextModel);
-                    setIsModelPickerOpen(false);
-                  } catch (error) {
-                    console.error(error);
-                  }
-                }}
-              />
+              </div>
             </div>
-          </div>
-          {isSlashCommandMenuOpen ? (
-            <SlashCommandMenu
-              commands={visibleSlashCommands}
-              emptyLabel={language === 'zh' ? '没有匹配的指令' : 'No matching commands'}
-              highlightedCommandName={highlightedSlashCommand?.name || ''}
-              language={language}
-              menuRef={slashMenuRef}
-              onSelectCommand={applySlashCommand}
-            />
-          ) : null}
-          <div className="absolute bottom-3 right-3 z-10 flex items-center gap-2">
-            {shouldShowContextUsage ? (
-              <ConversationContextUsageChip
-                copy={copy}
+            {isSlashCommandMenuOpen ? (
+              <SlashCommandMenu
+                commands={visibleSlashCommands}
+                emptyLabel={language === 'zh' ? '没有匹配的指令' : 'No matching commands'}
+                highlightedCommandName={highlightedSlashCommand?.name || ''}
+                isExpanded={isComposerExpanded}
                 language={language}
-                usage={sessionContextUsage}
+                menuRef={slashMenuRef}
+                onSelectCommand={applySlashCommand}
               />
             ) : null}
-            <Button
-              type="button"
-              variant="outline"
-              size="icon"
-              onClick={handlePickAttachments}
-              disabled={!pane.workspace || pane.isBusy || !canUseSessionProvider}
-              aria-label={copy.addAttachment}
-              title={copy.addAttachment}
-              className="h-8 w-8 rounded-full border-border/80 bg-background shadow-sm hover:bg-muted"
-            >
-              <Paperclip className="h-3.5 w-3.5" />
-            </Button>
-            <Button
-              onClick={pane.session?.isRunning ? () => onStopRun?.(pane.id) : () => {
-                void handleSend();
-              }}
-              disabled={pane.session?.isRunning ? false : (!canSend || !canUseSessionProvider)}
-              size="icon"
-              aria-label={pane.session?.isRunning ? copy.runStop : (pane.isSending ? copy.sending : copy.sendMessage)}
-              className="h-8 w-8 rounded-full shadow-sm"
-            >
-              {pane.session?.isRunning ? (
-                <Square className="h-3.5 w-3.5" />
-              ) : pane.isSending ? (
-                <LoaderCircle className="h-4 w-4 animate-spin" />
-              ) : (
-                <ArrowUp className="h-4 w-4" />
-              )}
-            </Button>
+            <div className="absolute bottom-3 right-3 z-10 flex items-center gap-2">
+              {shouldShowContextUsage ? (
+                <ConversationContextUsageChip
+                  copy={copy}
+                  language={language}
+                  usage={sessionContextUsage}
+                />
+              ) : null}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={handlePickAttachments}
+                disabled={!pane.workspace || !canUseSessionProvider}
+                aria-label={copy.addAttachment}
+                title={copy.addAttachment}
+                className="h-8 w-8 rounded-md"
+              >
+                <Paperclip className="h-3.5 w-3.5" />
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                onClick={pane.session?.isRunning ? () => onStopRun?.(pane.id) : () => {
+                  void handleSend();
+                }}
+                disabled={pane.session?.isRunning ? false : (!canSend || !canUseSessionProvider)}
+                aria-label={pane.session?.isRunning ? copy.runStop : (pane.isSending ? copy.sending : copy.sendMessage)}
+                className="h-8 w-8 rounded-full shadow-sm"
+              >
+                {pane.session?.isRunning ? (
+                  <Square className="h-3.5 w-3.5" />
+                ) : pane.isSending ? (
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                ) : (
+                  <ArrowUp className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -5709,12 +5794,21 @@ function SlashCommandMenu({
   commands,
   emptyLabel,
   highlightedCommandName,
+  isExpanded = false,
   language,
   menuRef,
   onSelectCommand,
 }) {
   return (
-    <div ref={menuRef} className="absolute inset-x-0 bottom-[calc(100%+10px)] z-20 overflow-hidden rounded-2xl border border-border bg-popover text-popover-foreground shadow-xl">
+    <div
+      ref={menuRef}
+      className={cn(
+        'absolute z-20 overflow-hidden rounded-2xl border border-border bg-popover text-popover-foreground shadow-xl',
+        isExpanded
+          ? 'inset-x-3 bottom-16'
+          : 'inset-x-0 bottom-[calc(100%+10px)]',
+      )}
+    >
       <div className="border-b border-border/70 px-3 py-2 text-[11px] font-medium text-muted-foreground">
         {language === 'zh' ? 'Slash 指令' : 'Slash commands'}
       </div>
@@ -6562,13 +6656,66 @@ function getCommandEventMeta(message, language) {
   };
 }
 
+function getEditEventMeta(message) {
+  const toolMeta = normalizeToolActivityMeta(message?.toolMeta);
+  if (toolMeta?.type !== 'edit') {
+    return null;
+  }
+
+  const filePath = toolMeta.filePath || '';
+  const fileName = toolMeta.fileName || filePath.split(/[\\/]/).filter(Boolean).pop() || '';
+  const addedLines = typeof toolMeta.addedLines === 'number' ? toolMeta.addedLines : null;
+  const deletedLines = typeof toolMeta.deletedLines === 'number' ? toolMeta.deletedLines : null;
+
+  if (!fileName && !filePath) {
+    return null;
+  }
+
+  return {
+    addedLines,
+    deletedLines,
+    fileName,
+    filePath,
+  };
+}
+
+function getDisplayEventContent(message, editMeta = null) {
+  const content = typeof message?.content === 'string' ? message.content.trim() : '';
+  if (!content) {
+    return '';
+  }
+
+  if (!editMeta) {
+    return content;
+  }
+
+  const normalizedContent = content.toLowerCase();
+  const normalizedTitle = typeof message?.title === 'string' ? message.title.trim().toLowerCase() : '';
+  const genericEditContents = new Set([
+    'updated file',
+    'editing file',
+    'edited file',
+    '文件已更新',
+    '正在更新文件',
+    '已编辑文件',
+  ]);
+
+  if (normalizedContent === normalizedTitle || genericEditContents.has(normalizedContent)) {
+    return '';
+  }
+
+  return content;
+}
+
 function EventMessage({ language, message }) {
   const copy = COPY[language];
   const meta = getEventMeta(message.kind, message.status);
   const Icon = meta.icon;
   const collapsible = isCollapsibleEvent(message);
   const [isOpen, setIsOpen] = useState(false);
-  const preview = createEventPreview(message.content);
+  const editMeta = getEditEventMeta(message);
+  const displayContent = getDisplayEventContent(message, editMeta);
+  const preview = createEventPreview(displayContent);
 
   if (message.kind === 'command') {
     const commandMeta = getCommandEventMeta(message, language);
@@ -6622,7 +6769,35 @@ function EventMessage({ language, message }) {
           <p className="text-[12px] font-medium text-muted-foreground">{message.title}</p>
           <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80">{formatTime(message.createdAt, language)}</span>
         </div>
-        {message.content && collapsible ? (
+        {editMeta ? (
+          <div className="mt-1 rounded-xl border border-border/70 bg-background/80 px-2.5 py-2">
+            <p
+              className="truncate text-[12px] font-medium text-foreground"
+              title={editMeta.filePath || editMeta.fileName}
+            >
+              {editMeta.fileName || editMeta.filePath}
+            </p>
+            {editMeta.filePath && editMeta.filePath !== editMeta.fileName ? (
+              <p
+                className="mt-0.5 truncate font-mono text-[11px] leading-5 text-muted-foreground"
+                title={editMeta.filePath}
+              >
+                {truncateMiddle(editMeta.filePath, 88)}
+              </p>
+            ) : null}
+            {(typeof editMeta.addedLines === 'number' && editMeta.addedLines > 0) || (typeof editMeta.deletedLines === 'number' && editMeta.deletedLines > 0) ? (
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] font-medium">
+                {typeof editMeta.addedLines === 'number' && editMeta.addedLines > 0 ? (
+                  <span className="text-emerald-600">+{editMeta.addedLines}</span>
+                ) : null}
+                {typeof editMeta.deletedLines === 'number' && editMeta.deletedLines > 0 ? (
+                  <span className="text-rose-500">-{editMeta.deletedLines}</span>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {displayContent && collapsible ? (
           <>
             {preview && <p className="mt-0.5 line-clamp-1 break-words text-[12px] leading-5 text-muted-foreground/90">{preview}</p>}
             <button
@@ -6635,12 +6810,12 @@ function EventMessage({ language, message }) {
             </button>
             {isOpen && (
               <div className="mt-1.5 whitespace-pre-wrap break-words border-l border-border/80 pl-3 text-[12px] leading-5 text-muted-foreground">
-                {message.content}
+                {displayContent}
               </div>
             )}
           </>
-        ) : message.content ? (
-          <p className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-5 text-muted-foreground">{message.content}</p>
+        ) : displayContent ? (
+          <p className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-5 text-muted-foreground">{displayContent}</p>
         ) : null}
       </div>
     </div>

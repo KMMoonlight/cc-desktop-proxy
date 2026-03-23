@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-03-23（当前工作区变更汇总）
+
+### 分屏架构重构 / 性能优化
+
+- **独立窗格入口**：新增 `pane.html` 和 `src/pane-main.jsx`，为分屏窗格提供独立的 HTML 入口和渲染逻辑，不再复用主窗口 URL
+- **构建配置扩展**：`vite.config.mjs` 新增多入口点配置（`rollupOptions.input`），支持 `main` 和 `pane` 两个独立构建入口
+- **状态管理重构**：`electron/runtime.cjs` 大规模重构状态序列化逻辑，拆分为多个专用方法：
+  - `createStateSerializationContext` - 创建共享的序列化上下文（provider 信息、代码编辑器、运行状态等）
+  - `createProviderSnapshot` - 为指定工作区路径创建 provider 快照
+  - `createAppStatePayload` - 组装应用状态负载
+  - `serializeWorkspacesByIds` - 按需序列化指定工作区列表
+  - `buildGlobalAppState` - 构建主窗口的全局应用状态
+  - `buildPaneAppState` - 构建窗格视图的精简应用状态（仅包含当前窗格相关的工作区和会话）
+  - `getAppStateForRecipient` - 根据接收者上下文（主窗口 / 窗格）返回对应的状态
+- **状态广播优化**：`emitState` 改为基于接收者上下文缓存状态，避免为多个窗格重复序列化相同数据；新增 `getStateRecipientContext` 和 `createStateRecipientCacheKey` 辅助函数
+- **结果投影机制**：新增 `projectResultForSender` 方法，IPC 处理器返回序列化状态时自动替换为接收者专属状态，确保窗格不会收到无关的全局数据
+- **窗格应用简化**：`src/App.jsx` 中的 `StandalonePaneApp` 移除了 `sessionSnapshot` 状态和手动获取会话快照的逻辑，改为直接依赖运行时返回的 `activeSession`；导出 `StandalonePaneApp` 供独立入口使用
+- **渲染性能优化**：`ConversationPaneBody` 为每条消息和运行指示器添加 `content-visibility: auto` 和 `contain-intrinsic-size`，减少大量消息时的布局计算开销
+
+---
+
 ## 2026-03-21（当前工作区变更汇总）
 
 ### Provider / Runtime / 持久化

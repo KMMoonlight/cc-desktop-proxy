@@ -78,6 +78,7 @@ const EMPTY_APP_STATE = {
   selectedWorkspaceId: null,
   workspaces: [],
 };
+const EMPTY_OBJECT = Object.freeze({});
 const EMPTY_LIST = Object.freeze([]);
 
 const PROVIDER_KEYS = ['claude', 'codex'];
@@ -224,6 +225,77 @@ function formatShortcutRangeLabel(platform, start, end) {
   return platform === 'darwin'
     ? `⌘${normalizedStart}-${normalizedEnd}`
     : `Meta+${normalizedStart}-${normalizedEnd}`;
+}
+
+function getGlobalPaneShortcutIntent(eventLike) {
+  if (
+    !eventLike
+    || eventLike.defaultPrevented
+    || eventLike.repeat
+    || !eventLike.metaKey
+    || eventLike.ctrlKey
+    || eventLike.altKey
+  ) {
+    return null;
+  }
+
+  const shortcutKey = typeof eventLike.key === 'string'
+    ? eventLike.key.toLowerCase()
+    : '';
+  const paneShortcutIndex = Number.parseInt(shortcutKey, 10);
+  const isPaneShortcut = Number.isInteger(paneShortcutIndex) && paneShortcutIndex >= 1 && paneShortcutIndex <= 9;
+  const isSplitAndCreateShortcut = shortcutKey === 'd' && eventLike.shiftKey;
+  const isSupportedUnshiftedShortcut = !eventLike.shiftKey && (
+    shortcutKey === 'o'
+    || shortcutKey === '.'
+    || shortcutKey === 'n'
+    || shortcutKey === 'd'
+    || shortcutKey === 't'
+    || shortcutKey === 'w'
+    || shortcutKey === 'b'
+    || isPaneShortcut
+  );
+
+  if (!isSplitAndCreateShortcut && !isSupportedUnshiftedShortcut) {
+    return null;
+  }
+
+  if (isSplitAndCreateShortcut) {
+    return { type: 'split-and-create' };
+  }
+
+  if (isPaneShortcut) {
+    return {
+      paneIndex: paneShortcutIndex - 1,
+      type: 'focus-pane-index',
+    };
+  }
+
+  if (shortcutKey === 'd') {
+    return { type: 'split-pane' };
+  }
+
+  if (shortcutKey === 'o') {
+    return { type: 'add-workspace' };
+  }
+
+  if (shortcutKey === '.') {
+    return { type: 'open-settings' };
+  }
+
+  if (shortcutKey === 'b') {
+    return { type: 'toggle-sidebar' };
+  }
+
+  if (shortcutKey === 't') {
+    return { type: 'toggle-provider' };
+  }
+
+  if (shortcutKey === 'w') {
+    return { type: 'clear-pane' };
+  }
+
+  return { type: 'create-session' };
 }
 
 function formatPlatformDisplayName(platform) {
@@ -451,6 +523,7 @@ const COPY = {
     paneSplitAddTooltip: (count) => `新增分屏 · 当前窗口最多可显示 ${count} 个分屏`,
     paneSplitAddTooltipUnlimited: '新增分屏 · 已忽略窗口尺寸限制',
     paneSplitLimitReached: '当前窗口尺寸下已达到最大分屏数',
+    pastingAttachment: '正在粘贴附件...',
     paneLoading: '正在载入对话...',
     noSessionCommandHint: '输入 /clear 新建对话，或先在左侧选择一个历史会话',
     noSessionCommandHintExpanded: '输入 /clear 新建对话，Enter 换行，点击发送按钮发送',
@@ -694,6 +767,7 @@ const COPY = {
     paneSplitAddTooltip: (count) => `Add split · This window can show up to ${count} panes`,
     paneSplitAddTooltipUnlimited: 'Add split · Window size limit ignored',
     paneSplitLimitReached: 'Maximum split count reached for this window size',
+    pastingAttachment: 'Pasting attachment...',
     paneLoading: 'Loading conversation...',
     noSessionCommandHint: 'Type /clear to start a conversation, or pick one from the sidebar',
     noSessionCommandHintExpanded: 'Type /clear to start a conversation, press Enter for a new line, then click Send',
@@ -846,11 +920,10 @@ function WindowViewFallback() {
   );
 }
 
-function StandalonePaneApp({ desktopClient }) {
+export function StandalonePaneApp({ desktopClient }) {
   const paneParams = useMemo(() => getWindowPaneParams(), []);
   const [appState, setAppState] = useState(EMPTY_APP_STATE);
   const appStateRef = useRef(EMPTY_APP_STATE);
-  const [sessionSnapshot, setSessionSnapshot] = useState(null);
   const [language, setLanguage] = useState(() => getInitialLanguage());
   const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
   const [systemTheme, setSystemTheme] = useState(() => getSystemTheme());
@@ -878,6 +951,14 @@ function StandalonePaneApp({ desktopClient }) {
   const providerCatalog = appState.providers && typeof appState.providers === 'object'
     ? appState.providers
     : {};
+  const workspaceById = useMemo(
+    () => new Map(appState.workspaces.map((entry) => [entry.id, entry])),
+    [appState.workspaces],
+  );
+  const sessionMetaByKey = useMemo(
+    () => buildSessionMetaLookup(appState.workspaces),
+    [appState.workspaces],
+  );
   const selectedWorkspace = useMemo(
     () => appState.workspaces.find((workspace) => workspace.id === appState.selectedWorkspaceId) || null,
     [appState.selectedWorkspaceId, appState.workspaces],
@@ -887,19 +968,10 @@ function StandalonePaneApp({ desktopClient }) {
     () => appState.workspaces.find((entry) => entry.id === paneParams.workspaceId) || null,
     [appState.workspaces, paneParams.workspaceId],
   );
-  const sessionMeta = useMemo(
-    () => workspace?.sessions.find((entry) => entry.id === paneParams.sessionId) || null,
-    [paneParams.sessionId, workspace],
-  );
   const sessionCacheKey = useMemo(
     () => createSessionCacheKey(paneParams.workspaceId, paneParams.sessionId),
     [paneParams.sessionId, paneParams.workspaceId],
   );
-  const sessionViewCache = useMemo(() => (
-    sessionCacheKey && sessionSnapshot
-      ? { [sessionCacheKey]: sessionSnapshot }
-      : {}
-  ), [sessionCacheKey, sessionSnapshot]);
   const paneDescriptor = useMemo(() => ({
     id: paneParams.paneId,
     sessionId: paneParams.sessionId || null,
@@ -922,7 +994,9 @@ function StandalonePaneApp({ desktopClient }) {
     paneCount: paneParams.paneCount,
     pendingPaneTurns,
     sendingPaneIds,
-    sessionViewCache,
+    sessionViewCache: EMPTY_OBJECT,
+    sessionMetaByKey,
+    workspaceById,
   }), [
     appState,
     copy,
@@ -931,9 +1005,10 @@ function StandalonePaneApp({ desktopClient }) {
     paneDescriptor,
     paneParams.paneCount,
     pendingPaneTurns,
+    sessionMetaByKey,
     selectedSession,
     sendingPaneIds,
-    sessionViewCache,
+    workspaceById,
   ]);
   const pendingApprovalRequestIds = useMemo(
     () => new Set(
@@ -962,6 +1037,26 @@ function StandalonePaneApp({ desktopClient }) {
 
   const notifyHost = useEventCallback((type, payload = {}) => {
     desktopClient?.notifyHost?.(type, payload);
+  });
+  const applyIncomingAppState = useEventCallback((nextState, { useTransition = false } = {}) => {
+    if (!nextState) {
+      return;
+    }
+
+    const commit = () => {
+      setAppState((current) => (
+        areStandalonePaneAppStatesEquivalent(current, nextState, paneParams)
+          ? current
+          : mergeIncomingAppState(current, nextState)
+      ));
+    };
+
+    if (useTransition) {
+      startTransition(commit);
+      return;
+    }
+
+    commit();
   });
 
   useEffect(() => {
@@ -1044,13 +1139,7 @@ function StandalonePaneApp({ desktopClient }) {
           return;
         }
 
-        startTransition(() => {
-          setAppState((current) => (
-            areStandalonePaneAppStatesEquivalent(current, event.state, paneParams)
-              ? current
-              : event.state
-          ));
-        });
+        applyIncomingAppState(event.state, { useTransition: true });
       }
     });
 
@@ -1062,7 +1151,7 @@ function StandalonePaneApp({ desktopClient }) {
           return;
         }
 
-        setAppState(state);
+        applyIncomingAppState(state);
       })
       .catch((error) => {
         if (!cancelled) {
@@ -1079,72 +1168,14 @@ function StandalonePaneApp({ desktopClient }) {
       cancelled = true;
       unsubscribe?.();
     };
-  }, [copy.bridgeUnavailable, desktopClient, setPaneError]);
+  }, [applyIncomingAppState, copy.bridgeUnavailable, desktopClient, paneParams, setPaneError]);
 
   useEffect(() => {
     if (!paneParams.workspaceId || !paneParams.sessionId) {
-      setSessionSnapshot(null);
       setPendingTurn(null);
       setIsSending(false);
-      return;
     }
-
-    const isSelectedPaneSession = (
-      selectedSession
-      && selectedSession.workspaceId === paneParams.workspaceId
-      && selectedSession.id === paneParams.sessionId
-    );
-
-    if (isSelectedPaneSession) {
-      setSessionSnapshot((current) => (
-        areSessionSnapshotsEqual(current, selectedSession) ? current : selectedSession
-      ));
-      return;
-    }
-
-    if (!desktopClient || !sessionMeta) {
-      return;
-    }
-
-    const hasFreshSnapshot = (
-      sessionSnapshot
-      && sessionSnapshot.updatedAt === sessionMeta.updatedAt
-      && sessionSnapshot.status === sessionMeta.status
-      && Boolean(sessionSnapshot.isRunning) === Boolean(sessionMeta.isRunning)
-    );
-
-    if (hasFreshSnapshot) {
-      return;
-    }
-
-    let cancelled = false;
-
-    desktopClient.getSession({
-      sessionId: paneParams.sessionId,
-      workspaceId: paneParams.workspaceId,
-    }).then((nextSession) => {
-      if (cancelled || !nextSession) {
-        return;
-      }
-
-      startTransition(() => {
-        setSessionSnapshot((current) => (
-          areSessionSnapshotsEqual(current, nextSession) ? current : nextSession
-        ));
-      });
-    }).catch(() => {});
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    desktopClient,
-    paneParams.sessionId,
-    paneParams.workspaceId,
-    selectedSession,
-    sessionMeta,
-    sessionSnapshot,
-  ]);
+  }, [paneParams.sessionId, paneParams.workspaceId]);
 
   useEffect(() => {
     if (!pendingTurn) {
@@ -1286,6 +1317,31 @@ function StandalonePaneApp({ desktopClient }) {
     };
   }, [desktopClient, language, setPaneError]);
 
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return undefined;
+    }
+
+    const handleGlobalPaneShortcuts = (event) => {
+      const shortcutIntent = getGlobalPaneShortcutIntent(event);
+      if (!shortcutIntent) {
+        return;
+      }
+
+      event.preventDefault();
+      notifyHost('global-pane-shortcut', {
+        ...shortcutIntent,
+        paneId: paneDescriptor.id,
+      });
+    };
+
+    document.addEventListener('keydown', handleGlobalPaneShortcuts);
+
+    return () => {
+      document.removeEventListener('keydown', handleGlobalPaneShortcuts);
+    };
+  }, [notifyHost, paneDescriptor.id]);
+
   async function createSessionForPane() {
     if (!desktopClient) {
       return null;
@@ -1310,9 +1366,6 @@ function StandalonePaneApp({ desktopClient }) {
       });
 
       setAppState((current) => integrateCreatedSessionResult(current, nextState));
-      setSessionSnapshot(nextState?.activeSession && typeof nextState.activeSession === 'object'
-        ? nextState.activeSession
-        : null);
       setPendingTurn(null);
       setIsSending(false);
       notifyHost('assign-session', {
@@ -1833,6 +1886,7 @@ const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
   onPaneAssignSession,
   onPaneClear,
   onPaneFocus,
+  onPaneShortcut,
 }) {
   const containerRef = useRef(null);
   const webviewRef = useRef(null);
@@ -1911,6 +1965,15 @@ const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
         return;
       }
 
+      if (eventType === 'global-pane-shortcut') {
+        onPaneShortcut?.({
+          paneId: targetPaneId,
+          paneIndex: Number.isInteger(eventPayload.paneIndex) ? eventPayload.paneIndex : -1,
+          type: typeof eventPayload.type === 'string' ? eventPayload.type : '',
+        });
+        return;
+      }
+
       if (eventType === 'assign-session') {
         onPaneAssignSession?.({
           paneId: targetPaneId,
@@ -1948,7 +2011,7 @@ const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
       element.removeEventListener('did-fail-load', handleDidFailLoad);
       element.removeEventListener('render-process-gone', handleRenderProcessGone);
     };
-  }, [onPaneAssignSession, onPaneClear, onPaneFocus, pane.id, preloadUrl, src]);
+  }, [onPaneAssignSession, onPaneClear, onPaneFocus, onPaneShortcut, pane.id, preloadUrl, src]);
 
   return (
     <div className="relative min-h-0 min-w-0 overflow-hidden bg-background">
@@ -1968,6 +2031,7 @@ const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
     && previousProps.onPaneAssignSession === nextProps.onPaneAssignSession
     && previousProps.onPaneClear === nextProps.onPaneClear
     && previousProps.onPaneFocus === nextProps.onPaneFocus
+    && previousProps.onPaneShortcut === nextProps.onPaneShortcut
     && arePaneViewModelsEqual(previousProps.pane, nextProps.pane)
   );
 });
@@ -2034,6 +2098,30 @@ function MainApp({ desktopClient }) {
   const slashCommandMenuRef = useRef(null);
   const textareaRef = useRef(null);
   const [paneBoardSize, setPaneBoardSize] = useState(() => getInitialPaneBoardSize());
+  const applyIncomingAppState = useEventCallback((nextState, { useTransition = false } = {}) => {
+    if (!nextState) {
+      return;
+    }
+
+    const commit = () => {
+      setAppState((current) => mergeIncomingAppState(current, nextState));
+    };
+
+    if (useTransition) {
+      startTransition(commit);
+      return;
+    }
+
+    commit();
+  });
+  const workspaceById = useMemo(
+    () => new Map(appState.workspaces.map((entry) => [entry.id, entry])),
+    [appState.workspaces],
+  );
+  const sessionMetaByKey = useMemo(
+    () => buildSessionMetaLookup(appState.workspaces),
+    [appState.workspaces],
+  );
   const focusedPane = useMemo(
     () => paneLayout.panes.find((pane) => pane.id === paneLayout.focusedPaneId) || paneLayout.panes[0] || null,
     [paneLayout.focusedPaneId, paneLayout.panes],
@@ -2182,8 +2270,10 @@ function MainApp({ desktopClient }) {
       paneCount: paneLayout.panes.length,
       pane,
       sessionViewCache,
+      sessionMetaByKey,
+      workspaceById,
     })),
-    [appState, copy, language, paneLayout.focusedPaneId, paneLayout.panes, pendingPaneTurns, selectedSession, sendingPaneIds, sessionViewCache],
+    [appState, copy, language, paneLayout.focusedPaneId, paneLayout.panes, pendingPaneTurns, selectedSession, sendingPaneIds, sessionMetaByKey, sessionViewCache, workspaceById],
   );
   const maxPaneCount = useMemo(
     () => (isPaneSizeLimitIgnored ? Number.POSITIVE_INFINITY : getAdaptivePaneLimit(paneBoardSize.width, paneBoardSize.height)),
@@ -2269,6 +2359,75 @@ function MainApp({ desktopClient }) {
       sessionId,
       workspaceId,
     }));
+  });
+  const handleEmbeddedPaneShortcut = useEventCallback((shortcutIntent) => {
+    if (!shortcutIntent || typeof shortcutIntent.type !== 'string') {
+      return;
+    }
+
+    const sourcePaneId = shortcutIntent.paneId || '';
+    const targetPaneId = sourcePaneId || focusedPane?.id || paneLayout.focusedPaneId || paneLayout.panes[0]?.id || '';
+    const targetPaneContext = targetPaneId ? getPaneContext(targetPaneId) : null;
+
+    if (shortcutIntent.type === 'split-and-create') {
+      void addPaneAndCreateSession(targetPaneId ? { paneId: targetPaneId } : {});
+      return;
+    }
+
+    if (shortcutIntent.type === 'focus-pane-index') {
+      const nextPane = visiblePaneViews[shortcutIntent.paneIndex];
+      if (!nextPane) {
+        return;
+      }
+
+      void focusPane(nextPane.id);
+      return;
+    }
+
+    if (shortcutIntent.type === 'split-pane') {
+      addPane();
+      return;
+    }
+
+    if (shortcutIntent.type === 'add-workspace') {
+      void addWorkspace();
+      return;
+    }
+
+    if (shortcutIntent.type === 'open-settings') {
+      openSettings();
+      return;
+    }
+
+    if (shortcutIntent.type === 'toggle-sidebar') {
+      toggleSidebarCollapse();
+      return;
+    }
+
+    if (shortcutIntent.type === 'toggle-provider') {
+      void toggleFreshSessionProvider(targetPaneId ? { paneId: targetPaneId } : {});
+      return;
+    }
+
+    if (shortcutIntent.type === 'clear-pane') {
+      if (!targetPaneId || paneLayout.panes.length <= 1) {
+        return;
+      }
+
+      clearPane(targetPaneId);
+      return;
+    }
+
+    const shortcutWorkspace = targetPaneContext?.workspace || focusedWorkspace || selectedWorkspace;
+    if (!shortcutWorkspace) {
+      setSidebarError(copy.noWorkspaceSelected);
+      return;
+    }
+
+    void createSession(
+      shortcutWorkspace.id,
+      targetPaneId ? { paneId: targetPaneId } : {},
+    );
   });
   const handlePanePickAttachments = useEventCallback(() => pickAttachmentsForPane());
   const handlePanePreparePastedAttachments = useEventCallback((clipboardData) => preparePastedAttachmentsForPane(clipboardData));
@@ -2752,101 +2911,13 @@ function MainApp({ desktopClient }) {
     }
 
     const handleGlobalPaneShortcuts = (event) => {
-      if (
-        event.defaultPrevented
-        || event.repeat
-        || !event.metaKey
-        || event.ctrlKey
-        || event.altKey
-      ) {
-        return;
-      }
-
-      const shortcutKey = event.key.toLowerCase();
-      const paneShortcutIndex = Number.parseInt(shortcutKey, 10);
-      const isPaneShortcut = Number.isInteger(paneShortcutIndex) && paneShortcutIndex >= 1 && paneShortcutIndex <= 9;
-      const isSplitAndCreateShortcut = shortcutKey === 'd' && event.shiftKey;
-      const isSupportedUnshiftedShortcut = !event.shiftKey && (
-        shortcutKey === 'o'
-        || shortcutKey === '.'
-        || shortcutKey === 'n'
-        || shortcutKey === 'd'
-        || shortcutKey === 't'
-        || shortcutKey === 'w'
-        || shortcutKey === 'b'
-        || isPaneShortcut
-      );
-
-      if (!isSplitAndCreateShortcut && !isSupportedUnshiftedShortcut) {
-        return;
-      }
-
-      if (isSplitAndCreateShortcut) {
-        event.preventDefault();
-        void addPaneAndCreateSession();
-        return;
-      }
-
-      if (isPaneShortcut) {
-        const targetPane = visiblePaneViews[paneShortcutIndex - 1];
-        if (!targetPane) {
-          return;
-        }
-
-        event.preventDefault();
-        void focusPane(targetPane.id);
-        return;
-      }
-
-      if (shortcutKey === 'd') {
-        event.preventDefault();
-        addPane();
-        return;
-      }
-
-      if (shortcutKey === 'o') {
-        event.preventDefault();
-        void addWorkspace();
-        return;
-      }
-
-      if (shortcutKey === '.') {
-        event.preventDefault();
-        openSettings();
-        return;
-      }
-
-      if (shortcutKey === 'b') {
-        event.preventDefault();
-        toggleSidebarCollapse();
-        return;
-      }
-
-      if (shortcutKey === 't') {
-        event.preventDefault();
-        void toggleFreshSessionProvider();
-        return;
-      }
-
-      if (shortcutKey === 'w') {
-        if (!focusedPane?.id || paneLayout.panes.length <= 1) {
-          return;
-        }
-
-        event.preventDefault();
-        clearPane(focusedPane.id);
-        return;
-      }
-
-      const shortcutWorkspace = focusedWorkspace || selectedWorkspace;
-      if (!shortcutWorkspace) {
-        event.preventDefault();
-        setSidebarError(copy.noWorkspaceSelected);
+      const shortcutIntent = getGlobalPaneShortcutIntent(event);
+      if (!shortcutIntent) {
         return;
       }
 
       event.preventDefault();
-      void createSession(shortcutWorkspace.id);
+      handleEmbeddedPaneShortcut(shortcutIntent);
     };
 
     document.addEventListener('keydown', handleGlobalPaneShortcuts);
@@ -2854,7 +2925,7 @@ function MainApp({ desktopClient }) {
     return () => {
       document.removeEventListener('keydown', handleGlobalPaneShortcuts);
     };
-  }, [copy.noWorkspaceSelected, focusedPane?.id, focusedWorkspace, openSettings, paneLayout.panes.length, selectedWorkspace, toggleFreshSessionProvider, visiblePaneViews]);
+  }, [handleEmbeddedPaneShortcut]);
 
   useEffect(() => {
     setPaneRecentIds((current) => syncPaneRecentIds(current, paneLayout.panes, paneLayout.focusedPaneId));
@@ -3063,9 +3134,7 @@ function MainApp({ desktopClient }) {
 
     const unsubscribe = desktopClient.onStateChange((event) => {
       if (event?.type === 'state' && event.state) {
-        startTransition(() => {
-          setAppState(event.state);
-        });
+        applyIncomingAppState(event.state, { useTransition: true });
       }
     });
 
@@ -3074,7 +3143,7 @@ function MainApp({ desktopClient }) {
     return () => {
       unsubscribe?.();
     };
-  }, []);
+  }, [applyIncomingAppState, copy.bridgeUnavailable, desktopClient]);
 
   useEffect(() => {
     if (isBootstrapping) {
@@ -3277,7 +3346,7 @@ function MainApp({ desktopClient }) {
       });
       const remoteRecentIds = normalizePaneRecentIds(state?.paneLayout?.recentPaneIds, hydratedPaneState.layout.panes);
 
-      setAppState(state);
+      applyIncomingAppState(state);
       setPaneLayout((current) => {
         const next = hydratedPaneState.layout;
         return arePaneLayoutsEqual(current, next) ? current : next;
@@ -3312,7 +3381,7 @@ function MainApp({ desktopClient }) {
 
     try {
       const state = await desktopClient.getAppState();
-      setAppState(state);
+      applyIncomingAppState(state);
     } catch (error) {
       setSidebarError(error.message);
     }
@@ -3327,7 +3396,7 @@ function MainApp({ desktopClient }) {
 
     try {
       const state = await desktopClient.refreshProviderStatus();
-      setAppState(state);
+      applyIncomingAppState(state);
       setSidebarError('');
     } catch (error) {
       setSidebarError(error.message);
@@ -3456,12 +3525,14 @@ function MainApp({ desktopClient }) {
     return '';
   }
 
-  async function addPaneAndCreateSession() {
+  async function addPaneAndCreateSession(options = {}) {
     if (!desktopClient) {
       return;
     }
 
-    const targetWorkspace = focusedWorkspace || selectedWorkspace;
+    const targetPaneId = options.paneId || '';
+    const paneContext = targetPaneId ? getPaneContext(targetPaneId) : null;
+    const targetWorkspace = paneContext?.workspace || focusedWorkspace || selectedWorkspace;
     if (!targetWorkspace) {
       setSidebarError(copy.noWorkspaceSelected);
       return;
@@ -3477,7 +3548,10 @@ function MainApp({ desktopClient }) {
 
     try {
       const nextState = await desktopClient.createSession({
-        preferredProvider: getPreferredProviderForNewSession(targetWorkspace.id),
+        preferredProvider: getPreferredProviderForNewSession(
+          targetWorkspace.id,
+          targetPaneId ? { paneId: targetPaneId } : {},
+        ),
         workspaceId: targetWorkspace.id,
       });
       setAppState((current) => integrateCreatedSessionResult(current, nextState));
@@ -3521,12 +3595,12 @@ function MainApp({ desktopClient }) {
     }
   }
 
-  async function toggleFreshSessionProvider() {
+  async function toggleFreshSessionProvider(options = {}) {
     if (!desktopClient) {
       return;
     }
 
-    const targetPaneId = focusedPane?.id || paneLayout.focusedPaneId || paneLayout.panes[0]?.id || '';
+    const targetPaneId = options.paneId || focusedPane?.id || paneLayout.focusedPaneId || paneLayout.panes[0]?.id || '';
     const context = targetPaneId ? getPaneContext(targetPaneId) : null;
     const targetWorkspace = context?.workspace || focusedWorkspace || selectedWorkspace;
     if (!targetWorkspace) {
@@ -5250,6 +5324,7 @@ function MainApp({ desktopClient }) {
                     onPaneAssignSession={handleEmbeddedPaneAssignSession}
                     onPaneClear={handlePaneClear}
                     onPaneFocus={handlePaneFocus}
+                    onPaneShortcut={handleEmbeddedPaneShortcut}
                   />
                 ))}
               </div>
@@ -5330,6 +5405,7 @@ const ConversationPane = memo(function ConversationPane({
   const [inputValue, setInputValue] = useState('');
   const [composerAttachments, setComposerAttachments] = useState([]);
   const [composerHistoryIndex, setComposerHistoryIndex] = useState(-1);
+  const [isPastingAttachments, setIsPastingAttachments] = useState(false);
   const [isComposerTextareaFocused, setIsComposerTextareaFocused] = useState(false);
   const [isComposerExpanded, setIsComposerExpanded] = useState(false);
   const [isProviderPickerOpen, setIsProviderPickerOpen] = useState(false);
@@ -5343,6 +5419,7 @@ const ConversationPane = memo(function ConversationPane({
   const modelPickerRef = useRef(null);
   const slashMenuRef = useRef(null);
   const textareaRef = useRef(null);
+  const isPastingAttachmentsRef = useRef(false);
   const isProviderLocked = Boolean(
     pane.sessionMeta?.providerLocked
     || isSessionProviderLocked(pane.session),
@@ -5374,6 +5451,7 @@ const ConversationPane = memo(function ConversationPane({
   const isSlashCommandMenuOpen = pane.isFocused && slashCommandQuery !== null;
   const hasFloatingOverlayOpen = isComposerExpanded || isSlashCommandMenuOpen || isProviderPickerOpen || isModePickerOpen || isReasoningPickerOpen || isModelPickerOpen;
   const hasComposerAttachments = composerAttachments.length > 0;
+  const hasComposerAttachmentOverlay = hasComposerAttachments || isPastingAttachments;
   const composerHistoryEntries = useMemo(
     () => getComposerHistoryEntries(pane.session?.messages || []),
     [pane.session?.messages],
@@ -5390,6 +5468,7 @@ const ConversationPane = memo(function ConversationPane({
     !pane.isBusy
     && pane.workspace
     && canUseSessionProvider
+    && !isPastingAttachments
     && (trimmedInputValue || hasComposerAttachments)
     && (pane.session || trimmedInputValue.startsWith('/')),
   );
@@ -5436,6 +5515,8 @@ const ConversationPane = memo(function ConversationPane({
   useEffect(() => {
     setComposerAttachments([]);
     setComposerHistoryIndex(-1);
+    isPastingAttachmentsRef.current = false;
+    setIsPastingAttachments(false);
     setIsComposerExpanded(false);
     setIsComposerTextareaFocused(false);
     setInputValue('');
@@ -5644,17 +5725,29 @@ const ConversationPane = memo(function ConversationPane({
   }
 
   async function handlePasteAttachments(clipboardData) {
-    const nextAttachments = await onPreparePastedAttachments?.(clipboardData);
-    if (!Array.isArray(nextAttachments) || nextAttachments.length === 0) {
-      return false;
+    if (isPastingAttachmentsRef.current) {
+      return true;
     }
 
-    setComposerAttachments((current) => mergeComposerAttachments(current, nextAttachments));
-    return true;
+    isPastingAttachmentsRef.current = true;
+    setIsPastingAttachments(true);
+
+    try {
+      const nextAttachments = await onPreparePastedAttachments?.(clipboardData);
+      if (!Array.isArray(nextAttachments) || nextAttachments.length === 0) {
+        return false;
+      }
+
+      setComposerAttachments((current) => mergeComposerAttachments(current, nextAttachments));
+      return true;
+    } finally {
+      isPastingAttachmentsRef.current = false;
+      setIsPastingAttachments(false);
+    }
   }
 
   async function handleSend() {
-    if (pane.isBusy || !canUseSessionProvider) {
+    if (pane.isBusy || !canUseSessionProvider || isPastingAttachmentsRef.current) {
       return;
     }
 
@@ -5853,7 +5946,7 @@ const ConversationPane = memo(function ConversationPane({
                 : 'border-input',
             )}
           >
-            {hasComposerAttachments && (
+            {hasComposerAttachmentOverlay && (
               <div className="absolute left-3 right-14 top-3 z-10 overflow-x-auto pb-1">
                 <div className="flex min-w-max items-center gap-2 pr-2">
                   {composerAttachments.map((attachment) => (
@@ -5866,6 +5959,12 @@ const ConversationPane = memo(function ConversationPane({
                       }}
                     />
                   ))}
+                  {isPastingAttachments ? (
+                    <span className="inline-flex h-8 items-center gap-2 rounded-full border border-border/80 bg-muted/55 px-3 text-[12px] text-muted-foreground shadow-sm">
+                      <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                      <span>{copy.pastingAttachment}</span>
+                    </span>
+                  ) : null}
                 </div>
               </div>
             )}
@@ -5891,6 +5990,7 @@ const ConversationPane = memo(function ConversationPane({
             </div>
             <Textarea
               ref={textareaRef}
+              aria-busy={isPastingAttachments}
               value={inputValue}
               onChange={(event) => {
                 if (composerHistoryIndex !== -1) {
@@ -6178,6 +6278,7 @@ const ConversationPaneBody = memo(function ConversationPaneBody({
   pendingApprovalActionId,
 }) {
   const viewportRef = useRef(null);
+  const contentRef = useRef(null);
 
   // Each pane maintains its own scroll position, including background panes that
   // continue receiving messages while another pane is focused.
@@ -6187,22 +6288,41 @@ const ConversationPaneBody = memo(function ConversationPaneBody({
       return undefined;
     }
 
+    let frameId = 0;
     let nextFrameId = 0;
-    const frameId = window.requestAnimationFrame(() => {
-      nextFrameId = window.requestAnimationFrame(() => {
-        const top = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
-        viewport.scrollTo({
-          top,
-          behavior: pane.session?.status === 'running' || pane.shouldShowRunIndicator ? 'auto' : 'smooth',
+    let resizeObserver = null;
+    const scheduleScrollToBottom = () => {
+      window.cancelAnimationFrame(frameId);
+      window.cancelAnimationFrame(nextFrameId);
+      frameId = window.requestAnimationFrame(() => {
+        nextFrameId = window.requestAnimationFrame(() => {
+          const top = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
+          viewport.scrollTo({
+            top,
+            behavior: pane.session?.status === 'running' || pane.shouldShowRunIndicator ? 'auto' : 'smooth',
+          });
         });
       });
-    });
+    };
+
+    scheduleScrollToBottom();
+
+    if (
+      contentRef.current
+      && typeof ResizeObserver !== 'undefined'
+      && (pane.session?.status === 'running' || pane.shouldShowRunIndicator)
+    ) {
+      // Keep pinning to the bottom while streamed output is still changing height.
+      resizeObserver = new ResizeObserver(() => {
+        scheduleScrollToBottom();
+      });
+      resizeObserver.observe(contentRef.current);
+    }
 
     return () => {
       window.cancelAnimationFrame(frameId);
-      if (nextFrameId) {
-        window.cancelAnimationFrame(nextFrameId);
-      }
+      window.cancelAnimationFrame(nextFrameId);
+      resizeObserver?.disconnect();
     };
   }, [
     pane.id,
@@ -6234,7 +6354,7 @@ const ConversationPaneBody = memo(function ConversationPaneBody({
           className="h-full px-3"
           viewportClassName="[&>div]:!block [&>div]:min-w-0 [&>div]:w-full [&>div]:max-w-full"
         >
-          <div className="flex w-full min-w-0 flex-col gap-3 py-3">
+          <div ref={contentRef} className="flex w-full min-w-0 flex-col gap-3 py-3">
             {pane.displayMessages.length === 0 ? (
               <ConversationEmptyState
                 icon={Bot}
@@ -6243,15 +6363,20 @@ const ConversationPaneBody = memo(function ConversationPaneBody({
             ) : (
               <>
                 {pane.displayMessages.map((message) => (
-                  <ChatMessage
-                    key={message.id}
-                    approvalActionId={pendingApprovalActionId}
-                    language={language}
-                    message={message}
-                    onApprovalDecision={onApprovalDecision}
-                  />
+                  <div key={message.id}>
+                    <ChatMessage
+                      approvalActionId={pendingApprovalActionId}
+                      language={language}
+                      message={message}
+                      onApprovalDecision={onApprovalDecision}
+                    />
+                  </div>
                 ))}
-                {pane.shouldShowRunIndicator && <RunIndicator language={language} />}
+                {pane.shouldShowRunIndicator ? (
+                  <div>
+                    <RunIndicator language={language} />
+                  </div>
+                ) : null}
               </>
             )}
           </div>
@@ -8279,29 +8404,31 @@ const ChatMessage = memo(function ChatMessage({ approvalActionId, language, mess
   };
 
   return (
-    <div className="flex min-w-0 items-start justify-end gap-1.5">
-      {message.content ? (
-        <button
-          type="button"
-          onClick={handleCopyMessage}
-          className={cn(
-            "mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded transition-colors",
-            copied
-              ? "text-green-600 dark:text-green-500"
-              : "text-muted-foreground/40 hover:bg-muted/50 hover:text-foreground"
-          )}
-          aria-label={language === 'zh' ? '复制消息' : 'Copy message'}
-          title={copied ? (language === 'zh' ? '已复制' : 'Copied') : (language === 'zh' ? '复制消息' : 'Copy message')}
-        >
-          {copied ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-        </button>
-      ) : null}
-      <div className="user-bubble-message min-w-0 max-w-[min(100%,42rem)] overflow-hidden rounded-2xl border px-2.5 py-2">
-        {messageAttachments.length > 0 ? <MessageAttachmentList attachments={messageAttachments} /> : null}
+    <div className="flex min-w-0 justify-end">
+      <div className="flex min-w-0 max-w-[min(100%,42rem)] flex-col items-end gap-1">
+        <div className="user-bubble-message min-w-0 max-w-full overflow-hidden rounded-2xl border px-2.5 py-2">
+          {messageAttachments.length > 0 ? <MessageAttachmentList attachments={messageAttachments} /> : null}
+          {message.content ? (
+            <div className={cn('whitespace-pre-wrap break-words text-[13px] leading-6', messageAttachments.length > 0 && 'mt-2')}>
+              {message.content}
+            </div>
+          ) : null}
+        </div>
         {message.content ? (
-          <div className={cn('whitespace-pre-wrap break-words text-[13px] leading-6', messageAttachments.length > 0 && 'mt-2')}>
-            {message.content}
-          </div>
+          <button
+            type="button"
+            onClick={handleCopyMessage}
+            className={cn(
+              'mr-1 inline-flex h-6 w-6 items-center justify-center rounded-md transition-colors',
+              copied
+                ? 'text-green-600 dark:text-green-500'
+                : 'text-muted-foreground/40 hover:bg-muted/50 hover:text-foreground',
+            )}
+            aria-label={language === 'zh' ? '复制消息' : 'Copy message'}
+            title={copied ? (language === 'zh' ? '已复制' : 'Copied') : (language === 'zh' ? '复制消息' : 'Copy message')}
+          >
+            {copied ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          </button>
         ) : null}
       </div>
     </div>
@@ -10666,16 +10793,20 @@ async function createPastedAttachmentPayload(file) {
     };
   }
 
-  const dataBase64 = await readFileAsBase64(file);
+  const dataBuffer = await readFileAsArrayBuffer(file);
   return {
-    dataBase64,
+    dataBuffer,
     kind: attachmentKind,
     mimeType: file.type || '',
     name: attachmentName || '',
   };
 }
 
-function readFileAsBase64(file) {
+async function readFileAsArrayBuffer(file) {
+  if (file && typeof file.arrayBuffer === 'function') {
+    return file.arrayBuffer();
+  }
+
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 
@@ -10684,12 +10815,10 @@ function readFileAsBase64(file) {
     };
 
     reader.onload = () => {
-      const result = typeof reader.result === 'string' ? reader.result : '';
-      const base64 = result.includes(',') ? result.split(',').pop() : result;
-      resolve(base64 || '');
+      resolve(reader.result instanceof ArrayBuffer ? reader.result : new ArrayBuffer(0));
     };
 
-    reader.readAsDataURL(file);
+    reader.readAsArrayBuffer(file);
   });
 }
 
@@ -11505,7 +11634,25 @@ function normalizePaneLayoutWithAppState(currentLayout, appState) {
 }
 
 function arePaneLayoutsEqual(left, right) {
-  return JSON.stringify(normalizePaneLayout(left)) === JSON.stringify(normalizePaneLayout(right));
+  const normalizedLeft = normalizePaneLayout(left);
+  const normalizedRight = normalizePaneLayout(right);
+
+  if (normalizedLeft.focusedPaneId !== normalizedRight.focusedPaneId) {
+    return false;
+  }
+
+  if (normalizedLeft.panes.length !== normalizedRight.panes.length) {
+    return false;
+  }
+
+  return normalizedLeft.panes.every((pane, index) => {
+    const rightPane = normalizedRight.panes[index];
+    return (
+      (pane?.id || '') === (rightPane?.id || '')
+      && (pane?.sessionId || '') === (rightPane?.sessionId || '')
+      && (pane?.workspaceId || '') === (rightPane?.workspaceId || '')
+    );
+  });
 }
 
 function createNextPaneId(existingPanes) {
@@ -11528,6 +11675,23 @@ function createSessionCacheKey(workspaceId, sessionId) {
   }
 
   return `${workspaceId}:${sessionId}`;
+}
+
+function buildSessionMetaLookup(workspaces) {
+  const lookup = new Map();
+
+  for (const workspace of Array.isArray(workspaces) ? workspaces : []) {
+    for (const session of Array.isArray(workspace?.sessions) ? workspace.sessions : []) {
+      const cacheKey = createSessionCacheKey(workspace.id, session?.id);
+      if (!cacheKey) {
+        continue;
+      }
+
+      lookup.set(cacheKey, session);
+    }
+  }
+
+  return lookup;
 }
 
 function buildSessionPaneBindingMap(panes) {
@@ -11804,10 +11968,13 @@ function buildPaneViewModel({
   language,
   paneCount,
   pane,
+  sessionMetaByKey,
   sessionViewCache,
+  workspaceById,
 }) {
-  const workspace = appState.workspaces.find((entry) => entry.id === pane.workspaceId) || null;
-  const sessionMeta = workspace?.sessions.find((entry) => entry.id === pane.sessionId) || null;
+  const sessionCacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
+  const workspace = workspaceById?.get(pane.workspaceId) || appState.workspaces.find((entry) => entry.id === pane.workspaceId) || null;
+  const sessionMeta = sessionMetaByKey?.get(sessionCacheKey) || workspace?.sessions.find((entry) => entry.id === pane.sessionId) || null;
   const session = resolvePaneSessionSnapshot(pane, activeSession, sessionViewCache);
   const pendingTurn = getPendingTurnForPane(pane, pendingPaneTurns, session);
   const pendingApprovals = Array.isArray(session?.pendingApprovals)
@@ -12102,7 +12269,7 @@ function buildEmbeddedPaneViewUrl({
     return '';
   }
 
-  const url = new URL(window.location.href);
+  const url = new URL('pane.html', window.location.href);
   url.searchParams.set('view', 'pane');
   url.searchParams.set('paneCount', String(Math.max(1, paneCount || 1)));
   url.searchParams.set('paneId', paneId || 'pane-1');
@@ -12149,6 +12316,208 @@ function areStandalonePaneAppStatesEquivalent(left, right, paneParams) {
       getRelevantActiveSessionForPane(left, paneParams),
       getRelevantActiveSessionForPane(right, paneParams),
     )
+  );
+}
+
+function mergeIncomingAppState(current, next) {
+  if (!next || typeof next !== 'object') {
+    return current;
+  }
+
+  if (!current || typeof current !== 'object') {
+    return next;
+  }
+
+  const merged = {
+    ...next,
+    activeSession: areSessionSnapshotsEqual(current.activeSession, next.activeSession)
+      ? current.activeSession
+      : next.activeSession,
+    appInfo: areComparableValuesEqual(current.appInfo, next.appInfo)
+      ? current.appInfo
+      : next.appInfo,
+    claude: areComparableValuesEqual(current.claude, next.claude)
+      ? current.claude
+      : next.claude,
+    codeEditors: areComparableValuesEqual(current.codeEditors, next.codeEditors)
+      ? current.codeEditors
+      : next.codeEditors,
+    expandedWorkspaceIds: areComparableValuesEqual(current.expandedWorkspaceIds, next.expandedWorkspaceIds)
+      ? current.expandedWorkspaceIds
+      : next.expandedWorkspaceIds,
+    networkProxy: areComparableValuesEqual(current.networkProxy, next.networkProxy)
+      ? current.networkProxy
+      : next.networkProxy,
+    paneLayout: areComparableValuesEqual(current.paneLayout, next.paneLayout)
+      ? current.paneLayout
+      : next.paneLayout,
+    providers: mergeProviderCatalogSnapshots(current.providers, next.providers),
+    workspaces: mergeWorkspaceSnapshots(current.workspaces, next.workspaces),
+  };
+
+  const isUnchanged = (
+    current.activeSession === merged.activeSession
+    && current.appInfo === merged.appInfo
+    && current.claude === merged.claude
+    && current.codeEditors === merged.codeEditors
+    && current.defaultProvider === merged.defaultProvider
+    && current.expandedWorkspaceIds === merged.expandedWorkspaceIds
+    && current.networkProxy === merged.networkProxy
+    && current.paneLayout === merged.paneLayout
+    && current.platform === merged.platform
+    && current.providers === merged.providers
+    && current.selectedCodeEditor === merged.selectedCodeEditor
+    && current.selectedSessionId === merged.selectedSessionId
+    && current.selectedWorkspaceId === merged.selectedWorkspaceId
+    && current.workspaces === merged.workspaces
+  );
+
+  return isUnchanged ? current : merged;
+}
+
+function mergeProviderCatalogSnapshots(currentProviders, nextProviders) {
+  if (currentProviders === nextProviders || areProviderCatalogsEquivalent(currentProviders, nextProviders)) {
+    return currentProviders;
+  }
+
+  if (!currentProviders || !nextProviders || typeof currentProviders !== 'object' || typeof nextProviders !== 'object') {
+    return nextProviders;
+  }
+
+  let mutated = false;
+  const merged = {};
+
+  for (const providerKey of PROVIDER_KEYS) {
+    const currentProvider = getProviderInfo(currentProviders, providerKey, providerKey);
+    const nextProvider = getProviderInfo(nextProviders, providerKey, providerKey);
+    merged[providerKey] = areProviderInfosEquivalent(currentProvider, nextProvider)
+      ? currentProvider
+      : nextProvider;
+
+    if (merged[providerKey] !== currentProvider) {
+      mutated = true;
+    }
+  }
+
+  return mutated ? merged : currentProviders;
+}
+
+function mergeWorkspaceSnapshots(currentWorkspaces, nextWorkspaces) {
+  if (currentWorkspaces === nextWorkspaces) {
+    return currentWorkspaces;
+  }
+
+  if (!Array.isArray(currentWorkspaces) || !Array.isArray(nextWorkspaces)) {
+    return nextWorkspaces;
+  }
+
+  const currentWorkspaceMap = new Map(
+    currentWorkspaces.map((workspace) => [workspace?.id || '', workspace]),
+  );
+  let mutated = currentWorkspaces.length !== nextWorkspaces.length;
+
+  const merged = nextWorkspaces.map((nextWorkspace, index) => {
+    const currentWorkspace = currentWorkspaceMap.get(nextWorkspace?.id || '') || currentWorkspaces[index] || null;
+    const mergedWorkspace = mergeWorkspaceSnapshot(currentWorkspace, nextWorkspace);
+
+    if (mergedWorkspace !== currentWorkspaces[index]) {
+      mutated = true;
+    }
+
+    return mergedWorkspace;
+  });
+
+  return mutated ? merged : currentWorkspaces;
+}
+
+function mergeWorkspaceSnapshot(currentWorkspace, nextWorkspace) {
+  if (currentWorkspace === nextWorkspace) {
+    return currentWorkspace;
+  }
+
+  if (!currentWorkspace || !nextWorkspace) {
+    return nextWorkspace;
+  }
+
+  const mergedSessions = mergeSessionMetaSnapshots(currentWorkspace.sessions, nextWorkspace.sessions);
+  const canReuseCurrent = (
+    (currentWorkspace.exists !== false) === (nextWorkspace.exists !== false)
+    && Number(currentWorkspace.gitAddedLines || 0) === Number(nextWorkspace.gitAddedLines || 0)
+    && (currentWorkspace.gitBranch || '') === (nextWorkspace.gitBranch || '')
+    && Number(currentWorkspace.gitDeletedLines || 0) === Number(nextWorkspace.gitDeletedLines || 0)
+    && Boolean(currentWorkspace.gitDirty) === Boolean(nextWorkspace.gitDirty)
+    && (currentWorkspace.gitRoot || '') === (nextWorkspace.gitRoot || '')
+    && (currentWorkspace.id || '') === (nextWorkspace.id || '')
+    && (currentWorkspace.name || '') === (nextWorkspace.name || '')
+    && (currentWorkspace.path || '') === (nextWorkspace.path || '')
+    && mergedSessions === currentWorkspace.sessions
+    && (currentWorkspace.updatedAt || '') === (nextWorkspace.updatedAt || '')
+  );
+
+  if (canReuseCurrent) {
+    return currentWorkspace;
+  }
+
+  return mergedSessions === nextWorkspace.sessions
+    ? nextWorkspace
+    : {
+      ...nextWorkspace,
+      sessions: mergedSessions,
+    };
+}
+
+function mergeSessionMetaSnapshots(currentSessions, nextSessions) {
+  if (currentSessions === nextSessions) {
+    return currentSessions;
+  }
+
+  if (!Array.isArray(currentSessions) || !Array.isArray(nextSessions)) {
+    return nextSessions;
+  }
+
+  const currentSessionMap = new Map(
+    currentSessions.map((session) => [session?.id || '', session]),
+  );
+  let mutated = currentSessions.length !== nextSessions.length;
+
+  const merged = nextSessions.map((nextSession, index) => {
+    const currentSession = currentSessionMap.get(nextSession?.id || '') || currentSessions[index] || null;
+    const mergedSession = areSerializedSessionMetaEqual(currentSession, nextSession)
+      ? currentSession
+      : nextSession;
+
+    if (mergedSession !== currentSessions[index]) {
+      mutated = true;
+    }
+
+    return mergedSession;
+  });
+
+  return mutated ? merged : currentSessions;
+}
+
+function areSerializedSessionMetaEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  return (
+    Boolean(left?.archived) === Boolean(right?.archived)
+    && (left?.claudeSessionId || '') === (right?.claudeSessionId || '')
+    && (left?.currentModel || '') === (right?.currentModel || '')
+    && (left?.effectiveModel || '') === (right?.effectiveModel || '')
+    && (left?.effectiveReasoningEffort || '') === (right?.effectiveReasoningEffort || '')
+    && (left?.id || '') === (right?.id || '')
+    && Boolean(left?.isRunning) === Boolean(right?.isRunning)
+    && Number(left?.messageCount || 0) === Number(right?.messageCount || 0)
+    && (left?.permissionMode || '') === (right?.permissionMode || '')
+    && (left?.preview || '') === (right?.preview || '')
+    && (left?.provider || '') === (right?.provider || '')
+    && Boolean(left?.providerLocked) === Boolean(right?.providerLocked)
+    && (left?.reasoningEffort || '') === (right?.reasoningEffort || '')
+    && (left?.status || '') === (right?.status || '')
+    && (left?.title || '') === (right?.title || '')
+    && (left?.updatedAt || '') === (right?.updatedAt || '')
   );
 }
 

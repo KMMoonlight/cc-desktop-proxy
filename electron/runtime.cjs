@@ -30,6 +30,7 @@ const DEFAULT_NETWORK_PROXY_TEST_TARGET = 'google.com';
 const NETWORK_PROXY_TEST_TIMEOUT_MS = 8_000;
 const SKILL_LIST_CACHE_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
+const SESSION_MESSAGE_SUMMARY_CACHE_MAX_SIZE = 600;
 const SERIALIZED_WORKSPACE_CACHE_MAX_SIZE = 120;
 const WORKSPACE_GIT_INFO_TTL_MS = 10_000;
 const STATE_EMIT_THROTTLE_MS = 120;
@@ -198,6 +199,7 @@ const MULTI_TARGET_GOTO_EDITOR_KEYS = new Set([
 
 const workspaceGitInfoCache = new Map();
 const skillListCache = new Map();
+const sessionMessageSummaryCache = new Map();
 const serializedWorkspaceCache = new Map();
 let shellPathCache = {
   checkedAt: 0,
@@ -308,11 +310,11 @@ class ClaudeDesktopRuntime {
       ipcMain.handle(channel, async (event, payload) => {
         const result = await handler(event, payload);
         this.emitState(event.sender);
-        return result;
+        return this.projectResultForSender(event.sender, result);
       });
     };
 
-    ipcMain.handle('desktop:get-app-state', () => this.getAppState());
+    ipcMain.handle('desktop:get-app-state', (event) => this.getAppStateForRecipient(event.sender));
     registerStateHandler('desktop:refresh-provider-status', () => this.getAppState({ forceProviderRefresh: true }));
     ipcMain.handle('desktop:get-git-diff-view-data', (_event, payload) => this.getGitDiffViewData(payload?.workspaceId));
     ipcMain.handle('desktop:open-git-diff-file-in-code-editor', (_event, payload) => (
@@ -358,9 +360,15 @@ class ClaudeDesktopRuntime {
     registerStateHandler('desktop:select-session', (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId));
     registerStateHandler('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
     registerStateHandler('desktop:set-pane-layout', (_event, paneLayout) => this.setPaneLayout(paneLayout));
-    ipcMain.handle('desktop:respond-to-approval', (event, payload) => this.respondToApproval(event.sender, payload));
-    ipcMain.handle('desktop:send-message', (event, payload) => this.sendMessage(event.sender, payload));
-    ipcMain.handle('desktop:stop-run', (event, payload) => this.stopRun(event.sender, payload));
+    ipcMain.handle('desktop:respond-to-approval', async (event, payload) => (
+      this.projectResultForSender(event.sender, await this.respondToApproval(event.sender, payload))
+    ));
+    ipcMain.handle('desktop:send-message', async (event, payload) => (
+      this.projectResultForSender(event.sender, await this.sendMessage(event.sender, payload))
+    ));
+    ipcMain.handle('desktop:stop-run', async (event, payload) => (
+      this.projectResultForSender(event.sender, await this.stopRun(event.sender, payload))
+    ));
     registerStateHandler('desktop:update-session-provider', (_event, payload) => (
       this.updateSessionProvider(payload?.workspaceId, payload?.sessionId, payload?.provider)
     ));
@@ -392,42 +400,72 @@ class ClaudeDesktopRuntime {
     this.handlersRegistered = true;
   }
 
-  getAppState(options = {}) {
-    this.refreshProviderInfo(options?.forceProviderRefresh === true);
-    this.refreshCodeEditors();
-    if (this.reconcileUnlockedSessionProviders()) {
+  projectResultForSender(sender, result) {
+    if (!isSerializedAppState(result)) {
+      return result;
+    }
+
+    return this.getAppStateForRecipient(sender);
+  }
+
+  createStateSerializationContext(options = {}) {
+    const forceProviderRefresh = options?.forceProviderRefresh === true;
+    const isLightweight = options?.lightweight === true;
+
+    if (forceProviderRefresh || !isLightweight) {
+      this.refreshProviderInfo(forceProviderRefresh);
+      this.refreshCodeEditors(forceProviderRefresh);
+    }
+
+    if (!isLightweight && this.reconcileUnlockedSessionProviders()) {
       this.scheduleSave();
     }
 
-    const selectedWorkspace = this.getSelectedWorkspace();
-    const selectedSession = this.getSelectedSession();
     const activeRunLookup = this.getActiveRunLookup();
     const hasActiveRun = Array.from(activeRunLookup.values()).some((runState) => Boolean(runState?.process));
-    const selectedWorkspacePath = selectedWorkspace?.path || '';
     const enabledProviders = new Set(this.getEnabledProviders());
     const codeEditors = this.getAvailableCodeEditors();
     const selectedCodeEditor = this.getSelectedCodeEditor(codeEditors);
-    const providers = {
+
+    return {
+      activeRunLookup,
+      codeEditors,
+      enabledProviders,
+      hasActiveRun,
+      selectedCodeEditor,
+    };
+  }
+
+  createProviderSnapshot(context, workspacePath = '') {
+    return {
       claude: serializeProviderInfo(
         'claude',
         this.claudeInfo,
-        collectInstalledSkills(selectedWorkspacePath, 'claude'),
-        enabledProviders.has('claude'),
+        collectInstalledSkills(workspacePath, 'claude'),
+        context.enabledProviders.has('claude'),
         this.getProviderSystemPrompt('claude'),
       ),
       codex: serializeProviderInfo(
         'codex',
         this.codexInfo,
-        collectInstalledSkills(selectedWorkspacePath, 'codex'),
-        enabledProviders.has('codex'),
+        collectInstalledSkills(workspacePath, 'codex'),
+        context.enabledProviders.has('codex'),
         this.getProviderSystemPrompt('codex'),
       ),
     };
+  }
+
+  createAppStatePayload(context, options = {}) {
+    const providers = this.createProviderSnapshot(context, options?.providerWorkspacePath || '');
+    const activeSession = options?.activeSession || null;
+    const selectedWorkspaceId = options?.selectedWorkspaceId || null;
+    const selectedSessionId = options?.selectedSessionId || null;
+    const workspaces = Array.isArray(options?.workspaces) ? options.workspaces : [];
 
     return {
       claude: {
         ...providers.claude,
-        busy: hasActiveRun,
+        busy: context.hasActiveRun,
       },
       appInfo: {
         arch: process.arch || '',
@@ -438,25 +476,92 @@ class ClaudeDesktopRuntime {
         userDataPath: app.getPath('userData'),
         version: app.getVersion(),
       },
-      codeEditors,
+      codeEditors: context.codeEditors,
       defaultProvider: this.getDefaultProvider(),
       expandedWorkspaceIds: this.store.expandedWorkspaceIds,
       networkProxy: normalizeNetworkProxySettings(this.store.networkProxy),
       paneLayout: this.store.paneLayout,
       platform: process.platform,
       providers,
-      selectedCodeEditor,
+      selectedCodeEditor: context.selectedCodeEditor,
+      selectedSessionId,
+      selectedWorkspaceId,
+      workspaces,
+      activeSession,
+    };
+  }
+
+  serializeWorkspacesByIds(workspaceIds, activeRunLookup, includeGitInfo = false) {
+    const orderedWorkspaceIds = Array.from(new Set(
+      (Array.isArray(workspaceIds) ? workspaceIds : [])
+        .filter((workspaceId) => typeof workspaceId === 'string' && workspaceId.trim()),
+    ));
+
+    return orderedWorkspaceIds
+      .map((workspaceId) => this.findWorkspace(workspaceId))
+      .filter(Boolean)
+      .map((workspace) => serializeWorkspace(workspace, activeRunLookup, includeGitInfo));
+  }
+
+  buildGlobalAppState(context, options = {}) {
+    const selectedWorkspace = this.getSelectedWorkspace();
+    const selectedSession = this.getSelectedSession();
+    const activeSession = options?.includeActiveSession === false
+      ? null
+      : (selectedWorkspace && selectedSession
+        ? serializeSession(selectedWorkspace, selectedSession, context.activeRunLookup)
+        : null);
+
+    return this.createAppStatePayload(context, {
+      activeSession,
+      providerWorkspacePath: selectedWorkspace?.path || '',
       selectedSessionId: this.store.selectedSessionId,
       selectedWorkspaceId: this.store.selectedWorkspaceId,
       workspaces: this.store.workspaces.map((workspace) => (
-        serializeWorkspace(workspace, activeRunLookup, true)
+        serializeWorkspace(workspace, context.activeRunLookup, true)
       )),
-      activeSession: options?.includeActiveSession === false
-        ? null
-        : (selectedWorkspace && selectedSession
-        ? serializeSession(selectedWorkspace, selectedSession, activeRunLookup)
-        : null),
-    };
+    });
+  }
+
+  buildPaneAppState(recipientContext, context) {
+    const paneWorkspace = this.findWorkspace(recipientContext?.workspaceId);
+    const paneSession = paneWorkspace?.sessions.find((session) => session.id === recipientContext?.sessionId && !session.archived) || null;
+    const selectedWorkspaceId = paneWorkspace?.id || this.store.selectedWorkspaceId || null;
+    const selectedSessionId = paneSession?.id || (paneWorkspace ? null : this.store.selectedSessionId);
+    const providerWorkspacePath = paneWorkspace?.path
+      || this.findWorkspace(selectedWorkspaceId)?.path
+      || '';
+    const activeSession = paneWorkspace && paneSession
+      ? serializeSession(paneWorkspace, paneSession, context.activeRunLookup)
+      : null;
+
+    return this.createAppStatePayload(context, {
+      activeSession,
+      providerWorkspacePath,
+      selectedSessionId,
+      selectedWorkspaceId,
+      workspaces: this.serializeWorkspacesByIds(
+        [selectedWorkspaceId, paneWorkspace?.id || ''],
+        context.activeRunLookup,
+        true,
+      ),
+    });
+  }
+
+  getAppState(options = {}) {
+    const context = this.createStateSerializationContext(options);
+    return this.buildGlobalAppState(context, options);
+  }
+
+  getAppStateForRecipient(contents, options = {}) {
+    const context = this.createStateSerializationContext(options);
+    const recipientContext = getStateRecipientContext(contents);
+
+    if (recipientContext?.view === 'pane') {
+      return this.buildPaneAppState(recipientContext, context);
+    }
+
+    return this.buildGlobalAppState(context, options);
   }
 
   async pickWorkspaceDirectory(browserWindow) {
@@ -491,19 +596,13 @@ class ClaudeDesktopRuntime {
 
   async preparePastedAttachments(payload) {
     const entries = Array.isArray(payload?.attachments) ? payload.attachments : [];
-    const attachments = [];
-
-    for (const entry of entries) {
-      const attachment = this.preparePastedAttachment(entry);
-      if (attachment) {
-        attachments.push(attachment);
-      }
-    }
+    const attachments = (await Promise.all(entries.map((entry) => this.preparePastedAttachment(entry))))
+      .filter(Boolean);
 
     return normalizeMessageAttachments(attachments, { verifyExists: true });
   }
 
-  preparePastedAttachment(entry) {
+  async preparePastedAttachment(entry) {
     if (!entry || typeof entry !== 'object') {
       return null;
     }
@@ -516,16 +615,17 @@ class ClaudeDesktopRuntime {
       };
     }
 
-    if (typeof entry.dataBase64 !== 'string' || !entry.dataBase64.trim()) {
+    const fileContents = getPastedAttachmentBuffer(entry);
+    if (!fileContents) {
       return null;
     }
 
     const targetDirectory = path.join(app.getPath('userData'), PASTED_ATTACHMENT_DIR_NAME);
-    fs.mkdirSync(targetDirectory, { recursive: true });
+    await fs.promises.mkdir(targetDirectory, { recursive: true });
 
     const fileName = createPastedAttachmentFileName(entry);
     const targetPath = path.join(targetDirectory, fileName);
-    fs.writeFileSync(targetPath, Buffer.from(entry.dataBase64, 'base64'));
+    await fs.promises.writeFile(targetPath, fileContents);
 
     return {
       kind: normalizeAttachmentKind(entry.kind, targetPath),
@@ -794,6 +894,7 @@ class ClaudeDesktopRuntime {
       id: randomUUID(),
       name: path.basename(workspacePath) || workspacePath,
       path: workspacePath,
+      revision: 1,
       sessions: [],
       updatedAt: now,
     };
@@ -906,7 +1007,10 @@ class ClaudeDesktopRuntime {
       throw new Error('正在执行中的话题暂时不能归档。');
     }
 
+    const now = new Date().toISOString();
     session.archived = true;
+    session.updatedAt = now;
+    this.touchWorkspace(workspace, now);
 
     if (this.store.selectedWorkspaceId === workspace.id && this.store.selectedSessionId === session.id) {
       this.store.selectedSessionId = getLatestVisibleSession(workspace)?.id || null;
@@ -2674,16 +2778,34 @@ class ClaudeDesktopRuntime {
       this.clearPendingStateEmit(webContents.id);
     }
 
-    const payload = {
-      state: this.getAppState({
-        includeActiveSession: options?.lightweight !== true,
-      }),
-      type: 'state',
-    };
+    const context = this.createStateSerializationContext(options);
+    const stateCache = new Map();
+    const senderContext = getStateRecipientContext(webContents);
 
     for (const contents of this.getStateRecipients()) {
       try {
-        contents.send('claude:event', payload);
+        const recipientContext = getStateRecipientContext(contents);
+        if (!shouldEmitStateToRecipient(senderContext, recipientContext, options)) {
+          continue;
+        }
+
+        const cacheKey = createStateRecipientCacheKey(recipientContext, options);
+        let state = stateCache.get(cacheKey);
+
+        if (!state) {
+          state = recipientContext?.view === 'pane'
+            ? this.buildPaneAppState(recipientContext, context)
+            : this.buildGlobalAppState(context, {
+              ...options,
+              includeActiveSession: options?.lightweight !== true,
+            });
+          stateCache.set(cacheKey, state);
+        }
+
+        contents.send('claude:event', {
+          state,
+          type: 'state',
+        });
       } catch {
         // Ignore transient renderer teardown while broadcasting global state.
       }
@@ -2732,6 +2854,9 @@ class ClaudeDesktopRuntime {
 
   touchWorkspace(workspace, timestamp = new Date().toISOString()) {
     workspace.updatedAt = timestamp;
+    workspace.revision = Number.isFinite(workspace.revision)
+      ? workspace.revision + 1
+      : 1;
   }
 
   refreshProviderInfo(force = false) {
@@ -2974,6 +3099,7 @@ function normalizeWorkspace(workspace) {
     id: workspace.id || randomUUID(),
     name: workspace.name || path.basename(workspace.path || '') || '未命名目录',
     path: typeof workspace.path === 'string' ? workspace.path : '',
+    revision: Number.isFinite(workspace.revision) ? Math.max(1, Math.floor(workspace.revision)) : 1,
     sessions: Array.isArray(workspace.sessions)
       ? workspace.sessions.map((session) => normalizeSession(session)).filter(Boolean)
       : [],
@@ -3153,6 +3279,86 @@ function normalizeWorkspaceApprovalRule(rule) {
   }
 
   return null;
+}
+
+function isSerializedAppState(value) {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && Array.isArray(value.workspaces)
+    && value.providers
+    && typeof value.providers === 'object'
+    && Object.prototype.hasOwnProperty.call(value, 'selectedWorkspaceId')
+  );
+}
+
+function getStateRecipientContext(contents) {
+  if (!contents || typeof contents.getURL !== 'function') {
+    return null;
+  }
+
+  let currentUrl = '';
+  try {
+    currentUrl = contents.getURL();
+  } catch {
+    return null;
+  }
+
+  if (!currentUrl) {
+    return null;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(currentUrl);
+  } catch {
+    return null;
+  }
+
+  return {
+    paneId: parsedUrl.searchParams.get('paneId') || '',
+    sessionId: parsedUrl.searchParams.get('sessionId') || '',
+    view: parsedUrl.searchParams.get('view') || 'main',
+    workspaceId: parsedUrl.searchParams.get('workspaceId') || '',
+  };
+}
+
+function createStateRecipientCacheKey(recipientContext, options = {}) {
+  if (recipientContext?.view === 'pane') {
+    return [
+      'pane',
+      recipientContext.workspaceId || '',
+      recipientContext.sessionId || '',
+    ].join('\u0000');
+  }
+
+  return [
+    'global',
+    options?.lightweight === true ? 'light' : 'full',
+  ].join('\u0000');
+}
+
+function shouldEmitStateToRecipient(senderContext, recipientContext, options = {}) {
+  if (recipientContext?.view !== 'pane' || options?.lightweight !== true) {
+    return true;
+  }
+
+  if (
+    senderContext?.view !== 'pane'
+    || !senderContext.workspaceId
+    || !senderContext.sessionId
+  ) {
+    return true;
+  }
+
+  if (!recipientContext.workspaceId || !recipientContext.sessionId) {
+    return true;
+  }
+
+  return (
+    recipientContext.workspaceId === senderContext.workspaceId
+    && recipientContext.sessionId === senderContext.sessionId
+  );
 }
 
 function normalizeMessage(message) {
@@ -4239,6 +4445,27 @@ function createPastedAttachmentFileName(entry) {
   return `${safeBaseName}-${Date.now()}-${randomUUID().slice(0, 8)}${extension}`;
 }
 
+function getPastedAttachmentBuffer(entry) {
+  const rawBuffer = entry?.dataBuffer;
+  if (rawBuffer instanceof ArrayBuffer) {
+    return Buffer.from(rawBuffer);
+  }
+
+  if (ArrayBuffer.isView(rawBuffer)) {
+    return Buffer.from(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+  }
+
+  if (Array.isArray(rawBuffer) && rawBuffer.length > 0) {
+    return Buffer.from(rawBuffer);
+  }
+
+  if (typeof entry?.dataBase64 === 'string' && entry.dataBase64.trim()) {
+    return Buffer.from(entry.dataBase64, 'base64');
+  }
+
+  return null;
+}
+
 function getPastedAttachmentExtension(entry) {
   const rawName = typeof entry?.name === 'string' ? entry.name.trim() : '';
   const nameExtension = path.extname(rawName || '');
@@ -4331,40 +4558,19 @@ function serializeWorkspace(workspace, activeRunLookup, includeGitInfo = false) 
 }
 
 function createSerializedWorkspaceCacheKey(workspace, activeRunLookup, includeGitInfo = false) {
-  const sessionStateSignature = Array.isArray(workspace?.sessions)
-    ? workspace.sessions
-      .map((session) => [
-        session?.id || '',
-        session?.updatedAt || '',
-        session?.status || '',
-        session?.archived ? '1' : '0',
-      ].join(':'))
-      .join('|')
-    : '';
-  const activeRunSignature = Array.isArray(workspace?.sessions)
-    ? workspace.sessions
-      .map((session) => {
-        const activeRun = activeRunLookup?.get(createRunKey(workspace.id, session?.id));
-        if (!activeRun) {
-          return '';
-        }
-
-        return `${session.id}:${activeRun.process ? '1' : '0'}`;
-      })
-      .filter(Boolean)
-      .join('|')
-    : '';
+  const activeRunSignature = getWorkspaceActiveRunSignature(workspace, activeRunLookup);
 
   return [
     workspace?.id || '',
     includeGitInfo ? 'git' : 'plain',
-    sessionStateSignature,
+    Number.isFinite(workspace?.revision) ? workspace.revision : 0,
     activeRunSignature,
   ].join('\u0000');
 }
 
 function serializeSession(workspace, session, activeRunLookup) {
   const activeRun = activeRunLookup.get(createRunKey(workspace.id, session.id)) || null;
+  const messageSummary = getSessionMessageSummary(session);
   const pendingApprovals = activeRun
       ? Array.from(activeRun.pendingApprovalRequests.values())
         .map((approval) => serializePendingApproval(approval))
@@ -4391,7 +4597,7 @@ function serializeSession(workspace, session, activeRunLookup) {
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
     reasoningEffort: configuredReasoningEffort,
     provider: normalizeSessionProvider(session.provider),
-    providerLocked: isSessionProviderLocked(session),
+    providerLocked: messageSummary.providerLocked,
     status: session.status,
     title: session.title,
     updatedAt: session.updatedAt,
@@ -4401,10 +4607,10 @@ function serializeSession(workspace, session, activeRunLookup) {
 }
 
 function serializeSessionMeta(workspace, session, activeRunLookup) {
-  const previewSource = getLatestPreviewMessage(session.messages);
   const activeRun = activeRunLookup.get(createRunKey(workspace.id, session.id)) || null;
   const effectiveDefaults = getEffectiveSessionDefaults(workspace.path, session);
   const configuredReasoningEffort = normalizeSessionReasoningEffort(session.reasoningEffort);
+  const messageSummary = getSessionMessageSummary(session);
 
   return {
     archived: Boolean(session.archived),
@@ -4414,12 +4620,12 @@ function serializeSessionMeta(workspace, session, activeRunLookup) {
     effectiveReasoningEffort: configuredReasoningEffort || effectiveDefaults.reasoningEffort,
     id: session.id,
     isRunning: Boolean(activeRun?.process),
-    messageCount: session.messages.filter((message) => message.role !== 'event').length,
+    messageCount: messageSummary.messageCount,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
     reasoningEffort: configuredReasoningEffort,
     provider: normalizeSessionProvider(session.provider),
-    providerLocked: isSessionProviderLocked(session),
-    preview: previewSource ? (truncateText(getMessagePreviewText(previewSource), 80) || '还没有消息') : '还没有消息',
+    providerLocked: messageSummary.providerLocked,
+    preview: messageSummary.preview,
     status: session.status,
     title: session.title,
     updatedAt: session.updatedAt,
@@ -5864,6 +6070,92 @@ function getLatestPreviewMessage(messages) {
   }
 
   return null;
+}
+
+function getWorkspaceActiveRunSignature(workspace, activeRunLookup) {
+  if (!workspace?.id || !(activeRunLookup instanceof Map) || activeRunLookup.size === 0) {
+    return '';
+  }
+
+  const runningSessionIds = [];
+  const workspaceRunPrefix = createRunKey(workspace.id, '');
+
+  for (const [runKey, activeRun] of activeRunLookup.entries()) {
+    if (!runKey.startsWith(workspaceRunPrefix) || !activeRun?.process || !activeRun.sessionId) {
+      continue;
+    }
+
+    runningSessionIds.push(activeRun.sessionId);
+  }
+
+  return runningSessionIds.sort().join('|');
+}
+
+function getSessionMessageSummary(session) {
+  if (!session || !Array.isArray(session.messages)) {
+    return {
+      messageCount: 0,
+      preview: '还没有消息',
+      providerLocked: false,
+    };
+  }
+
+  const cacheKey = [
+    session.id || '',
+    session.updatedAt || '',
+    session.messages.length,
+  ].join('\u0000');
+  const cached = sessionMessageSummaryCache.get(cacheKey);
+  if (cached) {
+    sessionMessageSummaryCache.delete(cacheKey);
+    sessionMessageSummaryCache.set(cacheKey, cached);
+    return cached;
+  }
+
+  const summary = summarizeSessionMessages(session.messages);
+  setBoundedCacheValue(
+    sessionMessageSummaryCache,
+    cacheKey,
+    summary,
+    SESSION_MESSAGE_SUMMARY_CACHE_MAX_SIZE,
+  );
+  return summary;
+}
+
+function summarizeSessionMessages(messages) {
+  let messageCount = 0;
+  let inputMessageCount = 0;
+  let previewMessage = null;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || typeof message !== 'object') {
+      continue;
+    }
+
+    if (message.role !== 'event') {
+      messageCount += 1;
+    }
+
+    if (
+      message.role === 'user'
+      || (message.role === 'event' && message.kind === 'command')
+    ) {
+      inputMessageCount += 1;
+    }
+
+    if (!previewMessage && (message.role === 'assistant' || message.role === 'user')) {
+      previewMessage = message;
+    }
+  }
+
+  return {
+    messageCount,
+    preview: previewMessage
+      ? (truncateText(getMessagePreviewText(previewMessage), 80) || '还没有消息')
+      : '还没有消息',
+    providerLocked: inputMessageCount > 0,
+  };
 }
 
 function getMessagePreviewText(message) {

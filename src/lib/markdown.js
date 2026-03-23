@@ -17,10 +17,32 @@ const MARKDOWN_COPY_TEXT = {
   },
 };
 
+const MARKDOWN_RENDER_CACHE_MAX_SIZE = 120;
+const markdownRenderCache = new Map();
+
 export function renderMarkdown(text = '', language = 'zh') {
-  const renderedHtml = marked.parse(text);
+  const normalizedText = typeof text === 'string' ? text : String(text ?? '');
+  const cacheKey = `${language}\u0000${normalizedText}`;
+  const cachedHtml = markdownRenderCache.get(cacheKey);
+  if (typeof cachedHtml === 'string') {
+    markdownRenderCache.delete(cacheKey);
+    markdownRenderCache.set(cacheKey, cachedHtml);
+    return cachedHtml;
+  }
+
+  const renderedHtml = marked.parse(normalizedText);
   const enhancedHtml = enhanceMarkdownHtml(renderedHtml, language);
-  return DOMPurify.sanitize(enhancedHtml);
+  const sanitizedHtml = DOMPurify.sanitize(enhancedHtml);
+
+  if (markdownRenderCache.size >= MARKDOWN_RENDER_CACHE_MAX_SIZE) {
+    const oldestKey = markdownRenderCache.keys().next().value;
+    if (oldestKey) {
+      markdownRenderCache.delete(oldestKey);
+    }
+  }
+
+  markdownRenderCache.set(cacheKey, sanitizedHtml);
+  return sanitizedHtml;
 }
 
 function enhanceMarkdownHtml(html, language) {

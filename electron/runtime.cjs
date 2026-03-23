@@ -17,8 +17,11 @@ const SCHEMA_VERSION = 8;
 const SAVE_DEBOUNCE_MS = 160;
 const CLAUDE_CHECK_TTL_MS = 30_000;
 const CODE_EDITOR_CHECK_TTL_MS = 30_000;
+const SKILL_LIST_CACHE_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
+const SERIALIZED_WORKSPACE_CACHE_MAX_SIZE = 120;
 const WORKSPACE_GIT_INFO_TTL_MS = 10_000;
+const STATE_EMIT_THROTTLE_MS = 75;
 const PASTED_ATTACHMENT_DIR_NAME = 'pasted-attachments';
 const SESSION_PERMISSION_MODES = new Set([
   'acceptEdits',
@@ -181,6 +184,8 @@ const MULTI_TARGET_GOTO_EDITOR_KEYS = new Set([
 ]);
 
 const workspaceGitInfoCache = new Map();
+const skillListCache = new Map();
+const serializedWorkspaceCache = new Map();
 let shellPathCache = {
   checkedAt: 0,
   value: '',
@@ -250,6 +255,7 @@ class ClaudeDesktopRuntime {
     this.configPath = path.join(app.getPath('userData'), CONFIG_FILE_NAME);
     this.defaultPickerPath = path.resolve(process.cwd());
     this.handlersRegistered = false;
+    this.pendingStateEmitTimers = new Map();
     this.saveTimer = null;
     this.claudeInfo = {
       available: null,
@@ -830,7 +836,7 @@ class ClaudeDesktopRuntime {
       : [];
 
     this.scheduleSave();
-    return this.getAppState();
+    return this.store.expandedWorkspaceIds;
   }
 
   setPaneLayout(paneLayout) {
@@ -1231,6 +1237,7 @@ class ClaudeDesktopRuntime {
     }
 
     fs.cpSync(sourcePath, targetPath, { recursive: true, errorOnExist: true, force: false });
+    skillListCache.clear();
 
     this.appendEventMessage(workspace, session, {
       commandSource: 'slash',
@@ -1730,6 +1737,7 @@ class ClaudeDesktopRuntime {
   }
 
   disposeWindow(contentsId) {
+    this.clearPendingStateEmit(contentsId);
     const windowRuns = this.windowRuns.get(contentsId);
     if (!windowRuns) {
       return;
@@ -1796,7 +1804,7 @@ class ClaudeDesktopRuntime {
       this.handleClaudeEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
     }
     this.scheduleSave();
-    this.emitState(webContents);
+    this.scheduleStateEmit(webContents);
   }
 
   handleClaudeEvent(webContents, workspace, session, runState, event) {
@@ -2099,7 +2107,6 @@ class ClaudeDesktopRuntime {
 
       if (block?.type === 'tool_use') {
         this.emitToolUse(workspace, session, runState, block);
-        this.emitState(webContents);
         return;
       }
 
@@ -2125,9 +2132,7 @@ class ClaudeDesktopRuntime {
 
     for (const block of content) {
       if (block.type === 'tool_use') {
-        if (this.emitToolUse(workspace, session, runState, block)) {
-          this.emitState(webContents);
-        }
+        this.emitToolUse(workspace, session, runState, block);
       }
     }
 
@@ -2166,7 +2171,6 @@ class ClaudeDesktopRuntime {
 
       clearPendingApprovalByToolUseId(runState, block.tool_use_id);
       runState.toolUses.delete(block.tool_use_id);
-      this.emitState(webContents);
     }
   }
 
@@ -2501,11 +2505,40 @@ class ClaudeDesktopRuntime {
     }
   }
 
+  clearPendingStateEmit(contentsId) {
+    const timer = this.pendingStateEmitTimers.get(contentsId);
+    if (!timer) {
+      return;
+    }
+
+    clearTimeout(timer);
+    this.pendingStateEmitTimers.delete(contentsId);
+  }
+
+  scheduleStateEmit(webContents) {
+    if (!webContents || webContents.isDestroyed()) {
+      return;
+    }
+
+    const contentsId = webContents.id;
+    if (this.pendingStateEmitTimers.has(contentsId)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingStateEmitTimers.delete(contentsId);
+      this.emitState(webContents);
+    }, STATE_EMIT_THROTTLE_MS);
+
+    this.pendingStateEmitTimers.set(contentsId, timer);
+  }
+
   emitState(webContents) {
     if (!webContents || webContents.isDestroyed()) {
       return;
     }
 
+    this.clearPendingStateEmit(webContents.id);
     webContents.send('claude:event', {
       state: this.getAppState(),
       type: 'state',
@@ -2917,6 +2950,22 @@ function normalizeWorkspaceApprovalRule(rule) {
       key: `command:${command}`,
       kind: 'command',
       toolName: typeof rule.toolName === 'string' && rule.toolName.trim() ? rule.toolName.trim() : 'Bash',
+    };
+  }
+
+  if (kind === 'edit') {
+    const filePath = getApprovalEditFilePath(rule);
+    if (!filePath) {
+      return null;
+    }
+
+    return {
+      createdAt: rule.createdAt || new Date().toISOString(),
+      filePath,
+      input: rule.input && typeof rule.input === 'object' ? rule.input : { file_path: filePath },
+      key: createEditApprovalRuleKey(filePath),
+      kind: 'edit',
+      toolName: typeof rule.toolName === 'string' && rule.toolName.trim() ? rule.toolName.trim() : 'Edit',
     };
   }
 
@@ -3549,6 +3598,13 @@ function createRunState(workspaceId = null, sessionId = null) {
 }
 
 function serializeWorkspace(workspace, activeRunLookup, includeGitInfo = false) {
+  const cacheKey = createSerializedWorkspaceCacheKey(workspace, activeRunLookup, includeGitInfo);
+  const cached = serializedWorkspaceCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && (!includeGitInfo || now - cached.checkedAt < WORKSPACE_GIT_INFO_TTL_MS)) {
+    return cached.value;
+  }
+
   const gitInfo = includeGitInfo ? getWorkspaceGitInfo(workspace.path) : null;
   const sessionMetas = workspace.sessions
     .filter((session) => !session.archived)
@@ -3556,7 +3612,7 @@ function serializeWorkspace(workspace, activeRunLookup, includeGitInfo = false) 
     .sort((left, right) => toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt))
     .map((session) => serializeSessionMeta(workspace, session, activeRunLookup));
 
-  return {
+  const serialized = {
     createdAt: workspace.createdAt,
     exists: directoryExists(workspace.path),
     gitAddedLines: Number.isFinite(gitInfo?.addedLines) ? gitInfo.addedLines : 0,
@@ -3570,6 +3626,46 @@ function serializeWorkspace(workspace, activeRunLookup, includeGitInfo = false) 
     sessions: sessionMetas,
     updatedAt: workspace.updatedAt,
   };
+
+  setBoundedCacheValue(serializedWorkspaceCache, cacheKey, {
+    checkedAt: now,
+    value: serialized,
+  }, SERIALIZED_WORKSPACE_CACHE_MAX_SIZE);
+
+  return serialized;
+}
+
+function createSerializedWorkspaceCacheKey(workspace, activeRunLookup, includeGitInfo = false) {
+  const sessionStateSignature = Array.isArray(workspace?.sessions)
+    ? workspace.sessions
+      .map((session) => [
+        session?.id || '',
+        session?.updatedAt || '',
+        session?.status || '',
+        session?.archived ? '1' : '0',
+      ].join(':'))
+      .join('|')
+    : '';
+  const activeRunSignature = Array.isArray(workspace?.sessions)
+    ? workspace.sessions
+      .map((session) => {
+        const activeRun = activeRunLookup?.get(createRunKey(workspace.id, session?.id));
+        if (!activeRun) {
+          return '';
+        }
+
+        return `${session.id}:${activeRun.process ? '1' : '0'}`;
+      })
+      .filter(Boolean)
+      .join('|')
+    : '';
+
+  return [
+    workspace?.id || '',
+    includeGitInfo ? 'git' : 'plain',
+    sessionStateSignature,
+    activeRunSignature,
+  ].join('\u0000');
 }
 
 function serializeSession(workspace, session, activeRunLookup) {
@@ -3740,6 +3836,22 @@ function createApprovalRuleFromPendingApproval(approval) {
     };
   }
 
+  if (inferApprovalCategory(approval) === 'edit') {
+    const filePath = getApprovalEditFilePath(approval);
+    if (!filePath) {
+      return null;
+    }
+
+    return {
+      createdAt: new Date().toISOString(),
+      filePath,
+      input: approval.input && typeof approval.input === 'object' ? approval.input : { file_path: filePath },
+      key: createEditApprovalRuleKey(filePath),
+      kind: 'edit',
+      toolName: typeof approval.toolName === 'string' && approval.toolName.trim() ? approval.toolName.trim() : 'Edit',
+    };
+  }
+
   if (inferApprovalCategory(approval) !== 'command') {
     return null;
   }
@@ -3803,11 +3915,33 @@ function normalizeApprovalBlockedPath(value) {
   return normalized ? path.resolve(normalized) : '';
 }
 
+function getApprovalEditFilePath(approval) {
+  if (!approval || typeof approval !== 'object') {
+    return '';
+  }
+
+  return normalizeApprovalBlockedPath(
+    approval.filePath
+    || getToolInputString(approval.input, ['file_path', 'path'])
+    || approval.path
+    || approval.blockedPath,
+  );
+}
+
+function createEditApprovalRuleKey(filePath) {
+  return `edit:${filePath}`;
+}
+
 function getApprovalRuleKey(approval) {
   if (isQueuedCodexWriteApproval(approval)) {
     const blockedPath = normalizeApprovalBlockedPath(approval.blockedPath || approval.input?.workspacePath);
     const sandboxMode = getQueuedCodexApprovalSandboxMode(approval) || 'workspace-write';
     return createCodexPermissionApprovalKey(blockedPath, sandboxMode);
+  }
+
+  if (inferApprovalCategory(approval) === 'edit') {
+    const filePath = getApprovalEditFilePath(approval);
+    return filePath ? createEditApprovalRuleKey(filePath) : '';
   }
 
   if (inferApprovalCategory(approval) !== 'command') {
@@ -7376,6 +7510,13 @@ function parseSkillInstallArgs(args) {
 
 function collectInstalledSkills(workspacePath, provider = DEFAULT_PROVIDER) {
   const normalizedProvider = normalizeSessionProvider(provider);
+  const cacheKey = `${normalizedProvider}\u0000${workspacePath || ''}`;
+  const cached = skillListCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.checkedAt < SKILL_LIST_CACHE_TTL_MS) {
+    return cached.entries;
+  }
+
   const providerSkillRoot = path.join(getProviderHome(normalizedProvider), 'skills');
   const roots = [
     { path: providerSkillRoot, scope: 'user' },
@@ -7438,7 +7579,24 @@ function collectInstalledSkills(workspacePath, provider = DEFAULT_PROVIDER) {
     }
   }
 
-  return entries.sort((left, right) => left.name.localeCompare(right.name));
+  const sortedEntries = entries.sort((left, right) => left.name.localeCompare(right.name));
+  skillListCache.set(cacheKey, {
+    checkedAt: now,
+    entries: sortedEntries,
+  });
+  return sortedEntries;
+}
+
+function setBoundedCacheValue(cache, key, value, maxEntries) {
+  cache.set(key, value);
+  if (cache.size <= maxEntries) {
+    return;
+  }
+
+  const oldestKey = cache.keys().next().value;
+  if (oldestKey !== undefined) {
+    cache.delete(oldestKey);
+  }
 }
 
 function getProviderHome(provider = DEFAULT_PROVIDER) {

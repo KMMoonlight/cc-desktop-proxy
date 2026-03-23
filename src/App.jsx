@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -11,6 +11,7 @@ import {
   ChevronRight,
   CheckCircle2,
   Columns2,
+  Copy,
   FileText,
   Folder,
   FolderOpen,
@@ -84,6 +85,7 @@ const LANGUAGE_STORAGE_KEY = 'cc-desktop-proxy-language';
 const PANE_LAYOUT_STORAGE_KEY = 'cc-desktop-proxy-pane-layout';
 const PANE_RECENT_IDS_STORAGE_KEY = 'cc-desktop-proxy-pane-recent-ids';
 const PANE_SIZE_LIMIT_IGNORED_STORAGE_KEY = 'cc-desktop-proxy-pane-size-limit-ignored';
+const PANE_FINISH_FLASH_ENABLED_STORAGE_KEY = 'cc-desktop-proxy-pane-finish-flash-enabled';
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'cc-desktop-proxy-sidebar-collapsed';
 const THEME_STORAGE_KEY = 'cc-desktop-proxy-theme';
 const PANE_LAYOUT_MODES = ['single', 'columns', 'rows', 'grid'];
@@ -258,6 +260,16 @@ function getPaneHeaderLabel(platform, paneNumber) {
   return String(paneNumber || '');
 }
 
+function useEventCallback(callback) {
+  const callbackRef = useRef(callback);
+
+  useEffect(() => {
+    callbackRef.current = callback;
+  });
+
+  return useCallback((...args) => callbackRef.current?.(...args), []);
+}
+
 const COPY = {
   zh: {
     addWorkspace: '添加工作目录',
@@ -271,6 +283,8 @@ const COPY = {
     approvalAllow: '允许',
     approvalAllowAlwaysCommand: '允许，且相同命令不再询问',
     approvalAllowAlwaysCommandSummary: '保存到当前工作目录的已允许命令列表',
+    approvalAllowAlwaysEdit: '允许，且此文件不再询问',
+    approvalAllowAlwaysEditSummary: '后续 Claude 编辑同一文件时直接允许',
     approvalAllowAlwaysWorkspaceWrite: '允许，且此工作目录不再询问',
     approvalAllowAlwaysWorkspaceWriteSummary: '下次 Codex 需要提升此工作目录权限时直接允许',
     approvalAllowSummary: '仅允许这一次',
@@ -440,6 +454,8 @@ const COPY = {
     settingsAboutUnavailable: '暂无信息',
     settingsPaneBehaviorDescription: '控制是否根据窗口尺寸限制分屏数量。',
     settingsPaneBehaviorTitle: '分屏',
+    settingsPaneFinishFlashDescription: '开启后，未选中的分屏在输出结束时会闪烁边框，直到再次选中。',
+    settingsPaneFinishFlashTitle: '后台完成时闪烁边框',
     settingsPaneSizeLimitDescription: '开启后不再因为屏幕或窗口尺寸隐藏分屏，可以继续新增分屏。',
     settingsPaneSizeLimitTitle: '无视屏幕大小限制',
     settingsProvidersHint: '至少保留一个 Provider 处于启用状态。',
@@ -510,6 +526,8 @@ const COPY = {
     approvalAllow: 'Allow',
     approvalAllowAlwaysCommand: 'Allow and don’t ask again for this command',
     approvalAllowAlwaysCommandSummary: 'Save it to the current workspace allowlist',
+    approvalAllowAlwaysEdit: 'Allow and don’t ask again for this file',
+    approvalAllowAlwaysEditSummary: 'Future Claude edits to this file will be allowed directly',
     approvalAllowAlwaysWorkspaceWrite: 'Allow and don’t ask again for this workspace',
     approvalAllowAlwaysWorkspaceWriteSummary: 'Future Codex workspace escalations in this workspace will be allowed directly',
     approvalAllowSummary: 'Allow only this time',
@@ -679,6 +697,8 @@ const COPY = {
     settingsAboutUnavailable: 'Unavailable',
     settingsPaneBehaviorDescription: 'Control whether split count follows the current window size.',
     settingsPaneBehaviorTitle: 'Splits',
+    settingsPaneFinishFlashDescription: 'When enabled, an inactive pane flashes its border after output finishes until you focus it again.',
+    settingsPaneFinishFlashTitle: 'Flash border on background completion',
     settingsPaneSizeLimitDescription: 'When enabled, panes stay visible and you can keep adding splits regardless of screen or window size.',
     settingsPaneSizeLimitTitle: 'Ignore screen size limit',
     settingsProvidersHint: 'Keep at least one provider enabled.',
@@ -755,6 +775,7 @@ function MainApp({ desktopClient }) {
   const [language, setLanguage] = useState(() => getInitialLanguage());
   const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
   const [isPaneSizeLimitIgnored, setIsPaneSizeLimitIgnored] = useState(() => getInitialPaneSizeLimitIgnored());
+  const [isPaneFinishFlashEnabled, setIsPaneFinishFlashEnabled] = useState(() => getInitialPaneFinishFlashEnabled());
   const [systemTheme, setSystemTheme] = useState(() => getSystemTheme());
   const [inputValue, setInputValue] = useState('');
   const [composerAttachments, setComposerAttachments] = useState([]);
@@ -770,7 +791,6 @@ function MainApp({ desktopClient }) {
   const [pendingPaneTurns, setPendingPaneTurns] = useState({});
   const [sendingPaneIds, setSendingPaneIds] = useState([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [settingsActiveTab, setSettingsActiveTab] = useState('app');
   const [isModePickerOpen, setIsModePickerOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [isUpdatingPermissionMode, setIsUpdatingPermissionMode] = useState(false);
@@ -789,6 +809,7 @@ function MainApp({ desktopClient }) {
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
   const [sessionViewCache, setSessionViewCache] = useState({});
   const [sessionSearchQuery, setSessionSearchQuery] = useState('');
+  const [paneCompletionAttention, setPaneCompletionAttention] = useState({});
 
   const hasHydratedExpandedWorkspaceIdsRef = useRef(false);
   const hasHydratedPaneLayoutRef = useRef(false);
@@ -798,6 +819,7 @@ function MainApp({ desktopClient }) {
   const collapsedSidebarRef = useRef(null);
   const [paneBoardElement, setPaneBoardElement] = useState(null);
   const paneLayoutRef = useRef(paneLayout);
+  const paneCompletionStatusRef = useRef({});
   const paneRecentIdsRef = useRef(paneRecentIds);
   const sidebarFlyoutRef = useRef(null);
   const slashCommandMenuRef = useRef(null);
@@ -843,7 +865,7 @@ function MainApp({ desktopClient }) {
   const providerCatalog = appState.providers && typeof appState.providers === 'object'
     ? appState.providers
     : {};
-  const appInfo = normalizeAppInfo(appState.appInfo);
+  const appInfo = useMemo(() => normalizeAppInfo(appState.appInfo), [appState.appInfo]);
   const codeEditors = useMemo(
     () => (
       Array.isArray(appState.codeEditors)
@@ -1023,6 +1045,69 @@ function MainApp({ desktopClient }) {
   const topBarHeightClass = isMac ? 'h-10' : 'h-11';
   const topBarOffsetClass = isMac ? 'pt-10' : 'pt-11';
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
+  const handleApprovalDecision = useEventCallback((requestId, decision) => respondToApproval(requestId, decision));
+  const handlePaneClear = useEventCallback((paneId) => clearPane(paneId));
+  const handlePaneFocus = useEventCallback((paneId) => {
+    void focusPane(paneId);
+  });
+  const handlePanePickAttachments = useEventCallback(() => pickAttachmentsForPane());
+  const handlePanePreparePastedAttachments = useEventCallback((clipboardData) => preparePastedAttachmentsForPane(clipboardData));
+  const handlePaneRunSlashCommand = useEventCallback((paneId, rawInput) => runSlashCommandForPane(paneId, rawInput));
+  const handlePaneSendMessage = useEventCallback((paneId, prompt, options) => submitPromptForPane(paneId, prompt, options));
+  const handlePaneStopRun = useEventCallback((paneId) => stopRunForPane(paneId));
+  const handlePaneUpdateSessionProvider = useEventCallback((paneId, nextProvider) => updateSessionProviderForPane(paneId, nextProvider));
+  const handlePaneUpdateSessionModel = useEventCallback((paneId, nextModel) => updateSessionModelForPane(paneId, nextModel));
+  const handlePaneUpdateSessionReasoningEffort = useEventCallback((paneId, nextReasoningEffort) => updateSessionReasoningEffortForPane(paneId, nextReasoningEffort));
+  const handlePaneUpdateSessionPermissionMode = useEventCallback((paneId, nextPermissionMode) => updateSessionPermissionModeForPane(paneId, nextPermissionMode));
+  const handleSettingsClose = useEventCallback(() => setIsSettingsOpen(false));
+  const handleSettingsRefreshProviderStatus = useEventCallback(() => refreshProviderStatus());
+  const handleSettingsSetProviderEnabled = useEventCallback((provider, enabled) => setProviderEnabled(provider, enabled));
+  const handleSettingsSetProviderSystemPrompt = useEventCallback((provider, systemPrompt) => (
+    setProviderSystemPrompt(provider, systemPrompt)
+  ));
+  const handleSettingsCodeEditorChange = useEventCallback((codeEditor) => setCodeEditor(codeEditor));
+  const handleSidebarArchiveSession = useEventCallback((workspaceId, sessionId, title) => {
+    setSidebarFlyoutView(null);
+    setPendingArchiveSession({
+      sessionId,
+      title,
+      workspaceId,
+    });
+  });
+  const handleSidebarCreateSession = useEventCallback((workspaceId) => {
+    setSidebarFlyoutView(null);
+    void createSession(workspaceId);
+  });
+  const handleSidebarOpenGitDiffWindow = useEventCallback((workspaceId) => {
+    setSidebarFlyoutView(null);
+    void openGitDiffWindow(workspaceId);
+  });
+  const handleSidebarOpenWorkspaceInFinder = useEventCallback((workspaceId) => {
+    setSidebarFlyoutView(null);
+    void openWorkspaceInFinder(workspaceId);
+  });
+  const handleSidebarOpenWorkspaceInCodeEditor = useEventCallback((workspaceId) => {
+    setSidebarFlyoutView(null);
+    void openWorkspaceInCodeEditor(workspaceId);
+  });
+  const handleSidebarRemoveWorkspace = useEventCallback((workspaceId, title) => {
+    setSidebarFlyoutView(null);
+    setPendingRemoveWorkspace({
+      title,
+      workspaceId,
+    });
+  });
+  const handleSidebarSelectSession = useEventCallback((workspaceId, sessionId) => {
+    setSidebarFlyoutView(null);
+    void selectSession(workspaceId, sessionId);
+  });
+  const handleSidebarSelectWorkspace = useEventCallback((workspaceId) => {
+    setSidebarFlyoutView(null);
+    void selectWorkspace(workspaceId);
+  });
+  const handleSidebarToggleWorkspaceExpand = useEventCallback((workspaceId) => {
+    toggleWorkspaceExpansion(workspaceId);
+  });
   const hasHiddenPanes = hiddenPaneViews.length > 0;
   const hiddenPaneSection = hasHiddenPanes ? (
     <HiddenPaneSection
@@ -1080,51 +1165,19 @@ function MainApp({ desktopClient }) {
                 key={workspace.id}
                 disabled={isArchivingSession || isRemovingWorkspace}
                 isExpanded={normalizedSessionSearchQuery ? true : expandedWorkspaceIds.includes(workspace.id)}
-                onArchiveSession={(session) => {
-                  setSidebarFlyoutView(null);
-                  setPendingArchiveSession({
-                    sessionId: session.id,
-                    title: session.title,
-                    workspaceId: workspace.id,
-                  });
-                }}
-                onCreateSession={() => {
-                  setSidebarFlyoutView(null);
-                  createSession(workspace.id);
-                }}
-                onOpenGitDiffWindow={() => {
-                  setSidebarFlyoutView(null);
-                  openGitDiffWindow(workspace.id);
-                }}
-                onOpenWorkspaceInFinder={() => {
-                  setSidebarFlyoutView(null);
-                  openWorkspaceInFinder(workspace.id);
-                }}
-                onOpenWorkspaceInCodeEditor={() => {
-                  setSidebarFlyoutView(null);
-                  openWorkspaceInCodeEditor(workspace.id);
-                }}
-                onRemoveWorkspace={() => {
-                  setSidebarFlyoutView(null);
-                  setPendingRemoveWorkspace({
-                    title: workspace.name,
-                    workspaceId: workspace.id,
-                  });
-                }}
-                onSelectSession={(sessionId) => {
-                  setSidebarFlyoutView(null);
-                  selectSession(workspace.id, sessionId);
-                }}
-                onSelectWorkspace={() => {
-                  setSidebarFlyoutView(null);
-                  selectWorkspace(workspace.id);
-                }}
-                onToggleExpand={() => toggleWorkspaceExpansion(workspace.id)}
+                onArchiveSession={handleSidebarArchiveSession}
+                onCreateSession={handleSidebarCreateSession}
+                onOpenGitDiffWindow={handleSidebarOpenGitDiffWindow}
+                onOpenWorkspaceInFinder={handleSidebarOpenWorkspaceInFinder}
+                onOpenWorkspaceInCodeEditor={handleSidebarOpenWorkspaceInCodeEditor}
+                onRemoveWorkspace={handleSidebarRemoveWorkspace}
+                onSelectSession={handleSidebarSelectSession}
+                onSelectWorkspace={handleSidebarSelectWorkspace}
+                onToggleExpand={handleSidebarToggleWorkspaceExpand}
                 platform={appState.platform}
                 selectedSessionId={focusedPane?.sessionId || appState.selectedSessionId}
                 sessionPaneBindingMap={sessionPaneBindingMap}
                 canOpenWorkspaceInCodeEditor={Boolean(selectedCodeEditor)}
-                language={language}
                 workspace={workspace}
               />
             ))
@@ -1180,22 +1233,6 @@ function MainApp({ desktopClient }) {
     }
 
     refreshAppStateSilently();
-  }, [isSettingsOpen]);
-
-  useEffect(() => {
-    if (!isSettingsOpen || settingsActiveTab !== 'providers' || !desktopClient?.refreshProviderStatus) {
-      return;
-    }
-
-    void refreshProviderStatus();
-  }, [desktopClient, isSettingsOpen, settingsActiveTab]);
-
-  useEffect(() => {
-    if (isSettingsOpen) {
-      return;
-    }
-
-    setSettingsActiveTab('app');
   }, [isSettingsOpen]);
 
   useEffect(() => {
@@ -1393,6 +1430,90 @@ function MainApp({ desktopClient }) {
   }, [paneLayout.panes, pendingPaneTurns, selectedSession, sendingPaneIds, sessionViewCache]);
 
   useEffect(() => {
+    const nextStatuses = {};
+    const nextAttentionPaneIds = new Set();
+
+    for (const pane of paneViews) {
+      const sessionCacheKey = createSessionCacheKey(pane.workspace?.id || pane.workspaceId, pane.session?.id || pane.sessionMeta?.id || pane.sessionId);
+      const status = {
+        isOutputInProgress: Boolean(pane.isOutputInProgress),
+        sessionCacheKey,
+      };
+      nextStatuses[pane.id] = status;
+
+      const previousStatus = paneCompletionStatusRef.current[pane.id];
+      const shouldTriggerAttention = (
+        previousStatus?.isOutputInProgress
+        && !status.isOutputInProgress
+        && previousStatus.sessionCacheKey
+        && previousStatus.sessionCacheKey === status.sessionCacheKey
+        && !pane.isFocused
+        && !pane.isOnlyPane
+        && isPaneFinishFlashEnabled
+      );
+
+      if (shouldTriggerAttention) {
+        nextAttentionPaneIds.add(pane.id);
+      }
+    }
+
+    paneCompletionStatusRef.current = nextStatuses;
+
+    setPaneCompletionAttention((current) => {
+      let mutated = false;
+      const next = {};
+
+      for (const pane of paneViews) {
+        const currentStatus = nextStatuses[pane.id];
+        const currentAttention = current[pane.id];
+        const shouldKeepAttention = (
+          currentAttention
+          && currentAttention.sessionCacheKey
+          && currentAttention.sessionCacheKey === currentStatus?.sessionCacheKey
+          && !pane.isFocused
+          && !pane.isOnlyPane
+          && isPaneFinishFlashEnabled
+        );
+
+        if (shouldKeepAttention) {
+          next[pane.id] = currentAttention;
+          if (currentAttention !== current[pane.id]) {
+            mutated = true;
+          }
+          continue;
+        }
+
+        if (nextAttentionPaneIds.has(pane.id) && currentStatus?.sessionCacheKey) {
+          next[pane.id] = { sessionCacheKey: currentStatus.sessionCacheKey };
+          if (
+            !currentAttention
+            || currentAttention.sessionCacheKey !== currentStatus.sessionCacheKey
+          ) {
+            mutated = true;
+          }
+          continue;
+        }
+
+        if (currentAttention) {
+          mutated = true;
+        }
+      }
+
+      if (!mutated && Object.keys(current).length === Object.keys(next).length) {
+        return current;
+      }
+
+      return next;
+    });
+  }, [isPaneFinishFlashEnabled, paneViews]);
+
+  useEffect(() => {
+    if (!isPaneFinishFlashEnabled && Object.keys(paneCompletionAttention).length > 0) {
+      setPaneCompletionAttention({});
+    }
+  }, [isPaneFinishFlashEnabled, paneCompletionAttention]);
+
+  useEffect(() => {
     if (!pendingApprovalActionId) {
       return;
     }
@@ -1585,6 +1706,14 @@ function MainApp({ desktopClient }) {
 
     window.localStorage.setItem(PANE_SIZE_LIMIT_IGNORED_STORAGE_KEY, JSON.stringify(isPaneSizeLimitIgnored));
   }, [isPaneSizeLimitIgnored]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(PANE_FINISH_FLASH_ENABLED_STORAGE_KEY, JSON.stringify(isPaneFinishFlashEnabled));
+  }, [isPaneFinishFlashEnabled]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -2252,15 +2381,52 @@ function MainApp({ desktopClient }) {
       return;
     }
 
-    if (!pane.sessionId || !pane.workspaceId) {
-      setPaneLayout((current) => focusPaneInLayout(current, paneId));
+    setPaneCompletionAttention((current) => {
+      if (!current[paneId]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[paneId];
+      return next;
+    });
+
+    setPaneLayout((current) => focusPaneInLayout(current, paneId));
+
+    if (!desktopClient || !pane.sessionId || !pane.workspaceId) {
       return;
     }
 
-    await openSessionInPane(pane.workspaceId, pane.sessionId, { paneId, preferPaneId: true });
+    if (
+      appState.selectedWorkspaceId === pane.workspaceId
+      && appState.selectedSessionId === pane.sessionId
+    ) {
+      return;
+    }
+
+    setSidebarError('');
+
+    try {
+      const nextState = await desktopClient.selectSession({
+        sessionId: pane.sessionId,
+        workspaceId: pane.workspaceId,
+      });
+      setAppState(nextState);
+    } catch (error) {
+      setSidebarError(error.message);
+    }
   }
 
   function clearPane(paneId) {
+    setPaneCompletionAttention((current) => {
+      if (!current[paneId]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[paneId];
+      return next;
+    });
     setPaneLayout((current) => removePaneFromLayout(current, paneId));
   }
 
@@ -3512,9 +3678,7 @@ function MainApp({ desktopClient }) {
     }
 
     desktopClient.setExpandedWorkspaces(nextExpandedWorkspaceIds)
-      .then((nextState) => {
-        setAppState(nextState);
-      })
+      .then(() => {})
       .catch((error) => {
         setSidebarError(error.message);
       });
@@ -3753,25 +3917,23 @@ function MainApp({ desktopClient }) {
                     copy={copy}
                     language={language}
                     maxPaneCount={maxPaneCount}
-                    onCreateSession={(workspaceId) => createSession(workspaceId, { paneId: pane.id })}
                     pane={pane}
                     paneNumber={paneIndex + 1}
                     paneShortcutLabel={getPaneHeaderLabel(appState.platform, paneIndex + 1)}
-                    onClear={() => clearPane(pane.id)}
-                    onFocus={() => {
-                      void focusPane(pane.id);
-                    }}
-                    onApprovalDecision={respondToApproval}
-                    onPickAttachments={pickAttachmentsForPane}
+                    shouldFlashFinishedBorder={Boolean(paneCompletionAttention[pane.id])}
+                    onClear={handlePaneClear}
+                    onFocus={handlePaneFocus}
+                    onApprovalDecision={handleApprovalDecision}
+                    onPickAttachments={handlePanePickAttachments}
                     platform={appState.platform}
-                    onPreparePastedAttachments={preparePastedAttachmentsForPane}
-                    onRunSlashCommand={runSlashCommandForPane}
-                    onSendMessage={submitPromptForPane}
-                    onStopRun={stopRunForPane}
-                    onUpdateSessionProvider={updateSessionProviderForPane}
-                    onUpdateSessionModel={updateSessionModelForPane}
-                    onUpdateSessionReasoningEffort={updateSessionReasoningEffortForPane}
-                    onUpdateSessionPermissionMode={updateSessionPermissionModeForPane}
+                    onPreparePastedAttachments={handlePanePreparePastedAttachments}
+                    onRunSlashCommand={handlePaneRunSlashCommand}
+                    onSendMessage={handlePaneSendMessage}
+                    onStopRun={handlePaneStopRun}
+                    onUpdateSessionProvider={handlePaneUpdateSessionProvider}
+                    onUpdateSessionModel={handlePaneUpdateSessionModel}
+                    onUpdateSessionReasoningEffort={handlePaneUpdateSessionReasoningEffort}
+                    onUpdateSessionPermissionMode={handlePaneUpdateSessionPermissionMode}
                     defaultProvider={appState.defaultProvider}
                     providerCatalog={providerCatalog}
                     isUpdatingModel={isUpdatingModel}
@@ -3826,28 +3988,28 @@ function MainApp({ desktopClient }) {
 
       {isSettingsOpen && (
         <SettingsDialog
-          activeTab={settingsActiveTab}
           appInfo={appInfo}
           codeEditors={codeEditors}
           copy={copy}
+          isPaneFinishFlashEnabled={isPaneFinishFlashEnabled}
           isPaneSizeLimitIgnored={isPaneSizeLimitIgnored}
           isUpdatingCodeEditor={isUpdatingCodeEditorSettings}
           isUpdatingProviders={isUpdatingProviderSettings}
           savingProviderSystemPromptKey={savingProviderSystemPromptKey}
           isRefreshingProviderStatus={isRefreshingProviderStatus}
           language={language}
-          onActiveTabChange={setSettingsActiveTab}
-          onCodeEditorChange={setCodeEditor}
-          onRefreshProviderStatus={refreshProviderStatus}
+          onCodeEditorChange={handleSettingsCodeEditorChange}
+          onRefreshProviderStatus={handleSettingsRefreshProviderStatus}
           providerSettings={providerSettings}
           platform={appState.platform}
           selectedCodeEditor={selectedCodeEditor}
           themePreference={themePreference}
-          onClose={() => setIsSettingsOpen(false)}
+          onClose={handleSettingsClose}
           onLanguageChange={setLanguage}
+          onPaneFinishFlashEnabledChange={setIsPaneFinishFlashEnabled}
           onPaneSizeLimitIgnoredChange={setIsPaneSizeLimitIgnored}
-          onSetProviderEnabled={setProviderEnabled}
-          onSetProviderSystemPrompt={setProviderSystemPrompt}
+          onSetProviderEnabled={handleSettingsSetProviderEnabled}
+          onSetProviderSystemPrompt={handleSettingsSetProviderSystemPrompt}
           onThemeChange={setThemePreference}
         />
       )}
@@ -3855,7 +4017,7 @@ function MainApp({ desktopClient }) {
   );
 }
 
-function ConversationPane({
+const ConversationPane = memo(function ConversationPane({
   canClear,
   copy,
   defaultProvider,
@@ -3864,7 +4026,6 @@ function ConversationPane({
   isUpdatingPermissionMode,
   isUpdatingProvider,
   language,
-  onCreateSession,
   onApprovalDecision,
   onClear,
   onFocus,
@@ -3883,6 +4044,7 @@ function ConversationPane({
   paneShortcutLabel,
   pendingApprovalActionId,
   providerCatalog,
+  shouldFlashFinishedBorder,
 }) {
   const [inputValue, setInputValue] = useState('');
   const [composerAttachments, setComposerAttachments] = useState([]);
@@ -4315,7 +4477,7 @@ function ConversationPane({
     <div
       data-conversation-pane="true"
       onMouseDownCapture={() => {
-        void onFocus?.();
+        void onFocus?.(pane.id);
       }}
       className={cn(
         'relative flex min-h-0 min-w-0 flex-col overflow-visible bg-background transition-colors duration-150',
@@ -4330,6 +4492,13 @@ function ConversationPane({
           aria-hidden="true"
           className="pointer-events-none absolute inset-0 z-[2] shadow-[inset_0_0_0_2px_hsl(var(--pane-focus)/0.42)]"
           style={{ boxShadow: `inset 0 0 0 2px ${getPaneAccentColorAlpha(paneNumber, 0.42)}` }}
+        />
+      ) : null}
+      {!pane.isFocused && !pane.isOnlyPane && shouldFlashFinishedBorder ? (
+        <div
+          aria-hidden="true"
+          className="pane-finish-flash pointer-events-none absolute inset-0 z-[2]"
+          style={{ '--pane-finish-flash-color': getPaneAccentColorAlpha(paneNumber, 0.58) }}
         />
       ) : null}
       <div
@@ -4401,7 +4570,7 @@ function ConversationPane({
           ) : null}
           <button
             type="button"
-            onClick={onClear}
+            onClick={() => onClear?.(pane.id)}
             disabled={!canClear || pane.isBusy || pane.isOnlyPane}
             aria-label={copy.paneClose}
             title={formatShortcutTooltip(copy.paneClose, 'W', platform)}
@@ -4483,7 +4652,7 @@ function ConversationPane({
             )}
           >
             {hasComposerAttachments && (
-              <div className="absolute left-3 right-44 top-3 z-10 overflow-x-auto pb-1">
+              <div className="absolute left-3 right-14 top-3 z-10 overflow-x-auto pb-1">
                 <div className="flex min-w-max items-center gap-2 pr-2">
                   {composerAttachments.map((attachment) => (
                     <ComposerAttachmentChip
@@ -4607,7 +4776,7 @@ function ConversationPane({
                     : (isComposerExpanded ? copy.noSessionCommandHintExpanded : copy.noSessionCommandHint))
               }
               className={cn(
-                'resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-44 text-[13px] shadow-none focus-visible:ring-0',
+                'resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-14 text-[13px] shadow-none focus-visible:ring-0',
                 hasComposerAttachments ? 'pt-16' : 'pt-3',
                 isComposerExpanded
                   ? 'h-full min-h-0 flex-1 overflow-y-auto'
@@ -4796,6 +4965,123 @@ function ConversationPane({
       </div>
     </div>
   );
+}, areConversationPanePropsEqual);
+
+function areConversationPanePropsEqual(previousProps, nextProps) {
+  return (
+    previousProps.canClear === nextProps.canClear
+    && previousProps.copy === nextProps.copy
+    && previousProps.defaultProvider === nextProps.defaultProvider
+    && previousProps.isUpdatingModel === nextProps.isUpdatingModel
+    && previousProps.isUpdatingReasoningEffort === nextProps.isUpdatingReasoningEffort
+    && previousProps.isUpdatingPermissionMode === nextProps.isUpdatingPermissionMode
+    && previousProps.isUpdatingProvider === nextProps.isUpdatingProvider
+    && previousProps.language === nextProps.language
+    && previousProps.paneNumber === nextProps.paneNumber
+    && previousProps.paneShortcutLabel === nextProps.paneShortcutLabel
+    && previousProps.pendingApprovalActionId === nextProps.pendingApprovalActionId
+    && previousProps.platform === nextProps.platform
+    && previousProps.shouldFlashFinishedBorder === nextProps.shouldFlashFinishedBorder
+    && previousProps.onApprovalDecision === nextProps.onApprovalDecision
+    && previousProps.onClear === nextProps.onClear
+    && previousProps.onFocus === nextProps.onFocus
+    && previousProps.onPickAttachments === nextProps.onPickAttachments
+    && previousProps.onPreparePastedAttachments === nextProps.onPreparePastedAttachments
+    && previousProps.onRunSlashCommand === nextProps.onRunSlashCommand
+    && previousProps.onSendMessage === nextProps.onSendMessage
+    && previousProps.onStopRun === nextProps.onStopRun
+    && previousProps.onUpdateSessionProvider === nextProps.onUpdateSessionProvider
+    && previousProps.onUpdateSessionModel === nextProps.onUpdateSessionModel
+    && previousProps.onUpdateSessionReasoningEffort === nextProps.onUpdateSessionReasoningEffort
+    && previousProps.onUpdateSessionPermissionMode === nextProps.onUpdateSessionPermissionMode
+    && arePaneViewModelsEqual(previousProps.pane, nextProps.pane)
+    && areProviderCatalogsEquivalent(previousProps.providerCatalog, nextProps.providerCatalog)
+  );
+}
+
+function arePaneViewModelsEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  return (
+    left?.id === right?.id
+    && left?.isBusy === right?.isBusy
+    && left?.isFocused === right?.isFocused
+    && left?.isLoading === right?.isLoading
+    && left?.isOnlyPane === right?.isOnlyPane
+    && left?.isOutputInProgress === right?.isOutputInProgress
+    && left?.isSending === right?.isSending
+    && left?.shouldShowRunIndicator === right?.shouldShowRunIndicator
+    && left?.title === right?.title
+    && left?.workspaceName === right?.workspaceName
+    && left?.displayMessages === right?.displayMessages
+    && left?.renderableMessages === right?.renderableMessages
+    && left?.session === right?.session
+    && left?.sessionMeta === right?.sessionMeta
+    && left?.workspace === right?.workspace
+  );
+}
+
+function areProviderCatalogsEquivalent(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  return PROVIDER_KEYS.every((providerKey) => (
+    areProviderInfosEquivalent(
+      getProviderInfo(left, providerKey, providerKey),
+      getProviderInfo(right, providerKey, providerKey),
+    )
+  ));
+}
+
+function areProviderInfosEquivalent(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  return (
+    Boolean(left?.available) === Boolean(right?.available)
+    && (left?.enabled !== false) === (right?.enabled !== false)
+    && (left?.systemPrompt || '') === (right?.systemPrompt || '')
+    && (left?.version || '') === (right?.version || '')
+    && areStringArraysEqual(left?.models, right?.models)
+    && areSkillListsEqual(left?.skills, right?.skills)
+  );
+}
+
+function areStringArraysEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((value, index) => value === right[index]);
+}
+
+function areSkillListsEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((skill, index) => {
+    const candidate = right[index];
+    return (
+      (skill?.commandName || '') === (candidate?.commandName || '')
+      && (skill?.description || '') === (candidate?.description || '')
+      && (skill?.name || '') === (candidate?.name || '')
+      && (skill?.path || '') === (candidate?.path || '')
+      && (skill?.scope || '') === (candidate?.scope || '')
+    );
+  });
 }
 
 function ConversationContextUsageChip({ copy, language, usage }) {
@@ -4963,21 +5249,50 @@ function createProviderPromptDrafts(providerSettings) {
     : {};
 }
 
-function SettingsDialog({
-  activeTab,
+function syncProviderPromptDrafts(currentDrafts, previousSavedDrafts, nextSavedDrafts) {
+  const currentEntries = currentDrafts && typeof currentDrafts === 'object' ? currentDrafts : {};
+  const previousEntries = previousSavedDrafts && typeof previousSavedDrafts === 'object' ? previousSavedDrafts : {};
+  const nextEntries = nextSavedDrafts && typeof nextSavedDrafts === 'object' ? nextSavedDrafts : {};
+  const nextDrafts = {};
+  let hasChanges = false;
+
+  Object.keys(nextEntries).forEach((providerKey) => {
+    const hasCurrentValue = Object.prototype.hasOwnProperty.call(currentEntries, providerKey);
+    const currentValue = hasCurrentValue ? currentEntries[providerKey] : '';
+    const previousSavedValue = typeof previousEntries[providerKey] === 'string' ? previousEntries[providerKey] : '';
+    const nextSavedValue = typeof nextEntries[providerKey] === 'string' ? nextEntries[providerKey] : '';
+    const nextValue = !hasCurrentValue || currentValue === previousSavedValue
+      ? nextSavedValue
+      : currentValue;
+
+    nextDrafts[providerKey] = nextValue;
+    if (!hasCurrentValue || nextValue !== currentValue) {
+      hasChanges = true;
+    }
+  });
+
+  if (!hasChanges && Object.keys(currentEntries).length !== Object.keys(nextDrafts).length) {
+    hasChanges = true;
+  }
+
+  return hasChanges ? nextDrafts : currentEntries;
+}
+
+const SettingsDialog = memo(function SettingsDialog({
   appInfo,
   codeEditors,
   copy,
+  isPaneFinishFlashEnabled,
   isPaneSizeLimitIgnored,
   isUpdatingCodeEditor,
   isUpdatingProviders,
   savingProviderSystemPromptKey,
   isRefreshingProviderStatus,
   language,
-  onActiveTabChange,
   onClose,
   onCodeEditorChange,
   onLanguageChange,
+  onPaneFinishFlashEnabledChange,
   onPaneSizeLimitIgnoredChange,
   onRefreshProviderStatus,
   onSetProviderEnabled,
@@ -4988,87 +5303,109 @@ function SettingsDialog({
   selectedCodeEditor,
   themePreference,
 }) {
-  const [providerPromptDrafts, setProviderPromptDrafts] = useState(() => createProviderPromptDrafts(providerSettings));
+  const [activeTab, setActiveTab] = useState('app');
+  const savedProviderPromptDrafts = useMemo(
+    () => createProviderPromptDrafts(providerSettings),
+    [providerSettings],
+  );
+  const [providerPromptDrafts, setProviderPromptDrafts] = useState(() => savedProviderPromptDrafts);
+  const savedProviderPromptDraftsRef = useRef(savedProviderPromptDrafts);
 
   useEffect(() => {
-    setProviderPromptDrafts(createProviderPromptDrafts(providerSettings));
-  }, [providerSettings]);
+    const previousSavedDrafts = savedProviderPromptDraftsRef.current;
+    savedProviderPromptDraftsRef.current = savedProviderPromptDrafts;
+    setProviderPromptDrafts((currentDrafts) => (
+      syncProviderPromptDrafts(currentDrafts, previousSavedDrafts, savedProviderPromptDrafts)
+    ));
+  }, [savedProviderPromptDrafts]);
 
-  const shortcutItems = [
-    {
-      action: copy.settingsShortcutAddWorkspace,
-      shortcut: formatShortcutLabel(platform, 'O'),
-    },
-    {
-      action: copy.settingsShortcutOpenSettings,
-      shortcut: formatShortcutLabel(platform, '.'),
-    },
-    {
-      action: copy.settingsShortcutToggleSidebar,
-      shortcut: formatShortcutLabel(platform, 'B'),
-    },
-    {
-      action: copy.settingsShortcutAddPane,
-      shortcut: formatShortcutLabel(platform, 'D'),
-    },
-    {
-      action: copy.settingsShortcutAddPaneAndCreate,
-      shortcut: formatShiftedShortcutLabel(platform, 'D'),
-    },
-    {
-      action: copy.settingsShortcutCreateConversation,
-      shortcut: formatShortcutLabel(platform, 'N'),
-    },
-    {
-      action: copy.settingsShortcutToggleFreshProvider,
-      shortcut: formatShortcutLabel(platform, 'T'),
-    },
-    {
-      action: copy.settingsShortcutClosePane,
-      shortcut: formatShortcutLabel(platform, 'W'),
-    },
-    {
-      action: copy.settingsShortcutFocusPane,
-      shortcut: formatShortcutRangeLabel(platform, '1', '9'),
-    },
-  ].filter((item) => item.shortcut);
-  const enabledProviderCount = providerSettings.filter((provider) => provider.enabled).length;
-  const modalLayoutStyles = getModalLayoutStyles(platform);
-  const aboutItems = [
-    { label: copy.settingsAboutName, value: appInfo.name || copy.settingsAboutUnavailable },
-    { label: copy.settingsAboutVersion, value: appInfo.version || copy.settingsAboutUnavailable },
-    { label: copy.settingsAboutPlatform, value: formatPlatformDisplayName(platform) || copy.settingsAboutUnavailable },
-    { label: copy.settingsAboutArch, value: appInfo.arch || copy.settingsAboutUnavailable },
-    { label: copy.settingsAboutElectron, value: appInfo.electronVersion || copy.settingsAboutUnavailable },
-    { label: copy.settingsAboutChrome, value: appInfo.chromeVersion || copy.settingsAboutUnavailable },
-    { label: copy.settingsAboutNode, value: appInfo.nodeVersion || copy.settingsAboutUnavailable },
-  ];
-  const settingsTabs = [
-    {
-      description: copy.settingsTabAppDescription,
-      icon: Settings,
-      key: 'app',
-      label: copy.settingsTabApp,
-    },
-    {
-      description: copy.settingsTabProvidersDescription,
-      icon: BrainCircuit,
-      key: 'providers',
-      label: copy.settingsTabProviders,
-    },
-    {
-      description: copy.settingsTabShortcutsDescription,
-      icon: TerminalSquare,
-      key: 'shortcuts',
-      label: copy.settingsTabShortcuts,
-    },
-    {
-      description: copy.settingsTabAboutDescription,
-      icon: Info,
-      key: 'about',
-      label: copy.settingsTabAbout,
-    },
-  ];
+  const shortcutItems = useMemo(
+    () => [
+      {
+        action: copy.settingsShortcutAddWorkspace,
+        shortcut: formatShortcutLabel(platform, 'O'),
+      },
+      {
+        action: copy.settingsShortcutOpenSettings,
+        shortcut: formatShortcutLabel(platform, '.'),
+      },
+      {
+        action: copy.settingsShortcutToggleSidebar,
+        shortcut: formatShortcutLabel(platform, 'B'),
+      },
+      {
+        action: copy.settingsShortcutAddPane,
+        shortcut: formatShortcutLabel(platform, 'D'),
+      },
+      {
+        action: copy.settingsShortcutAddPaneAndCreate,
+        shortcut: formatShiftedShortcutLabel(platform, 'D'),
+      },
+      {
+        action: copy.settingsShortcutCreateConversation,
+        shortcut: formatShortcutLabel(platform, 'N'),
+      },
+      {
+        action: copy.settingsShortcutToggleFreshProvider,
+        shortcut: formatShortcutLabel(platform, 'T'),
+      },
+      {
+        action: copy.settingsShortcutClosePane,
+        shortcut: formatShortcutLabel(platform, 'W'),
+      },
+      {
+        action: copy.settingsShortcutFocusPane,
+        shortcut: formatShortcutRangeLabel(platform, '1', '9'),
+      },
+    ].filter((item) => item.shortcut),
+    [copy, platform],
+  );
+  const enabledProviderCount = useMemo(
+    () => providerSettings.filter((provider) => provider.enabled).length,
+    [providerSettings],
+  );
+  const modalLayoutStyles = useMemo(() => getModalLayoutStyles(platform), [platform]);
+  const aboutItems = useMemo(
+    () => [
+      { label: copy.settingsAboutName, value: appInfo.name || copy.settingsAboutUnavailable },
+      { label: copy.settingsAboutVersion, value: appInfo.version || copy.settingsAboutUnavailable },
+      { label: copy.settingsAboutPlatform, value: formatPlatformDisplayName(platform) || copy.settingsAboutUnavailable },
+      { label: copy.settingsAboutArch, value: appInfo.arch || copy.settingsAboutUnavailable },
+      { label: copy.settingsAboutElectron, value: appInfo.electronVersion || copy.settingsAboutUnavailable },
+      { label: copy.settingsAboutChrome, value: appInfo.chromeVersion || copy.settingsAboutUnavailable },
+      { label: copy.settingsAboutNode, value: appInfo.nodeVersion || copy.settingsAboutUnavailable },
+    ],
+    [appInfo, copy, platform],
+  );
+  const settingsTabs = useMemo(
+    () => [
+      {
+        description: copy.settingsTabAppDescription,
+        icon: Settings,
+        key: 'app',
+        label: copy.settingsTabApp,
+      },
+      {
+        description: copy.settingsTabProvidersDescription,
+        icon: BrainCircuit,
+        key: 'providers',
+        label: copy.settingsTabProviders,
+      },
+      {
+        description: copy.settingsTabShortcutsDescription,
+        icon: TerminalSquare,
+        key: 'shortcuts',
+        label: copy.settingsTabShortcuts,
+      },
+      {
+        description: copy.settingsTabAboutDescription,
+        icon: Info,
+        key: 'about',
+        label: copy.settingsTabAbout,
+      },
+    ],
+    [copy],
+  );
   const activeTabItem = settingsTabs.find((item) => item.key === activeTab) || settingsTabs[0];
   const ActiveTabIcon = activeTabItem.icon;
 
@@ -5114,7 +5451,13 @@ function SettingsDialog({
                         key={item.key}
                         type="button"
                         aria-pressed={isActive}
-                        onClick={() => onActiveTabChange(item.key)}
+                        onClick={() => {
+                          if (item.key === activeTab) {
+                            return;
+                          }
+
+                          setActiveTab(item.key);
+                        }}
                         className={cn(
                           'flex min-w-[220px] items-start gap-3 rounded-2xl border px-3 py-3 text-left transition-colors md:min-w-0',
                           isActive
@@ -5216,6 +5559,32 @@ function SettingsDialog({
                         <p className="text-[11px] leading-5 text-muted-foreground">{copy.settingsPaneBehaviorDescription}</p>
                       </div>
                       <div className="overflow-hidden rounded-xl border border-border/80 bg-background/60">
+                        <div className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-[12px] font-medium text-foreground">{copy.settingsPaneFinishFlashTitle}</p>
+                            <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{copy.settingsPaneFinishFlashDescription}</p>
+                          </div>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={isPaneFinishFlashEnabled}
+                            aria-label={copy.settingsPaneFinishFlashTitle}
+                            onClick={() => onPaneFinishFlashEnabledChange(!isPaneFinishFlashEnabled)}
+                            className={cn(
+                              'inline-flex h-6 w-10 shrink-0 items-center rounded-full border p-0.5 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35',
+                              isPaneFinishFlashEnabled
+                                ? 'border-emerald-300 bg-emerald-400/90 dark:border-emerald-400/70 dark:bg-emerald-400/80'
+                                : 'border-border/80 bg-muted/80',
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                'h-4 w-4 rounded-full bg-background shadow-sm transition-transform',
+                                isPaneFinishFlashEnabled ? 'translate-x-4' : 'translate-x-0',
+                              )}
+                            />
+                          </button>
+                        </div>
                         <div className="flex items-center justify-between gap-3 px-3 py-3">
                           <div className="min-w-0">
                             <p className="truncate text-[12px] font-medium text-foreground">{copy.settingsPaneSizeLimitTitle}</p>
@@ -5465,6 +5834,63 @@ function SettingsDialog({
       </div>
     </div>
   );
+}, areSettingsDialogPropsEqual);
+
+function areSettingsDialogPropsEqual(previousProps, nextProps) {
+  return (
+    previousProps.copy === nextProps.copy
+    && previousProps.isPaneFinishFlashEnabled === nextProps.isPaneFinishFlashEnabled
+    && previousProps.isPaneSizeLimitIgnored === nextProps.isPaneSizeLimitIgnored
+    && previousProps.isRefreshingProviderStatus === nextProps.isRefreshingProviderStatus
+    && previousProps.isUpdatingCodeEditor === nextProps.isUpdatingCodeEditor
+    && previousProps.isUpdatingProviders === nextProps.isUpdatingProviders
+    && previousProps.language === nextProps.language
+    && previousProps.platform === nextProps.platform
+    && previousProps.savingProviderSystemPromptKey === nextProps.savingProviderSystemPromptKey
+    && previousProps.themePreference === nextProps.themePreference
+    && previousProps.onClose === nextProps.onClose
+    && previousProps.onCodeEditorChange === nextProps.onCodeEditorChange
+    && previousProps.onLanguageChange === nextProps.onLanguageChange
+    && previousProps.onPaneFinishFlashEnabledChange === nextProps.onPaneFinishFlashEnabledChange
+    && previousProps.onPaneSizeLimitIgnoredChange === nextProps.onPaneSizeLimitIgnoredChange
+    && previousProps.onRefreshProviderStatus === nextProps.onRefreshProviderStatus
+    && previousProps.onSetProviderEnabled === nextProps.onSetProviderEnabled
+    && previousProps.onSetProviderSystemPrompt === nextProps.onSetProviderSystemPrompt
+    && previousProps.onThemeChange === nextProps.onThemeChange
+    && areComparableValuesEqual(previousProps.appInfo, nextProps.appInfo)
+    && areComparableValuesEqual(previousProps.codeEditors, nextProps.codeEditors)
+    && areComparableValuesEqual(previousProps.providerSettings, nextProps.providerSettings)
+    && areComparableValuesEqual(previousProps.selectedCodeEditor, nextProps.selectedCodeEditor)
+  );
+}
+
+function areComparableValuesEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+
+    return left.every((value, index) => areComparableValuesEqual(value, right[index]));
+  }
+
+  if (left && right && typeof left === 'object' && typeof right === 'object') {
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    if (leftKeys.length !== rightKeys.length) {
+      return false;
+    }
+
+    return leftKeys.every((key) => (
+      Object.prototype.hasOwnProperty.call(right, key)
+      && areComparableValuesEqual(left[key], right[key])
+    ));
+  }
+
+  return left === right;
 }
 
 function HiddenPaneSection({ copy, hiddenPanes, onClearPane, onFocusPane }) {
@@ -5850,12 +6276,11 @@ function SlashCommandMenu({
   );
 }
 
-function WorkspaceItem({
+const WorkspaceItem = memo(function WorkspaceItem({
   canOpenWorkspaceInCodeEditor,
   copy,
   disabled,
   isExpanded,
-  language,
   onArchiveSession,
   onCreateSession,
   onOpenGitDiffWindow,
@@ -5875,6 +6300,25 @@ function WorkspaceItem({
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
   const [moreMenuPosition, setMoreMenuPosition] = useState(null);
   const moreMenuRef = useRef(null);
+  const handleToggleExpand = useEventCallback(() => onToggleExpand?.(workspace.id));
+  const handleSelectWorkspace = useEventCallback(() => {
+    onSelectWorkspace?.(workspace.id);
+    if (!isExpanded) {
+      onToggleExpand?.(workspace.id);
+    }
+  });
+  const handleCreateSession = useEventCallback(() => onCreateSession?.(workspace.id));
+  const handleToggleMoreMenu = useEventCallback(() => {
+    setIsMoreMenuOpen((current) => !current);
+  });
+  const handleOpenWorkspaceInCodeEditor = useEventCallback(() => onOpenWorkspaceInCodeEditor?.(workspace.id));
+  const handleOpenWorkspaceInFinder = useEventCallback(() => onOpenWorkspaceInFinder?.(workspace.id));
+  const handleOpenGitDiffWindow = useEventCallback(() => onOpenGitDiffWindow?.(workspace.id));
+  const handleRemoveWorkspace = useEventCallback(() => onRemoveWorkspace?.(workspace.id, workspace.name));
+  const handleSelectSession = useEventCallback((sessionId) => onSelectSession?.(workspace.id, sessionId));
+  const handleArchiveSession = useEventCallback((sessionId, sessionTitle) => (
+    onArchiveSession?.(workspace.id, sessionId, sessionTitle)
+  ));
 
   useEffect(() => {
     if (!isMoreMenuOpen || typeof document === 'undefined') {
@@ -5960,7 +6404,7 @@ function WorkspaceItem({
         <div className="flex min-w-0 items-center gap-1">
           <button
             type="button"
-            onClick={onToggleExpand}
+            onClick={handleToggleExpand}
             className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-[background-color,color,transform,box-shadow] hover:bg-background/80 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 active:scale-95 active:bg-background"
             disabled={disabled}
             aria-label={isExpanded ? copy.collapseWorkspace : copy.expandWorkspace}
@@ -5969,12 +6413,7 @@ function WorkspaceItem({
           </button>
           <button
             type="button"
-            onClick={() => {
-              onSelectWorkspace();
-              if (!isExpanded) {
-                onToggleExpand();
-              }
-            }}
+            onClick={handleSelectWorkspace}
             className="min-w-0 flex-1 rounded-md px-1 py-1 text-left transition-[background-color,color,transform,box-shadow] hover:bg-background/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 active:translate-y-px active:bg-background"
             disabled={disabled}
             title={workspace.path}
@@ -5989,7 +6428,7 @@ function WorkspaceItem({
           <Button
             variant="ghost"
             size="icon"
-            onClick={onCreateSession}
+            onClick={handleCreateSession}
             disabled={disabled}
             className={cn(
               SIDEBAR_ACTION_BUTTON_CLASS,
@@ -6004,7 +6443,7 @@ function WorkspaceItem({
               ref={moreButtonRef}
               variant="ghost"
               size="icon"
-              onClick={() => setIsMoreMenuOpen((current) => !current)}
+              onClick={handleToggleMoreMenu}
               disabled={disabled}
               aria-label={copy.workspaceMoreActions}
               className={cn(
@@ -6025,21 +6464,21 @@ function WorkspaceItem({
                 disabled={disabled}
                 onOpenWorkspaceInCodeEditor={() => {
                   setIsMoreMenuOpen(false);
-                  onOpenWorkspaceInCodeEditor?.();
+                  handleOpenWorkspaceInCodeEditor();
                 }}
                 onOpenWorkspaceInFinder={() => {
                   setIsMoreMenuOpen(false);
-                  onOpenWorkspaceInFinder?.();
+                  handleOpenWorkspaceInFinder();
                 }}
                 position={moreMenuPosition}
                 workspace={workspace}
                 onOpenGitDiffWindow={() => {
                   setIsMoreMenuOpen(false);
-                  onOpenGitDiffWindow?.();
+                  handleOpenGitDiffWindow();
                 }}
                 onRemoveWorkspace={() => {
                   setIsMoreMenuOpen(false);
-                  onRemoveWorkspace?.();
+                  handleRemoveWorkspace();
                 }}
               />
             ) : null}
@@ -6056,13 +6495,12 @@ function WorkspaceItem({
                 <SessionItem
                   copy={copy}
                   disabled={disabled}
-                  language={language}
-                  onArchive={() => onArchiveSession(session)}
+                  onArchive={handleArchiveSession}
                   key={session.id}
                   session={session}
                   paneNumbers={sessionPaneBindingMap.get(createSessionCacheKey(workspace.id, session.id)) || []}
                   isSelected={session.id === selectedSessionId}
-                  onSelect={() => onSelectSession(session.id)}
+                  onSelect={handleSelectSession}
                 />
               ))}
             </div>
@@ -6071,6 +6509,107 @@ function WorkspaceItem({
       )}
     </div>
   );
+}, areWorkspaceItemPropsEqual);
+
+function areWorkspaceItemPropsEqual(previousProps, nextProps) {
+  return (
+    previousProps.canOpenWorkspaceInCodeEditor === nextProps.canOpenWorkspaceInCodeEditor
+    && previousProps.copy === nextProps.copy
+    && previousProps.disabled === nextProps.disabled
+    && previousProps.isExpanded === nextProps.isExpanded
+    && previousProps.onArchiveSession === nextProps.onArchiveSession
+    && previousProps.onCreateSession === nextProps.onCreateSession
+    && previousProps.onOpenGitDiffWindow === nextProps.onOpenGitDiffWindow
+    && previousProps.onOpenWorkspaceInCodeEditor === nextProps.onOpenWorkspaceInCodeEditor
+    && previousProps.onOpenWorkspaceInFinder === nextProps.onOpenWorkspaceInFinder
+    && previousProps.onRemoveWorkspace === nextProps.onRemoveWorkspace
+    && previousProps.onSelectSession === nextProps.onSelectSession
+    && previousProps.onSelectWorkspace === nextProps.onSelectWorkspace
+    && previousProps.onToggleExpand === nextProps.onToggleExpand
+    && previousProps.platform === nextProps.platform
+    && getWorkspaceSelectedSessionId(previousProps.workspace, previousProps.selectedSessionId)
+      === getWorkspaceSelectedSessionId(nextProps.workspace, nextProps.selectedSessionId)
+    && areWorkspaceSidebarItemsEqual(previousProps.workspace, nextProps.workspace)
+    && areWorkspaceSessionPaneBindingsEqual(
+      previousProps.workspace,
+      nextProps.workspace,
+      previousProps.sessionPaneBindingMap,
+      nextProps.sessionPaneBindingMap,
+    )
+  );
+}
+
+function areWorkspaceSidebarItemsEqual(leftWorkspace, rightWorkspace) {
+  if (leftWorkspace === rightWorkspace) {
+    return true;
+  }
+
+  return (
+    (leftWorkspace?.exists !== false) === (rightWorkspace?.exists !== false)
+    && (leftWorkspace?.gitBranch || '') === (rightWorkspace?.gitBranch || '')
+    && Boolean(leftWorkspace?.gitDirty) === Boolean(rightWorkspace?.gitDirty)
+    && (leftWorkspace?.id || '') === (rightWorkspace?.id || '')
+    && (leftWorkspace?.name || '') === (rightWorkspace?.name || '')
+    && (leftWorkspace?.path || '') === (rightWorkspace?.path || '')
+    && areWorkspaceSessionListsEqual(leftWorkspace?.sessions, rightWorkspace?.sessions)
+  );
+}
+
+function areWorkspaceSessionListsEqual(leftSessions, rightSessions) {
+  if (leftSessions === rightSessions) {
+    return true;
+  }
+
+  if (!Array.isArray(leftSessions) || !Array.isArray(rightSessions) || leftSessions.length !== rightSessions.length) {
+    return false;
+  }
+
+  return leftSessions.every((session, index) => (
+    areWorkspaceSessionListItemsEqual(session, rightSessions[index])
+  ));
+}
+
+function areWorkspaceSessionListItemsEqual(leftSession, rightSession) {
+  if (leftSession === rightSession) {
+    return true;
+  }
+
+  return (
+    (leftSession?.id || '') === (rightSession?.id || '')
+    && Boolean(leftSession?.isRunning) === Boolean(rightSession?.isRunning)
+    && (leftSession?.title || '') === (rightSession?.title || '')
+  );
+}
+
+function areWorkspaceSessionPaneBindingsEqual(leftWorkspace, rightWorkspace, leftBindingMap, rightBindingMap) {
+  const leftSessions = Array.isArray(leftWorkspace?.sessions) ? leftWorkspace.sessions : [];
+  const rightSessions = Array.isArray(rightWorkspace?.sessions) ? rightWorkspace.sessions : [];
+
+  if (leftSessions.length !== rightSessions.length) {
+    return false;
+  }
+
+  return leftSessions.every((session, index) => {
+    const rightSession = rightSessions[index];
+    if ((session?.id || '') !== (rightSession?.id || '')) {
+      return false;
+    }
+
+    return areComparableValuesEqual(
+      leftBindingMap?.get(createSessionCacheKey(leftWorkspace?.id, session?.id)) || [],
+      rightBindingMap?.get(createSessionCacheKey(rightWorkspace?.id, rightSession?.id)) || [],
+    );
+  });
+}
+
+function getWorkspaceSelectedSessionId(workspace, selectedSessionId) {
+  if (!workspace || !selectedSessionId) {
+    return '';
+  }
+
+  return Array.isArray(workspace.sessions) && workspace.sessions.some((session) => session.id === selectedSessionId)
+    ? selectedSessionId
+    : '';
 }
 
 function WorkspaceMoreMenu({
@@ -6164,14 +6703,14 @@ function WorkspaceMoreMenu({
   );
 }
 
-function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect, paneNumbers = [], session }) {
+const SessionItem = memo(function SessionItem({ copy, disabled, isSelected, onArchive, onSelect, paneNumbers = [], session }) {
   const showRunningDot = isSelected && session.isRunning;
 
   return (
     <div className="group relative">
       <button
         type="button"
-        onClick={onSelect}
+        onClick={() => onSelect?.(session.id)}
         className="w-full overflow-hidden px-2 py-1.5 text-left transition-[background-color,color,transform,box-shadow] hover:bg-background/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/35 active:translate-y-px active:bg-background"
       >
         <div className="flex items-center gap-2">
@@ -6198,7 +6737,7 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
         <Button
           variant="ghost"
           size="icon"
-          onClick={onArchive}
+          onClick={() => onArchive?.(session.id, session.title)}
           disabled={disabled || session.isRunning}
           className={cn(
             SIDEBAR_ACTION_BUTTON_CLASS,
@@ -6210,6 +6749,18 @@ function SessionItem({ copy, disabled, isSelected, language, onArchive, onSelect
         </Button>
       </div>
     </div>
+  );
+}, areSessionItemPropsEqual);
+
+function areSessionItemPropsEqual(previousProps, nextProps) {
+  return (
+    previousProps.copy === nextProps.copy
+    && previousProps.disabled === nextProps.disabled
+    && previousProps.isSelected === nextProps.isSelected
+    && previousProps.onArchive === nextProps.onArchive
+    && previousProps.onSelect === nextProps.onSelect
+    && areComparableValuesEqual(previousProps.paneNumbers, nextProps.paneNumbers)
+    && areWorkspaceSessionListItemsEqual(previousProps.session, nextProps.session)
   );
 }
 
@@ -6266,7 +6817,24 @@ function MessageLeadIcon({ children, className }) {
   );
 }
 
-function ChatMessage({ approvalActionId, language, message, onApprovalDecision }) {
+const AssistantMarkdownSegment = memo(function AssistantMarkdownSegment({ content, error, language }) {
+  const renderedHtml = useMemo(() => renderMarkdown(content, language), [content, language]);
+
+  return (
+    <div
+      className={cn('markdown-body text-[13px] leading-6', error && 'text-destructive')}
+      dangerouslySetInnerHTML={{
+        __html: renderedHtml,
+      }}
+    />
+  );
+}, (previousProps, nextProps) => (
+  previousProps.content === nextProps.content
+  && previousProps.error === nextProps.error
+  && previousProps.language === nextProps.language
+));
+
+const ChatMessage = memo(function ChatMessage({ approvalActionId, language, message, onApprovalDecision }) {
   if (message.role === 'event') {
     return <EventMessage language={language} message={message} />;
   }
@@ -6308,15 +6876,7 @@ function ChatMessage({ approvalActionId, language, message, onApprovalDecision }
                 );
               }
 
-              return (
-                <div
-                  key={segment.key}
-                  className={cn('markdown-body text-[13px] leading-6', segment.error && 'text-destructive')}
-                  dangerouslySetInnerHTML={{
-                    __html: renderMarkdown(segment.content, language),
-                  }}
-                />
-              );
+              return <AssistantMarkdownSegment key={segment.key} content={segment.content} error={segment.error} language={language} />;
             })}
             {showThinkingIndicator ? <TypingIndicator label={copy.assistantThinking} labelLoading /> : null}
           </div>
@@ -6324,6 +6884,15 @@ function ChatMessage({ approvalActionId, language, message, onApprovalDecision }
       </div>
     );
   }
+
+  const handleCopyMessage = async () => {
+    if (!message.content) return;
+    try {
+      await copyTextToClipboard(message.content);
+    } catch (error) {
+      console.error('Failed to copy message:', error);
+    }
+  };
 
   return (
     <div className="flex min-w-0 items-start justify-end gap-2.5">
@@ -6334,10 +6903,28 @@ function ChatMessage({ approvalActionId, language, message, onApprovalDecision }
             {message.content}
           </div>
         ) : null}
+        {message.content ? (
+          <div className="mt-1 flex justify-end">
+            <button
+              type="button"
+              onClick={handleCopyMessage}
+              className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-muted/50 hover:text-foreground"
+              aria-label={language === 'zh' ? '复制消息' : 'Copy message'}
+              title={language === 'zh' ? '复制消息' : 'Copy message'}
+            >
+              <Copy className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );
-}
+}, (previousProps, nextProps) => (
+  previousProps.approvalActionId === nextProps.approvalActionId
+  && previousProps.language === nextProps.language
+  && previousProps.message === nextProps.message
+  && previousProps.onApprovalDecision === nextProps.onApprovalDecision
+));
 
 function ComposerAttachmentChip({ attachment, onRemove, removeLabel }) {
   return (
@@ -6978,6 +7565,58 @@ function isMergeableToolEvent(message) {
   return message.kind === 'command' && getCommandEventSource(message) === 'tool';
 }
 
+const RENDERABLE_MESSAGE_CACHE_MAX_SIZE = 120;
+const renderableMessageCache = new Map();
+
+function getRenderableMessages(session, language, sessionRunning = false, pendingApprovals = []) {
+  if (!session) {
+    return [];
+  }
+
+  const cacheKey = createRenderableMessageCacheKey(session, language, sessionRunning, pendingApprovals);
+  const cachedMessages = renderableMessageCache.get(cacheKey);
+  if (cachedMessages) {
+    renderableMessageCache.delete(cacheKey);
+    renderableMessageCache.set(cacheKey, cachedMessages);
+    return cachedMessages;
+  }
+
+  const mergedMessages = mergeRenderableMessages(
+    session.messages || [],
+    language,
+    sessionRunning,
+    pendingApprovals,
+  );
+
+  if (renderableMessageCache.size >= RENDERABLE_MESSAGE_CACHE_MAX_SIZE) {
+    const oldestKey = renderableMessageCache.keys().next().value;
+    if (oldestKey) {
+      renderableMessageCache.delete(oldestKey);
+    }
+  }
+
+  renderableMessageCache.set(cacheKey, mergedMessages);
+  return mergedMessages;
+}
+
+function createRenderableMessageCacheKey(session, language, sessionRunning = false, pendingApprovals = []) {
+  const sessionKey = createSessionCacheKey(session?.workspaceId, session?.id);
+  const approvalKey = Array.isArray(pendingApprovals)
+    ? pendingApprovals
+      .map((approval) => `${approval?.requestId || ''}:${approval?.createdAt || ''}`)
+      .join('|')
+    : '';
+
+  return [
+    sessionKey,
+    session?.status || '',
+    session?.updatedAt || '',
+    sessionRunning ? 'running' : 'idle',
+    language,
+    approvalKey,
+  ].join('\u0000');
+}
+
 function mergeRenderableMessages(messages, language, sessionRunning = false, pendingApprovals = []) {
   const normalizedMessages = normalizeRenderableToolMessages(messages, sessionRunning);
   const merged = [];
@@ -7154,19 +7793,24 @@ function markTrailingAssistantMessageAsPending(messages) {
     return;
   }
 
-  const trailingMessage = messages[messages.length - 1];
+  const trailingMessageIndex = messages.length - 1;
+  const trailingMessage = messages[trailingMessageIndex];
   if (trailingMessage?.role !== 'assistant') {
     return;
   }
 
-  const hasToolActivity = assistantMessageHasToolActivity(trailingMessage);
-  if (assistantMessageHasText(trailingMessage) && !hasToolActivity) {
+  if (assistantMessageHasPendingApproval(trailingMessage)) {
     return;
   }
 
-  if (hasToolActivity) {
-    trailingMessage.pendingThinking = true;
+  if (trailingMessage.pendingThinking) {
+    return;
   }
+
+  messages[trailingMessageIndex] = {
+    ...trailingMessage,
+    pendingThinking: true,
+  };
 }
 
 function mergeLegacyToolEvents(messages, language) {
@@ -7946,6 +8590,14 @@ function getApprovalAllowAlwaysOption(approval, copy) {
       decision: 'allow_always',
       description: copy.approvalAllowAlwaysWorkspaceWriteSummary,
       label: copy.approvalAllowAlwaysWorkspaceWrite,
+    };
+  }
+
+  if (approval?.category === 'edit') {
+    return {
+      decision: 'allow_always',
+      description: copy.approvalAllowAlwaysEditSummary,
+      label: copy.approvalAllowAlwaysEdit,
     };
   }
 
@@ -9774,14 +10426,12 @@ function buildPaneViewModel({
     || sessionMeta?.status === 'running'
   );
   const isRunning = Boolean(pendingTurn || sessionRunning);
-  const renderableMessages = session
-    ? mergeRenderableMessages(
-      session.messages || [],
-      language,
-      sessionRunning,
-      pendingApprovals,
-    )
-    : [];
+  const renderableMessages = getRenderableMessages(
+    session,
+    language,
+    sessionRunning,
+    pendingApprovals,
+  );
   const displayMessages = pendingTurn
     ? appendPendingTurnMessage(renderableMessages, pendingTurn)
     : renderableMessages;
@@ -9797,6 +10447,18 @@ function buildPaneViewModel({
       status: 'running',
     }
     : session;
+  const shouldShowRunIndicator = shouldRenderRunIndicator(
+    sessionForIndicator,
+    renderableMessages,
+    Boolean(isPaneSending || pendingTurn),
+    pendingTurn,
+  );
+  const isOutputInProgress = isPaneOutputInProgress(
+    sessionForIndicator,
+    renderableMessages,
+    Boolean(isPaneSending || pendingTurn),
+    pendingTurn,
+  );
 
   return {
     id: pane.id,
@@ -9804,17 +10466,13 @@ function buildPaneViewModel({
     isFocused: pane.id === focusedPaneId,
     isLoading: Boolean(pane.sessionId && !session && sessionMeta),
     isOnlyPane: paneCount <= 1,
+    isOutputInProgress,
     isSending: Boolean(isPaneSending || pendingTurn),
     displayMessages,
     renderableMessages,
     session,
     sessionMeta,
-    shouldShowRunIndicator: shouldRenderRunIndicator(
-      sessionForIndicator,
-      renderableMessages,
-      Boolean(isPaneSending || pendingTurn),
-      pendingTurn,
-    ),
+    shouldShowRunIndicator,
     title: sessionMeta?.title || session?.title || copy.paneEmptyTitle,
     workspace,
     workspaceName: workspace?.name || '',
@@ -9949,6 +10607,23 @@ function getInitialPaneSizeLimitIgnored() {
     return window.localStorage.getItem(PANE_SIZE_LIMIT_IGNORED_STORAGE_KEY) === 'true';
   } catch {
     return false;
+  }
+}
+
+function getInitialPaneFinishFlashEnabled() {
+  if (typeof window === 'undefined') {
+    return true;
+  }
+
+  try {
+    const storedValue = window.localStorage.getItem(PANE_FINISH_FLASH_ENABLED_STORAGE_KEY);
+    if (storedValue === null) {
+      return true;
+    }
+
+    return storedValue === 'true';
+  } catch {
+    return true;
   }
 }
 
@@ -10378,19 +11053,69 @@ function shouldRenderRunIndicator(session, renderableMessages, isSending, pendin
     return false;
   }
 
-  if (assistantMessageHasRunningToolActivity(trailingMessage)) {
-    return false;
-  }
-
   if (trailingMessage.pendingThinking) {
     return false;
   }
 
-  if (trailingMessage.streaming && !assistantMessageHasText(trailingMessage)) {
+  if (assistantMessageHasRunningToolActivity(trailingMessage)) {
     return false;
   }
 
-  return true;
+  return !assistantMessageHasText(trailingMessage);
+}
+
+function isPaneOutputInProgress(session, renderableMessages, isSending, pendingTurn = null) {
+  if (!session) {
+    return false;
+  }
+
+  if (shouldRenderRunIndicator(session, renderableMessages, isSending, pendingTurn)) {
+    return true;
+  }
+
+  if (!isSending && session.status !== 'running') {
+    return false;
+  }
+
+  const messages = Array.isArray(renderableMessages) && renderableMessages.length > 0
+    ? renderableMessages
+    : session.messages;
+  const pendingAwareMessages = pendingTurn
+    ? appendPendingTurnMessage(messages, pendingTurn)
+    : messages;
+  const lastUserIndex = findLastOutboundTurnIndex(pendingAwareMessages);
+  if (lastUserIndex === -1) {
+    return isSending;
+  }
+
+  const trailingMessages = pendingAwareMessages.slice(lastUserIndex + 1);
+  const trailingMessage = trailingMessages[trailingMessages.length - 1] || null;
+
+  if (!trailingMessage) {
+    return true;
+  }
+
+  if (trailingMessage.role !== 'assistant') {
+    return true;
+  }
+
+  if (assistantMessageHasPendingApproval(trailingMessage)) {
+    return false;
+  }
+
+  if (assistantMessageHasRunningToolActivity(trailingMessage)) {
+    return true;
+  }
+
+  if (trailingMessage.pendingThinking) {
+    return true;
+  }
+
+  if (trailingMessage.streaming && !assistantMessageHasText(trailingMessage)) {
+    return true;
+  }
+
+  return false;
 }
 
 function findLastOutboundTurnIndex(messages) {

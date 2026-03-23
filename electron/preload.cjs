@@ -1,17 +1,34 @@
+const { pathToFileURL } = require('url');
+
 const { contextBridge, ipcRenderer } = require('electron');
+
+const embeddedPanePreloadUrl = pathToFileURL(__filename).toString();
 
 contextBridge.exposeInMainWorld('claudeDesktop', {
   addWorkspace: (workspacePath) => ipcRenderer.invoke('desktop:add-workspace', workspacePath),
   archiveSession: (payload) => ipcRenderer.invoke('desktop:archive-session', payload),
   createSession: (payload) => ipcRenderer.invoke('desktop:create-session', payload),
+  embeddedPanePreloadUrl,
   getAppState: () => ipcRenderer.invoke('desktop:get-app-state'),
   getGitDiffViewData: (payload) => ipcRenderer.invoke('desktop:get-git-diff-view-data', payload),
   getSession: (payload) => ipcRenderer.invoke('desktop:get-session', payload),
   installSkill: (payload) => ipcRenderer.invoke('desktop:install-skill', payload),
   listSkills: (payload) => ipcRenderer.invoke('desktop:list-skills', payload),
+  notifyHost: (type, payload) => {
+    if (typeof ipcRenderer.sendToHost !== 'function') {
+      return false;
+    }
+
+    ipcRenderer.sendToHost('claude:host-event', {
+      payload,
+      type,
+    });
+    return true;
+  },
   openLink: (href) => ipcRenderer.invoke('desktop:open-link', href),
   openGitDiffFileInCodeEditor: (payload) => ipcRenderer.invoke('desktop:open-git-diff-file-in-code-editor', payload),
   openGitDiffWindow: (payload) => ipcRenderer.invoke('desktop:open-git-diff-window', payload),
+  openSettingsWindow: () => ipcRenderer.invoke('desktop:open-settings-window'),
   openWorkspaceInCodeEditor: (workspaceId) => ipcRenderer.invoke('desktop:open-workspace-in-code-editor', workspaceId),
   openWorkspaceInFinder: (workspaceId) => ipcRenderer.invoke('desktop:open-workspace-in-finder', workspaceId),
   onStateChange: (callback) => {
@@ -37,6 +54,7 @@ contextBridge.exposeInMainWorld('claudeDesktop', {
   respondToApproval: (payload) => ipcRenderer.invoke('desktop:respond-to-approval', payload),
   setCodeEditor: (payload) => ipcRenderer.invoke('desktop:set-code-editor', payload),
   setExpandedWorkspaces: (workspaceIds) => ipcRenderer.invoke('desktop:set-expanded-workspaces', workspaceIds),
+  setNetworkProxy: (payload) => ipcRenderer.invoke('desktop:set-network-proxy', payload),
   setPaneLayout: (paneLayout) => ipcRenderer.invoke('desktop:set-pane-layout', paneLayout),
   selectSession: (payload) => ipcRenderer.invoke('desktop:select-session', payload),
   selectWorkspace: (workspaceId) => ipcRenderer.invoke('desktop:select-workspace', workspaceId),
@@ -44,6 +62,7 @@ contextBridge.exposeInMainWorld('claudeDesktop', {
   setProviderEnabled: (payload) => ipcRenderer.invoke('desktop:set-provider-enabled', payload),
   setProviderSystemPrompt: (payload) => ipcRenderer.invoke('desktop:set-provider-system-prompt', payload),
   stopRun: (payload) => ipcRenderer.invoke('desktop:stop-run', payload),
+  testNetworkProxy: (payload) => ipcRenderer.invoke('desktop:test-network-proxy', payload),
   updateSessionProvider: (payload) => ipcRenderer.invoke('desktop:update-session-provider', payload),
   runMcpCommand: (payload) => ipcRenderer.invoke('desktop:run-mcp-command', payload),
   updateSessionModel: (payload) => ipcRenderer.invoke('desktop:update-session-model', payload),

@@ -1,11 +1,20 @@
 const { randomUUID } = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
+const tls = require('tls');
 const { fileURLToPath } = require('url');
 
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  shell,
+  webContents: electronWebContents,
+} = require('electron');
 
 const CONFIG_FILE_NAME = 'claude-desktop-config.json';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
@@ -13,15 +22,17 @@ const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const DEFAULT_PROVIDER = 'claude';
 const EMPTY_ASSISTANT_TEXT = '（本轮没有收到可展示的文本输出）';
 const EMPTY_TREE_HASH = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const SAVE_DEBOUNCE_MS = 160;
 const CLAUDE_CHECK_TTL_MS = 30_000;
 const CODE_EDITOR_CHECK_TTL_MS = 30_000;
+const DEFAULT_NETWORK_PROXY_TEST_TARGET = 'google.com';
+const NETWORK_PROXY_TEST_TIMEOUT_MS = 8_000;
 const SKILL_LIST_CACHE_TTL_MS = 30_000;
 const STDERR_BUFFER_LIMIT = 6000;
 const SERIALIZED_WORKSPACE_CACHE_MAX_SIZE = 120;
 const WORKSPACE_GIT_INFO_TTL_MS = 10_000;
-const STATE_EMIT_THROTTLE_MS = 75;
+const STATE_EMIT_THROTTLE_MS = 120;
 const PASTED_ATTACHMENT_DIR_NAME = 'pasted-attachments';
 const SESSION_PERMISSION_MODES = new Set([
   'acceptEdits',
@@ -46,6 +57,8 @@ const CODEX_SANDBOX_MODES = new Set([
 ]);
 const SESSION_PROVIDER_KEYS = ['claude', 'codex'];
 const SESSION_PROVIDERS = new Set(SESSION_PROVIDER_KEYS);
+const PROXY_ENV_KEYS = ['ALL_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'];
+const SOCKET_BUFFER_KEY = Symbol('socketBuffer');
 const DEFAULT_CODE_EDITOR_KEY = 'vscode';
 const MAC_APPLICATION_SCAN_DEPTH = 3;
 let codexConfigDefaultsCache = {
@@ -280,6 +293,7 @@ class ClaudeDesktopRuntime {
 
     this.store = this.loadStore();
     this.gitDiffWindows = new Map();
+    this.settingsWindow = null;
     this.windowRuns = new Map();
     this.refreshProviderInfo(true);
     this.refreshCodeEditors(true);
@@ -290,8 +304,16 @@ class ClaudeDesktopRuntime {
       return;
     }
 
+    const registerStateHandler = (channel, handler) => {
+      ipcMain.handle(channel, async (event, payload) => {
+        const result = await handler(event, payload);
+        this.emitState(event.sender);
+        return result;
+      });
+    };
+
     ipcMain.handle('desktop:get-app-state', () => this.getAppState());
-    ipcMain.handle('desktop:refresh-provider-status', () => this.getAppState({ forceProviderRefresh: true }));
+    registerStateHandler('desktop:refresh-provider-status', () => this.getAppState({ forceProviderRefresh: true }));
     ipcMain.handle('desktop:get-git-diff-view-data', (_event, payload) => this.getGitDiffViewData(payload?.workspaceId));
     ipcMain.handle('desktop:open-git-diff-file-in-code-editor', (_event, payload) => (
       this.openGitDiffFileInCodeEditor(payload?.workspaceId, payload?.path)
@@ -299,64 +321,71 @@ class ClaudeDesktopRuntime {
     ipcMain.handle('desktop:get-session', (_event, payload) => this.getSession(payload?.workspaceId, payload?.sessionId));
     ipcMain.handle('desktop:open-link', (_event, href) => this.openLink(href));
     ipcMain.handle('desktop:open-git-diff-window', (event, payload) => {
-      const browserWindow = BrowserWindow.fromWebContents(event.sender);
+      const browserWindow = this.resolveBrowserWindowForSender(event.sender);
       return this.openGitDiffWindow(browserWindow, payload?.workspaceId);
     });
+    ipcMain.handle('desktop:open-settings-window', () => this.openSettingsWindow());
     ipcMain.handle('desktop:open-workspace-in-code-editor', (_event, workspaceId) => this.openWorkspaceInCodeEditor(workspaceId));
     ipcMain.handle('desktop:open-workspace-in-finder', (_event, workspaceId) => this.openWorkspaceInFinder(workspaceId));
     ipcMain.handle('desktop:prepare-pasted-attachments', (_event, payload) => this.preparePastedAttachments(payload));
     ipcMain.handle('desktop:pick-attachments', (event) => {
-      const browserWindow = BrowserWindow.fromWebContents(event.sender);
+      const browserWindow = this.resolveBrowserWindowForSender(event.sender);
       return this.pickAttachments(browserWindow);
     });
     ipcMain.handle('desktop:pick-workspace', (event) => {
-      const browserWindow = BrowserWindow.fromWebContents(event.sender);
+      const browserWindow = this.resolveBrowserWindowForSender(event.sender);
       return this.pickWorkspaceDirectory(browserWindow);
     });
-    ipcMain.handle('desktop:add-workspace', (_event, workspacePath) => this.addWorkspace(workspacePath));
-    ipcMain.handle('desktop:archive-session', (_event, payload) => this.archiveSession(payload?.workspaceId, payload?.sessionId));
-    ipcMain.handle('desktop:create-session', (_event, payload) => (
+    registerStateHandler('desktop:add-workspace', (_event, workspacePath) => this.addWorkspace(workspacePath));
+    registerStateHandler('desktop:archive-session', (_event, payload) => this.archiveSession(payload?.workspaceId, payload?.sessionId));
+    registerStateHandler('desktop:create-session', (_event, payload) => (
       this.createSession(
         typeof payload === 'string' ? payload : payload?.workspaceId,
         typeof payload === 'string' ? '' : payload?.preferredProvider,
       )
     ));
-    ipcMain.handle('desktop:install-skill', (_event, payload) => (
+    registerStateHandler('desktop:install-skill', (_event, payload) => (
       this.installSkill(payload?.workspaceId, payload?.sessionId, payload?.args)
     ));
-    ipcMain.handle('desktop:list-skills', (_event, payload) => (
+    registerStateHandler('desktop:list-skills', (_event, payload) => (
       this.listSkills(payload?.workspaceId, payload?.sessionId)
     ));
-    ipcMain.handle('desktop:remove-workspace', (_event, workspaceId) => this.removeWorkspace(workspaceId));
-    ipcMain.handle('desktop:run-mcp-command', (_event, payload) => (
+    registerStateHandler('desktop:remove-workspace', (_event, workspaceId) => this.removeWorkspace(workspaceId));
+    registerStateHandler('desktop:run-mcp-command', (_event, payload) => (
       this.runMcpCommand(payload?.workspaceId, payload?.sessionId, payload?.args)
     ));
-    ipcMain.handle('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId));
-    ipcMain.handle('desktop:select-session', (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId));
-    ipcMain.handle('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
-    ipcMain.handle('desktop:set-pane-layout', (_event, paneLayout) => this.setPaneLayout(paneLayout));
+    registerStateHandler('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId));
+    registerStateHandler('desktop:select-session', (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId));
+    registerStateHandler('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
+    registerStateHandler('desktop:set-pane-layout', (_event, paneLayout) => this.setPaneLayout(paneLayout));
     ipcMain.handle('desktop:respond-to-approval', (event, payload) => this.respondToApproval(event.sender, payload));
     ipcMain.handle('desktop:send-message', (event, payload) => this.sendMessage(event.sender, payload));
     ipcMain.handle('desktop:stop-run', (event, payload) => this.stopRun(event.sender, payload));
-    ipcMain.handle('desktop:update-session-provider', (_event, payload) => (
+    registerStateHandler('desktop:update-session-provider', (_event, payload) => (
       this.updateSessionProvider(payload?.workspaceId, payload?.sessionId, payload?.provider)
     ));
-    ipcMain.handle('desktop:set-code-editor', (_event, payload) => (
+    registerStateHandler('desktop:set-code-editor', (_event, payload) => (
       this.setCodeEditor(payload?.codeEditor)
     ));
-    ipcMain.handle('desktop:set-provider-enabled', (_event, payload) => (
+    registerStateHandler('desktop:set-network-proxy', (_event, payload) => (
+      this.setNetworkProxy(payload?.networkProxy)
+    ));
+    ipcMain.handle('desktop:test-network-proxy', (_event, payload) => (
+      this.testNetworkProxy(payload?.networkProxy, payload?.testTarget)
+    ));
+    registerStateHandler('desktop:set-provider-enabled', (_event, payload) => (
       this.setProviderEnabled(payload?.provider, payload?.enabled)
     ));
-    ipcMain.handle('desktop:set-provider-system-prompt', (_event, payload) => (
+    registerStateHandler('desktop:set-provider-system-prompt', (_event, payload) => (
       this.setProviderSystemPrompt(payload?.provider, payload?.systemPrompt)
     ));
-    ipcMain.handle('desktop:update-session-model', (_event, payload) => (
+    registerStateHandler('desktop:update-session-model', (_event, payload) => (
       this.updateSessionModel(payload?.workspaceId, payload?.sessionId, payload?.model)
     ));
-    ipcMain.handle('desktop:update-session-reasoning-effort', (_event, payload) => (
+    registerStateHandler('desktop:update-session-reasoning-effort', (_event, payload) => (
       this.updateSessionReasoningEffort(payload?.workspaceId, payload?.sessionId, payload?.reasoningEffort)
     ));
-    ipcMain.handle('desktop:update-session-permission-mode', (_event, payload) => (
+    registerStateHandler('desktop:update-session-permission-mode', (_event, payload) => (
       this.updateSessionPermissionMode(payload?.workspaceId, payload?.sessionId, payload?.permissionMode)
     ));
 
@@ -412,6 +441,7 @@ class ClaudeDesktopRuntime {
       codeEditors,
       defaultProvider: this.getDefaultProvider(),
       expandedWorkspaceIds: this.store.expandedWorkspaceIds,
+      networkProxy: normalizeNetworkProxySettings(this.store.networkProxy),
       paneLayout: this.store.paneLayout,
       platform: process.platform,
       providers,
@@ -421,9 +451,11 @@ class ClaudeDesktopRuntime {
       workspaces: this.store.workspaces.map((workspace) => (
         serializeWorkspace(workspace, activeRunLookup, true)
       )),
-      activeSession: selectedWorkspace && selectedSession
+      activeSession: options?.includeActiveSession === false
+        ? null
+        : (selectedWorkspace && selectedSession
         ? serializeSession(selectedWorkspace, selectedSession, activeRunLookup)
-        : null,
+        : null),
     };
   }
 
@@ -687,6 +719,58 @@ class ClaudeDesktopRuntime {
     browserWindow.on('closed', () => {
       if (this.gitDiffWindows.get(workspace.id) === browserWindow) {
         this.gitDiffWindows.delete(workspace.id);
+      }
+      this.disposeWindow(contentsId);
+    });
+
+    return { ok: true, reused: false };
+  }
+
+  async openSettingsWindow() {
+    const existingWindow = this.settingsWindow;
+    if (existingWindow && !existingWindow.isDestroyed()) {
+      existingWindow.focus();
+      return { ok: true, reused: true };
+    }
+
+    const browserWindow = new BrowserWindow({
+      width: 1080,
+      height: 820,
+      minWidth: 920,
+      minHeight: 620,
+      title: `${app.getName()} · Settings`,
+      titleBarStyle: 'hiddenInset',
+      backgroundColor: '#f7f1e7',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        preload: path.join(__dirname, 'preload.cjs'),
+        sandbox: false,
+      },
+    });
+
+    const query = new URLSearchParams({
+      view: 'settings',
+    });
+
+    if (process.env.ELECTRON_RENDERER_URL) {
+      await browserWindow.loadURL(`${process.env.ELECTRON_RENDERER_URL}?${query.toString()}`);
+    } else {
+      await browserWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), {
+        query: {
+          view: 'settings',
+        },
+      });
+    }
+
+    browserWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    const contentsId = browserWindow.webContents.id;
+
+    this.settingsWindow = browserWindow;
+
+    browserWindow.on('closed', () => {
+      if (this.settingsWindow === browserWindow) {
+        this.settingsWindow = null;
       }
       this.disposeWindow(contentsId);
     });
@@ -1148,6 +1232,22 @@ class ClaudeDesktopRuntime {
     return this.getAppState();
   }
 
+  setNetworkProxy(networkProxy) {
+    const nextNetworkProxy = normalizeNetworkProxySettings(networkProxy);
+    if (areNetworkProxySettingsEqual(this.store.networkProxy, nextNetworkProxy)) {
+      return this.getAppState();
+    }
+
+    this.store.networkProxy = nextNetworkProxy;
+    this.scheduleSave();
+
+    return this.getAppState({ forceProviderRefresh: true });
+  }
+
+  async testNetworkProxy(networkProxy, testTarget) {
+    return testNetworkProxyConnections(networkProxy, testTarget);
+  }
+
   runMcpCommand(workspaceId, sessionId, rawArgs) {
     const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
     const provider = this.assertProviderEnabled(session.provider);
@@ -1156,7 +1256,7 @@ class ClaudeDesktopRuntime {
       throw new Error('请使用 /mcp list、/mcp get <name>、/mcp add ... 或 /mcp remove <name>。');
     }
 
-    const cliEnv = getCliProcessEnv();
+    const cliEnv = getCliProcessEnv(false, this.store.networkProxy);
     const executablePath = this.getProviderInfo(provider).executablePath || resolveProviderExecutablePath(provider, cliEnv);
     if (!executablePath) {
       throw new Error(`未检测到可用的 ${getProviderLabel(provider)} CLI。`);
@@ -1370,7 +1470,7 @@ class ClaudeDesktopRuntime {
 
     this.touchWorkspace(workspace, now);
     this.scheduleSave();
-    this.emitState(webContents);
+    this.scheduleStateEmit(webContents);
     return { ok: true };
   }
 
@@ -1417,7 +1517,7 @@ class ClaudeDesktopRuntime {
     const runToken = runState.runToken;
 
     const extraAttachmentDirs = collectAttachmentDirectories(workspace.path, attachments);
-    const cliEnv = getCliProcessEnv();
+    const cliEnv = getCliProcessEnv(false, this.store.networkProxy);
     const executablePath = providerInfo.executablePath || resolveProviderExecutablePath(provider, cliEnv);
     if (!executablePath) {
       throw new Error(`未检测到可用的 ${providerLabel} CLI。`);
@@ -1480,7 +1580,7 @@ class ClaudeDesktopRuntime {
     runState.targetCodexPlanModeActive = codexTurn.targetPlanModeActive;
     this.touchWorkspace(workspace, now);
     this.scheduleSave();
-    this.emitState(webContents);
+    this.scheduleStateEmit(webContents);
 
     let buffer = '';
 
@@ -2534,22 +2634,60 @@ class ClaudeDesktopRuntime {
 
     const timer = setTimeout(() => {
       this.pendingStateEmitTimers.delete(contentsId);
-      this.emitState(webContents);
+      this.emitState(webContents, { lightweight: true });
     }, STATE_EMIT_THROTTLE_MS);
 
     this.pendingStateEmitTimers.set(contentsId, timer);
   }
 
-  emitState(webContents) {
-    if (!webContents || webContents.isDestroyed()) {
-      return;
+  resolveBrowserWindowForSender(sender) {
+    if (!sender || sender.isDestroyed()) {
+      return null;
     }
 
-    this.clearPendingStateEmit(webContents.id);
-    webContents.send('claude:event', {
-      state: this.getAppState(),
-      type: 'state',
+    const directWindow = BrowserWindow.fromWebContents(sender);
+    if (directWindow) {
+      return directWindow;
+    }
+
+    const hostContents = sender.hostWebContents;
+    if (!hostContents || hostContents.isDestroyed()) {
+      return null;
+    }
+
+    return BrowserWindow.fromWebContents(hostContents);
+  }
+
+  getStateRecipients() {
+    return electronWebContents.getAllWebContents().filter((contents) => {
+      if (!contents || contents.isDestroyed()) {
+        return false;
+      }
+
+      const type = typeof contents.getType === 'function' ? contents.getType() : '';
+      return type === 'window' || type === 'webview';
     });
+  }
+
+  emitState(webContents, options = {}) {
+    if (webContents && !webContents.isDestroyed()) {
+      this.clearPendingStateEmit(webContents.id);
+    }
+
+    const payload = {
+      state: this.getAppState({
+        includeActiveSession: options?.lightweight !== true,
+      }),
+      type: 'state',
+    };
+
+    for (const contents of this.getStateRecipients()) {
+      try {
+        contents.send('claude:event', payload);
+      } catch {
+        // Ignore transient renderer teardown while broadcasting global state.
+      }
+    }
   }
 
   getSelectedWorkspace() {
@@ -2597,7 +2735,7 @@ class ClaudeDesktopRuntime {
   }
 
   refreshProviderInfo(force = false) {
-    const cliEnv = getCliProcessEnv(force);
+    const cliEnv = getCliProcessEnv(force, this.store.networkProxy);
     this.claudeInfo = inspectProvider('claude', cliEnv, force, this.claudeInfo);
     this.codexInfo = inspectProvider('codex', cliEnv, force, this.codexInfo, {
       refreshStatusOnly: !force && this.hasActiveProviderRun('codex'),
@@ -2685,6 +2823,7 @@ class ClaudeDesktopRuntime {
       codeEditor: '',
       enabledProviders: SESSION_PROVIDER_KEYS.slice(),
       expandedWorkspaceIds: [],
+      networkProxy: normalizeNetworkProxySettings(),
       paneLayout: null,
       providerSystemPrompts: normalizeProviderSystemPrompts(),
       schemaVersion: SCHEMA_VERSION,
@@ -2717,6 +2856,7 @@ class ClaudeDesktopRuntime {
           codeEditor: '',
           enabledProviders: SESSION_PROVIDER_KEYS.slice(),
           expandedWorkspaceIds: [migratedWorkspace.id],
+          networkProxy: normalizeNetworkProxySettings(),
           paneLayout: null,
           providerSystemPrompts: normalizeProviderSystemPrompts(),
           schemaVersion: SCHEMA_VERSION,
@@ -2754,6 +2894,7 @@ class ClaudeDesktopRuntime {
         codeEditor: normalizeCodeEditorKey(parsed.codeEditor),
         enabledProviders: normalizeEnabledProviders(parsed.enabledProviders),
         expandedWorkspaceIds,
+        networkProxy: normalizeNetworkProxySettings(parsed.networkProxy),
         paneLayout: normalizePaneLayoutState(parsed.paneLayout),
         providerSystemPrompts: normalizeProviderSystemPrompts(parsed.providerSystemPrompts),
         schemaVersion: SCHEMA_VERSION,
@@ -2782,6 +2923,7 @@ class ClaudeDesktopRuntime {
       codeEditor: this.getSelectedCodeEditor(),
       enabledProviders: this.getEnabledProviders(),
       expandedWorkspaceIds: this.store.expandedWorkspaceIds,
+      networkProxy: normalizeNetworkProxySettings(this.store.networkProxy),
       paneLayout: normalizePaneLayoutState(this.store.paneLayout),
       providerSystemPrompts: normalizeProviderSystemPrompts(this.store.providerSystemPrompts),
       schemaVersion: SCHEMA_VERSION,
@@ -3460,6 +3602,552 @@ function normalizeProviderSystemPrompts(value) {
     prompts[provider] = normalizeProviderSystemPrompt(source[provider]);
     return prompts;
   }, {});
+}
+
+function normalizeNetworkProxySettings(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    allProxy: normalizeNetworkProxyValue(source.allProxy ?? source.ALL_PROXY),
+    enabled: source.enabled === true,
+    httpProxy: normalizeNetworkProxyValue(source.httpProxy ?? source.HTTP_PROXY),
+    httpsProxy: normalizeNetworkProxyValue(source.httpsProxy ?? source.HTTPS_PROXY),
+    noProxy: normalizeNetworkProxyValue(source.noProxy ?? source.NO_PROXY),
+  };
+}
+
+function normalizeNetworkProxyValue(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function areNetworkProxySettingsEqual(left, right) {
+  const normalizedLeft = normalizeNetworkProxySettings(left);
+  const normalizedRight = normalizeNetworkProxySettings(right);
+
+  return normalizedLeft.enabled === normalizedRight.enabled
+    && normalizedLeft.httpProxy === normalizedRight.httpProxy
+    && normalizedLeft.httpsProxy === normalizedRight.httpsProxy
+    && normalizedLeft.allProxy === normalizedRight.allProxy
+    && normalizedLeft.noProxy === normalizedRight.noProxy;
+}
+
+async function testNetworkProxyConnections(networkProxy, testTarget) {
+  const proxyTargets = buildNetworkProxyTestTargets(networkProxy);
+  if (proxyTargets.length === 0) {
+    throw new Error('请先填写至少一个代理地址，再测试连接。');
+  }
+
+  const normalizedTarget = parseNetworkProxyTestTarget(testTarget);
+
+  const results = [];
+  for (const proxyTarget of proxyTargets) {
+    const startedAt = Date.now();
+
+    try {
+      await connectThroughProxy(
+        proxyTarget.proxyUrl,
+        normalizedTarget.host,
+        normalizedTarget.port,
+        NETWORK_PROXY_TEST_TIMEOUT_MS,
+      );
+
+      results.push({
+        durationMs: Date.now() - startedAt,
+        labels: proxyTarget.labels,
+        message: '已成功建立代理隧道。',
+        ok: true,
+        proxyUrl: proxyTarget.proxyUrl,
+      });
+    } catch (error) {
+      results.push({
+        durationMs: Date.now() - startedAt,
+        labels: proxyTarget.labels,
+        message: normalizeErrorMessage(error),
+        ok: false,
+        proxyUrl: proxyTarget.proxyUrl,
+      });
+    }
+  }
+
+  return {
+    ok: results.every((item) => item.ok),
+    results,
+    targetHost: normalizedTarget.host,
+    targetPort: normalizedTarget.port,
+    targetDisplay: normalizedTarget.display,
+    timeoutMs: NETWORK_PROXY_TEST_TIMEOUT_MS,
+  };
+}
+
+function buildNetworkProxyTestTargets(networkProxy) {
+  const normalizedProxy = normalizeNetworkProxySettings(networkProxy);
+  const groupedTargets = new Map();
+  const candidates = [
+    ['HTTPS_PROXY', normalizedProxy.httpsProxy],
+    ['ALL_PROXY', normalizedProxy.allProxy],
+    ['HTTP_PROXY', normalizedProxy.httpProxy],
+  ];
+
+  for (const [label, proxyUrl] of candidates) {
+    const normalizedUrl = normalizeNetworkProxyValue(proxyUrl);
+    if (!normalizedUrl) {
+      continue;
+    }
+
+    const existingTarget = groupedTargets.get(normalizedUrl);
+    if (existingTarget) {
+      existingTarget.labels.push(label);
+      continue;
+    }
+
+    groupedTargets.set(normalizedUrl, {
+      labels: [label],
+      proxyUrl: normalizedUrl,
+    });
+  }
+
+  return Array.from(groupedTargets.values());
+}
+
+async function connectThroughProxy(proxyUrl, targetHost, targetPort, timeoutMs) {
+  const proxyEndpoint = parseNetworkProxyEndpoint(proxyUrl);
+  let socket = null;
+
+  try {
+    if (proxyEndpoint.protocol === 'http:') {
+      socket = await connectTcpSocket(proxyEndpoint.host, proxyEndpoint.port, timeoutMs);
+      await performHttpProxyConnect(socket, proxyEndpoint, targetHost, targetPort, timeoutMs);
+      return;
+    }
+
+    if (proxyEndpoint.protocol === 'https:') {
+      const rawSocket = await connectTcpSocket(proxyEndpoint.host, proxyEndpoint.port, timeoutMs);
+      socket = await connectTlsSocket(rawSocket, proxyEndpoint.host, timeoutMs);
+      await performHttpProxyConnect(socket, proxyEndpoint, targetHost, targetPort, timeoutMs);
+      return;
+    }
+
+    if (['socks:', 'socks5:', 'socks5h:'].includes(proxyEndpoint.protocol)) {
+      socket = await connectTcpSocket(proxyEndpoint.host, proxyEndpoint.port, timeoutMs);
+      await performSocks5ProxyConnect(socket, proxyEndpoint, targetHost, targetPort, timeoutMs);
+      return;
+    }
+
+    if (['socks4:', 'socks4a:'].includes(proxyEndpoint.protocol)) {
+      socket = await connectTcpSocket(proxyEndpoint.host, proxyEndpoint.port, timeoutMs);
+      await performSocks4ProxyConnect(socket, proxyEndpoint, targetHost, targetPort, timeoutMs);
+      return;
+    }
+
+    throw new Error(`暂不支持测试 ${proxyEndpoint.protocol.replace(/:$/, '')} 代理。`);
+  } finally {
+    socket?.destroy();
+  }
+}
+
+function parseNetworkProxyEndpoint(proxyUrl) {
+  const rawValue = normalizeNetworkProxyValue(proxyUrl);
+  if (!rawValue) {
+    throw new Error('代理地址为空。');
+  }
+
+  const urlValue = rawValue.includes('://') ? rawValue : `http://${rawValue}`;
+  let parsedUrl = null;
+
+  try {
+    parsedUrl = new URL(urlValue);
+  } catch {
+    throw new Error('代理地址格式无效。');
+  }
+
+  const protocol = typeof parsedUrl.protocol === 'string' ? parsedUrl.protocol.toLowerCase() : '';
+  const host = parsedUrl.hostname || '';
+  if (!host) {
+    throw new Error('代理地址缺少主机名。');
+  }
+
+  const port = parsedUrl.port
+    ? Number(parsedUrl.port)
+    : getDefaultNetworkProxyPort(protocol);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error('代理地址端口无效。');
+  }
+
+  return {
+    host,
+    password: decodeURIComponent(parsedUrl.password || ''),
+    port,
+    protocol,
+    proxyUrl: rawValue,
+    username: decodeURIComponent(parsedUrl.username || ''),
+  };
+}
+
+function getDefaultNetworkProxyPort(protocol) {
+  if (protocol === 'https:') {
+    return 443;
+  }
+
+  if (['socks:', 'socks4:', 'socks4a:', 'socks5:', 'socks5h:'].includes(protocol)) {
+    return 1080;
+  }
+
+  return 80;
+}
+
+function parseNetworkProxyTestTarget(value) {
+  const rawValue = typeof value === 'string' && value.trim()
+    ? value.trim()
+    : DEFAULT_NETWORK_PROXY_TEST_TARGET;
+  const urlValue = rawValue.includes('://')
+    ? rawValue
+    : `https://${rawValue}`;
+  let parsedUrl = null;
+
+  try {
+    parsedUrl = new URL(urlValue);
+  } catch {
+    throw new Error('测试目标格式无效。');
+  }
+
+  const protocol = typeof parsedUrl.protocol === 'string' ? parsedUrl.protocol.toLowerCase() : 'https:';
+  const host = parsedUrl.hostname || '';
+  if (!host) {
+    throw new Error('测试目标缺少主机名。');
+  }
+
+  const port = parsedUrl.port
+    ? Number(parsedUrl.port)
+    : protocol === 'http:' ? 80 : 443;
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error('测试目标端口无效。');
+  }
+
+  return {
+    display: `${host}:${port}`,
+    host,
+    port,
+  };
+}
+
+function normalizeErrorMessage(error) {
+  if (error && typeof error.message === 'string' && error.message.trim()) {
+    return error.message.trim();
+  }
+
+  return '连接测试失败。';
+}
+
+function connectTcpSocket(host, port, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host, port });
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(new Error(`连接代理超时（>${timeoutMs}ms）。`));
+      socket.destroy();
+    }, timeoutMs);
+
+    const finish = (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener('connect', handleConnect);
+      socket.removeListener('error', handleError);
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(socket);
+    };
+
+    const handleConnect = () => finish(null);
+    const handleError = (error) => finish(error);
+
+    socket.once('connect', handleConnect);
+    socket.once('error', handleError);
+  });
+}
+
+function connectTlsSocket(socket, servername, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const tlsSocket = tls.connect({
+      servername,
+      socket,
+    });
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(new Error(`连接 HTTPS 代理超时（>${timeoutMs}ms）。`));
+      tlsSocket.destroy();
+    }, timeoutMs);
+
+    const finish = (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+      tlsSocket.removeListener('secureConnect', handleSecureConnect);
+      tlsSocket.removeListener('error', handleError);
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(tlsSocket);
+    };
+
+    const handleSecureConnect = () => finish(null);
+    const handleError = (error) => finish(error);
+
+    tlsSocket.once('secureConnect', handleSecureConnect);
+    tlsSocket.once('error', handleError);
+  });
+}
+
+async function performHttpProxyConnect(socket, proxyEndpoint, targetHost, targetPort, timeoutMs) {
+  const authorizationHeader = buildHttpProxyAuthorizationHeader(proxyEndpoint);
+  socket.write(
+    `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n`
+    + `Host: ${targetHost}:${targetPort}\r\n`
+    + 'Proxy-Connection: Keep-Alive\r\n'
+    + authorizationHeader
+    + '\r\n',
+  );
+
+  const responseBuffer = await readSocketUntil(socket, (buffer) => {
+    const headerEndIndex = buffer.indexOf('\r\n\r\n');
+    return headerEndIndex >= 0 ? headerEndIndex + 4 : 0;
+  }, timeoutMs);
+  const responseText = responseBuffer.toString('utf8');
+  const statusLine = responseText.split('\r\n')[0] || '';
+  const statusMatch = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})/i);
+
+  if (!statusMatch) {
+    throw new Error('HTTP 代理返回了无法识别的响应。');
+  }
+
+  const statusCode = Number(statusMatch[1]);
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error(`HTTP 代理 CONNECT 失败：${statusLine}`);
+  }
+}
+
+function buildHttpProxyAuthorizationHeader(proxyEndpoint) {
+  if (!proxyEndpoint.username && !proxyEndpoint.password) {
+    return '';
+  }
+
+  const credentials = Buffer.from(
+    `${proxyEndpoint.username || ''}:${proxyEndpoint.password || ''}`,
+    'utf8',
+  ).toString('base64');
+
+  return `Proxy-Authorization: Basic ${credentials}\r\n`;
+}
+
+async function performSocks5ProxyConnect(socket, proxyEndpoint, targetHost, targetPort, timeoutMs) {
+  const methods = proxyEndpoint.username || proxyEndpoint.password
+    ? [0x00, 0x02]
+    : [0x00];
+
+  socket.write(Buffer.from([0x05, methods.length, ...methods]));
+  const negotiationResponse = await readSocketBytes(socket, 2, timeoutMs);
+  if (negotiationResponse[0] !== 0x05) {
+    throw new Error('SOCKS5 代理响应版本不正确。');
+  }
+
+  if (negotiationResponse[1] === 0xFF) {
+    throw new Error('SOCKS5 代理不接受当前认证方式。');
+  }
+
+  if (negotiationResponse[1] === 0x02) {
+    const username = Buffer.from(proxyEndpoint.username || '', 'utf8');
+    const password = Buffer.from(proxyEndpoint.password || '', 'utf8');
+    if (username.length > 255 || password.length > 255) {
+      throw new Error('SOCKS5 用户名或密码过长。');
+    }
+
+    socket.write(Buffer.concat([
+      Buffer.from([0x01, username.length]),
+      username,
+      Buffer.from([password.length]),
+      password,
+    ]));
+
+    const authResponse = await readSocketBytes(socket, 2, timeoutMs);
+    if (authResponse[1] !== 0x00) {
+      throw new Error('SOCKS5 用户名或密码认证失败。');
+    }
+  } else if (negotiationResponse[1] !== 0x00) {
+    throw new Error('SOCKS5 代理返回了未知认证方式。');
+  }
+
+  const hostBuffer = Buffer.from(targetHost, 'utf8');
+  if (hostBuffer.length === 0 || hostBuffer.length > 255) {
+    throw new Error('测试目标域名无效。');
+  }
+
+  socket.write(Buffer.concat([
+    Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuffer.length]),
+    hostBuffer,
+    encodePort(targetPort),
+  ]));
+
+  const connectResponseHead = await readSocketBytes(socket, 4, timeoutMs);
+  if (connectResponseHead[0] !== 0x05) {
+    throw new Error('SOCKS5 CONNECT 响应版本不正确。');
+  }
+
+  if (connectResponseHead[1] !== 0x00) {
+    throw new Error(getSocks5ErrorMessage(connectResponseHead[1]));
+  }
+
+  let remainingLength = 0;
+  if (connectResponseHead[3] === 0x01) {
+    remainingLength = 4 + 2;
+  } else if (connectResponseHead[3] === 0x03) {
+    const domainLengthBuffer = await readSocketBytes(socket, 1, timeoutMs);
+    remainingLength = domainLengthBuffer[0] + 2;
+  } else if (connectResponseHead[3] === 0x04) {
+    remainingLength = 16 + 2;
+  } else {
+    throw new Error('SOCKS5 CONNECT 返回了未知地址类型。');
+  }
+
+  if (remainingLength > 0) {
+    await readSocketBytes(socket, remainingLength, timeoutMs);
+  }
+}
+
+async function performSocks4ProxyConnect(socket, proxyEndpoint, targetHost, targetPort, timeoutMs) {
+  if (proxyEndpoint.password) {
+    throw new Error('SOCKS4 代理不支持密码认证。');
+  }
+
+  const userId = Buffer.from(proxyEndpoint.username || '', 'utf8');
+  const hostBuffer = Buffer.from(targetHost, 'utf8');
+  socket.write(Buffer.concat([
+    Buffer.from([0x04, 0x01]),
+    encodePort(targetPort),
+    Buffer.from([0x00, 0x00, 0x00, 0x01]),
+    userId,
+    Buffer.from([0x00]),
+    hostBuffer,
+    Buffer.from([0x00]),
+  ]));
+
+  const response = await readSocketBytes(socket, 8, timeoutMs);
+  if (response[1] !== 0x5A) {
+    throw new Error(getSocks4ErrorMessage(response[1]));
+  }
+}
+
+function encodePort(port) {
+  const buffer = Buffer.allocUnsafe(2);
+  buffer.writeUInt16BE(port, 0);
+  return buffer;
+}
+
+function readSocketUntil(socket, matcher, timeoutMs) {
+  const initialBuffer = getSocketBufferedData(socket);
+  const initialMatchLength = matcher(initialBuffer);
+  if (initialMatchLength > 0) {
+    return Promise.resolve(consumeSocketBuffer(socket, initialBuffer, initialMatchLength));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let buffered = initialBuffer;
+    const timer = setTimeout(() => {
+      finish(new Error(`等待代理响应超时（>${timeoutMs}ms）。`));
+      socket.destroy();
+    }, timeoutMs);
+
+    const finish = (error, value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener('data', handleData);
+      socket.removeListener('error', handleError);
+      socket.removeListener('close', handleClose);
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(value);
+    };
+
+    const handleData = (chunk) => {
+      buffered = Buffer.concat([buffered, chunk]);
+      const matchedLength = matcher(buffered);
+      if (matchedLength > 0) {
+        finish(null, consumeSocketBuffer(socket, buffered, matchedLength));
+      }
+    };
+
+    const handleError = (error) => finish(error);
+    const handleClose = () => finish(new Error('代理连接已关闭。'));
+
+    socket.on('data', handleData);
+    socket.once('error', handleError);
+    socket.once('close', handleClose);
+  });
+}
+
+function readSocketBytes(socket, expectedLength, timeoutMs) {
+  return readSocketUntil(
+    socket,
+    (buffer) => (buffer.length >= expectedLength ? expectedLength : 0),
+    timeoutMs,
+  );
+}
+
+function getSocketBufferedData(socket) {
+  return Buffer.isBuffer(socket[SOCKET_BUFFER_KEY])
+    ? socket[SOCKET_BUFFER_KEY]
+    : Buffer.alloc(0);
+}
+
+function consumeSocketBuffer(socket, buffered, consumedLength) {
+  const nextBuffer = Buffer.isBuffer(buffered) ? buffered : Buffer.alloc(0);
+  socket[SOCKET_BUFFER_KEY] = nextBuffer.subarray(consumedLength);
+  return nextBuffer.subarray(0, consumedLength);
+}
+
+function getSocks5ErrorMessage(code) {
+  const messages = {
+    0x01: 'SOCKS5 代理报告一般性失败。',
+    0x02: 'SOCKS5 规则拒绝了连接请求。',
+    0x03: 'SOCKS5 网络不可达。',
+    0x04: 'SOCKS5 主机不可达。',
+    0x05: 'SOCKS5 目标连接被拒绝。',
+    0x06: 'SOCKS5 连接超时。',
+    0x07: 'SOCKS5 命令不受支持。',
+    0x08: 'SOCKS5 地址类型不受支持。',
+  };
+
+  return messages[code] || `SOCKS5 代理返回错误代码 0x${code.toString(16)}。`;
+}
+
+function getSocks4ErrorMessage(code) {
+  const messages = {
+    0x5B: 'SOCKS4 代理拒绝了连接请求。',
+    0x5C: 'SOCKS4 代理无法连接目标身份服务。',
+    0x5D: 'SOCKS4 代理的身份校验失败。',
+  };
+
+  return messages[code] || `SOCKS4 代理返回错误代码 0x${code.toString(16)}。`;
 }
 
 function getProviderSystemPromptValue(systemPrompts, provider = DEFAULT_PROVIDER) {
@@ -7200,16 +7888,46 @@ function resolveCliExecutablePath(commandName, env = process.env) {
   return '';
 }
 
-function getCliProcessEnv(force = false) {
+function getCliProcessEnv(force = false, networkProxy = null) {
   const shellPath = getShellPathValue(force);
-  if (!shellPath) {
-    return { ...process.env };
+  const baseEnv = !shellPath
+    ? { ...process.env }
+    : {
+      ...process.env,
+      PATH: shellPath,
+    };
+
+  return applyNetworkProxySettingsToEnv(baseEnv, networkProxy);
+}
+
+function applyNetworkProxySettingsToEnv(env, networkProxy) {
+  const nextEnv = env && typeof env === 'object' ? { ...env } : {};
+  const normalizedProxy = normalizeNetworkProxySettings(networkProxy);
+
+  if (!normalizedProxy.enabled) {
+    return nextEnv;
   }
 
-  return {
-    ...process.env,
-    PATH: shellPath,
-  };
+  for (const key of PROXY_ENV_KEYS) {
+    delete nextEnv[key];
+    delete nextEnv[key.toLowerCase()];
+  }
+
+  setMirroredEnvValue(nextEnv, 'HTTP_PROXY', normalizedProxy.httpProxy);
+  setMirroredEnvValue(nextEnv, 'HTTPS_PROXY', normalizedProxy.httpsProxy);
+  setMirroredEnvValue(nextEnv, 'ALL_PROXY', normalizedProxy.allProxy);
+  setMirroredEnvValue(nextEnv, 'NO_PROXY', normalizedProxy.noProxy);
+
+  return nextEnv;
+}
+
+function setMirroredEnvValue(env, key, value) {
+  if (!value) {
+    return;
+  }
+
+  env[key] = value;
+  env[key.toLowerCase()] = value;
 }
 
 function getShellPathValue(force = false) {

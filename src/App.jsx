@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -41,7 +41,6 @@ import {
   X,
 } from 'lucide-react';
 
-import GitDiffWindow from '@/components/git-diff-window';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -79,6 +78,7 @@ const EMPTY_APP_STATE = {
   selectedWorkspaceId: null,
   workspaces: [],
 };
+const EMPTY_LIST = Object.freeze([]);
 
 const PROVIDER_KEYS = ['claude', 'codex'];
 const LANGUAGE_STORAGE_KEY = 'cc-desktop-proxy-language';
@@ -89,6 +89,7 @@ const PANE_FINISH_FLASH_ENABLED_STORAGE_KEY = 'cc-desktop-proxy-pane-finish-flas
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'cc-desktop-proxy-sidebar-collapsed';
 const THEME_STORAGE_KEY = 'cc-desktop-proxy-theme';
 const PANE_LAYOUT_MODES = ['single', 'columns', 'rows', 'grid'];
+const PANE_FOCUS_SESSION_SYNC_DELAY_MS = 90;
 const MIN_PANE_HEIGHT = 510;
 const MIN_PANE_WIDTH = 540;
 const SIDEBAR_EXPANDED_WIDTH = 280;
@@ -124,6 +125,8 @@ const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
 const SIDEBAR_ACTION_BUTTON_CLASS = 'h-8 w-8 shrink-0 rounded-md bg-transparent p-0 text-muted-foreground shadow-none hover:bg-background/80 hover:text-foreground';
 const SIDEBAR_ACTION_SLOT_CLASS = 'absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1';
 const SIDEBAR_RAIL_BUTTON_CLASS = 'relative inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-transparent bg-transparent text-muted-foreground transition-[background-color,color,border-color,box-shadow] hover:bg-background/85 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35';
+const GitDiffWindow = lazy(() => import('@/components/git-diff-window'));
+const SettingsWindow = lazy(() => import('@/components/settings-window'));
 
 function getModalLayoutStyles(platform) {
   if (platform === 'darwin') {
@@ -813,14 +816,1165 @@ export default function App() {
   const windowView = getWindowView();
 
   if (windowView === 'git-diff') {
-    return <GitDiffWindow desktopClient={desktopClient} />;
+    return (
+      <Suspense fallback={<WindowViewFallback />}>
+        <GitDiffWindow desktopClient={desktopClient} />
+      </Suspense>
+    );
+  }
+
+  if (windowView === 'settings') {
+    return (
+      <Suspense fallback={<WindowViewFallback />}>
+        <SettingsWindow desktopClient={desktopClient} />
+      </Suspense>
+    );
+  }
+
+  if (windowView === 'pane') {
+    return <StandalonePaneApp desktopClient={desktopClient} />;
   }
 
   return <MainApp desktopClient={desktopClient} />;
 }
 
+function WindowViewFallback() {
+  return (
+    <div className="flex h-full items-center justify-center bg-background">
+      <LoaderCircle className="h-5 w-5 animate-spin text-muted-foreground" />
+    </div>
+  );
+}
+
+function StandalonePaneApp({ desktopClient }) {
+  const paneParams = useMemo(() => getWindowPaneParams(), []);
+  const [appState, setAppState] = useState(EMPTY_APP_STATE);
+  const appStateRef = useRef(EMPTY_APP_STATE);
+  const [sessionSnapshot, setSessionSnapshot] = useState(null);
+  const [language, setLanguage] = useState(() => getInitialLanguage());
+  const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
+  const [systemTheme, setSystemTheme] = useState(() => getSystemTheme());
+  const [isPaneFinishFlashEnabled, setIsPaneFinishFlashEnabled] = useState(() => getInitialPaneFinishFlashEnabled());
+  const [toastItems, setToastItems] = useState([]);
+  const [isSending, setIsSending] = useState(false);
+  const [pendingTurn, setPendingTurn] = useState(null);
+  const [isUpdatingModel, setIsUpdatingModel] = useState(false);
+  const [isUpdatingReasoningEffort, setIsUpdatingReasoningEffort] = useState(false);
+  const [isUpdatingPermissionMode, setIsUpdatingPermissionMode] = useState(false);
+  const [isUpdatingProvider, setIsUpdatingProvider] = useState(false);
+  const [pendingApprovalActionId, setPendingApprovalActionId] = useState('');
+  const [isPaneFocused, setIsPaneFocused] = useState(() => (
+    typeof document === 'undefined' ? true : document.hasFocus()
+  ));
+  const [shouldFlashFinishedBorder, setShouldFlashFinishedBorder] = useState(false);
+  const [isBootstrapping, setIsBootstrapping] = useState(true);
+  const paneCompletionStatusRef = useRef({
+    isOutputInProgress: false,
+    sessionCacheKey: '',
+  });
+
+  const copy = COPY[language];
+  const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
+  const providerCatalog = appState.providers && typeof appState.providers === 'object'
+    ? appState.providers
+    : {};
+  const selectedWorkspace = useMemo(
+    () => appState.workspaces.find((workspace) => workspace.id === appState.selectedWorkspaceId) || null,
+    [appState.selectedWorkspaceId, appState.workspaces],
+  );
+  const selectedSession = appState.activeSession;
+  const workspace = useMemo(
+    () => appState.workspaces.find((entry) => entry.id === paneParams.workspaceId) || null,
+    [appState.workspaces, paneParams.workspaceId],
+  );
+  const sessionMeta = useMemo(
+    () => workspace?.sessions.find((entry) => entry.id === paneParams.sessionId) || null,
+    [paneParams.sessionId, workspace],
+  );
+  const sessionCacheKey = useMemo(
+    () => createSessionCacheKey(paneParams.workspaceId, paneParams.sessionId),
+    [paneParams.sessionId, paneParams.workspaceId],
+  );
+  const sessionViewCache = useMemo(() => (
+    sessionCacheKey && sessionSnapshot
+      ? { [sessionCacheKey]: sessionSnapshot }
+      : {}
+  ), [sessionCacheKey, sessionSnapshot]);
+  const paneDescriptor = useMemo(() => ({
+    id: paneParams.paneId,
+    sessionId: paneParams.sessionId || null,
+    workspaceId: paneParams.workspaceId || null,
+  }), [paneParams.paneId, paneParams.sessionId, paneParams.workspaceId]);
+  const pendingPaneTurns = useMemo(() => (
+    pendingTurn ? { [paneDescriptor.id]: pendingTurn } : {}
+  ), [paneDescriptor.id, pendingTurn]);
+  const sendingPaneIds = useMemo(
+    () => (isSending ? [paneDescriptor.id] : []),
+    [isSending, paneDescriptor.id],
+  );
+  const paneView = useMemo(() => buildPaneViewModel({
+    activeSession: selectedSession,
+    appState,
+    copy,
+    focusedPaneId: isPaneFocused ? paneDescriptor.id : '',
+    language,
+    pane: paneDescriptor,
+    paneCount: paneParams.paneCount,
+    pendingPaneTurns,
+    sendingPaneIds,
+    sessionViewCache,
+  }), [
+    appState,
+    copy,
+    isPaneFocused,
+    language,
+    paneDescriptor,
+    paneParams.paneCount,
+    pendingPaneTurns,
+    selectedSession,
+    sendingPaneIds,
+    sessionViewCache,
+  ]);
+  const pendingApprovalRequestIds = useMemo(
+    () => new Set(
+      Array.isArray(paneView.session?.pendingApprovals)
+        ? paneView.session.pendingApprovals.map((approval) => approval?.requestId).filter(Boolean)
+        : []
+    ),
+    [paneView.session?.pendingApprovals],
+  );
+
+  const dismissToast = useEventCallback((toastId) => {
+    setToastItems((current) => current.filter((item) => item.id !== toastId));
+  });
+
+  const setPaneError = useEventCallback((nextError) => {
+    const message = normalizeToastMessage(nextError);
+    if (!message) {
+      return;
+    }
+
+    setToastItems((current) => appendToast(current, {
+      message,
+      tone: 'error',
+    }));
+  });
+
+  const notifyHost = useEventCallback((type, payload = {}) => {
+    desktopClient?.notifyHost?.(type, payload);
+  });
+
+  useEffect(() => {
+    appStateRef.current = appState;
+  }, [appState]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+
+    const root = document.documentElement;
+    root.classList.toggle('dark', resolvedTheme === 'dark');
+    root.style.colorScheme = resolvedTheme;
+  }, [resolvedTheme]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      return;
+    }
+
+    document.documentElement.lang = getIntlLocale(language);
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
+    window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
+  }, [language, themePreference]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const syncSystemTheme = (event) => {
+      setSystemTheme(event.matches ? 'dark' : 'light');
+    };
+
+    setSystemTheme(mediaQuery.matches ? 'dark' : 'light');
+    mediaQuery.addEventListener('change', syncSystemTheme);
+
+    return () => {
+      mediaQuery.removeEventListener('change', syncSystemTheme);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const syncPreferences = (event) => {
+      if (!event.key || event.key === LANGUAGE_STORAGE_KEY) {
+        setLanguage(getInitialLanguage());
+      }
+
+      if (!event.key || event.key === THEME_STORAGE_KEY) {
+        setThemePreference(getInitialThemePreference());
+      }
+
+      if (!event.key || event.key === PANE_FINISH_FLASH_ENABLED_STORAGE_KEY) {
+        setIsPaneFinishFlashEnabled(getInitialPaneFinishFlashEnabled());
+      }
+    };
+
+    window.addEventListener('storage', syncPreferences);
+    return () => {
+      window.removeEventListener('storage', syncPreferences);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!desktopClient) {
+      setPaneError(copy.bridgeUnavailable);
+      setIsBootstrapping(false);
+      return undefined;
+    }
+
+    const unsubscribe = desktopClient.onStateChange((event) => {
+      if (event?.type === 'state' && event.state) {
+        if (areStandalonePaneAppStatesEquivalent(appStateRef.current, event.state, paneParams)) {
+          return;
+        }
+
+        startTransition(() => {
+          setAppState((current) => (
+            areStandalonePaneAppStatesEquivalent(current, event.state, paneParams)
+              ? current
+              : event.state
+          ));
+        });
+      }
+    });
+
+    let cancelled = false;
+
+    desktopClient.getAppState()
+      .then((state) => {
+        if (cancelled) {
+          return;
+        }
+
+        setAppState(state);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setPaneError(error.message);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsBootstrapping(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, [copy.bridgeUnavailable, desktopClient, setPaneError]);
+
+  useEffect(() => {
+    if (!paneParams.workspaceId || !paneParams.sessionId) {
+      setSessionSnapshot(null);
+      setPendingTurn(null);
+      setIsSending(false);
+      return;
+    }
+
+    const isSelectedPaneSession = (
+      selectedSession
+      && selectedSession.workspaceId === paneParams.workspaceId
+      && selectedSession.id === paneParams.sessionId
+    );
+
+    if (isSelectedPaneSession) {
+      setSessionSnapshot((current) => (
+        areSessionSnapshotsEqual(current, selectedSession) ? current : selectedSession
+      ));
+      return;
+    }
+
+    if (!desktopClient || !sessionMeta) {
+      return;
+    }
+
+    const hasFreshSnapshot = (
+      sessionSnapshot
+      && sessionSnapshot.updatedAt === sessionMeta.updatedAt
+      && sessionSnapshot.status === sessionMeta.status
+      && Boolean(sessionSnapshot.isRunning) === Boolean(sessionMeta.isRunning)
+    );
+
+    if (hasFreshSnapshot) {
+      return;
+    }
+
+    let cancelled = false;
+
+    desktopClient.getSession({
+      sessionId: paneParams.sessionId,
+      workspaceId: paneParams.workspaceId,
+    }).then((nextSession) => {
+      if (cancelled || !nextSession) {
+        return;
+      }
+
+      startTransition(() => {
+        setSessionSnapshot((current) => (
+          areSessionSnapshotsEqual(current, nextSession) ? current : nextSession
+        ));
+      });
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    desktopClient,
+    paneParams.sessionId,
+    paneParams.workspaceId,
+    selectedSession,
+    sessionMeta,
+    sessionSnapshot,
+  ]);
+
+  useEffect(() => {
+    if (!pendingTurn) {
+      return;
+    }
+
+    if (!hasSessionAppliedPendingTurn(paneView.session, pendingTurn)) {
+      return;
+    }
+
+    setPendingTurn(null);
+    setIsSending(false);
+  }, [paneView.session, pendingTurn]);
+
+  useEffect(() => {
+    const status = {
+      isOutputInProgress: Boolean(paneView.isOutputInProgress),
+      sessionCacheKey,
+    };
+    const previousStatus = paneCompletionStatusRef.current;
+    const shouldTriggerAttention = (
+      previousStatus?.isOutputInProgress
+      && !status.isOutputInProgress
+      && previousStatus.sessionCacheKey
+      && previousStatus.sessionCacheKey === status.sessionCacheKey
+      && !paneView.isFocused
+      && !paneView.isOnlyPane
+      && isPaneFinishFlashEnabled
+    );
+
+    paneCompletionStatusRef.current = status;
+
+    if (paneView.isFocused || paneView.isOnlyPane || !isPaneFinishFlashEnabled) {
+      setShouldFlashFinishedBorder(false);
+      return;
+    }
+
+    if (shouldTriggerAttention) {
+      setShouldFlashFinishedBorder(true);
+    }
+  }, [
+    isPaneFinishFlashEnabled,
+    paneView.isFocused,
+    paneView.isOnlyPane,
+    paneView.isOutputInProgress,
+    sessionCacheKey,
+  ]);
+
+  useEffect(() => {
+    if (!pendingApprovalActionId) {
+      return;
+    }
+
+    if (pendingApprovalRequestIds.has(pendingApprovalActionId)) {
+      return;
+    }
+
+    setPendingApprovalActionId('');
+  }, [pendingApprovalActionId, pendingApprovalRequestIds]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const syncPaneFocus = () => {
+      const nextFocused = typeof document === 'undefined' ? true : document.hasFocus();
+      setIsPaneFocused(nextFocused);
+
+      if (nextFocused) {
+        setShouldFlashFinishedBorder(false);
+        notifyHost('focus-pane', { paneId: paneDescriptor.id });
+      }
+    };
+
+    window.addEventListener('focus', syncPaneFocus);
+    window.addEventListener('blur', syncPaneFocus);
+    syncPaneFocus();
+
+    return () => {
+      window.removeEventListener('focus', syncPaneFocus);
+      window.removeEventListener('blur', syncPaneFocus);
+    };
+  }, [notifyHost, paneDescriptor.id]);
+
+  useEffect(() => {
+    if (!desktopClient || typeof document === 'undefined') {
+      return undefined;
+    }
+
+    const handleDocumentClick = (event) => {
+      if (event.defaultPrevented || !(event.target instanceof Element)) {
+        return;
+      }
+
+      const copyButton = event.target.closest('[data-markdown-copy-button="true"]');
+      if (copyButton) {
+        event.preventDefault();
+        void (async () => {
+          const copyShell = copyButton.closest('[data-markdown-copy-shell="true"]');
+          if (!(copyShell instanceof HTMLElement)) {
+            return;
+          }
+
+          const textToCopy = getMarkdownCopyText(copyShell);
+          if (!textToCopy) {
+            return;
+          }
+
+          try {
+            await copyTextToClipboard(textToCopy);
+            flashMarkdownCopyButton(copyButton);
+          } catch (error) {
+            setPaneError(error?.message || (language === 'zh' ? '复制失败。' : 'Copy failed.'));
+          }
+        })();
+        return;
+      }
+
+      const anchor = event.target.closest('a[href]');
+      if (!anchor) {
+        return;
+      }
+
+      const href = anchor.getAttribute('href');
+      if (!href) {
+        return;
+      }
+
+      event.preventDefault();
+      desktopClient.openLink(href).catch((error) => {
+        setPaneError(error.message);
+      });
+    };
+
+    document.addEventListener('click', handleDocumentClick);
+    return () => {
+      document.removeEventListener('click', handleDocumentClick);
+    };
+  }, [desktopClient, language, setPaneError]);
+
+  async function createSessionForPane() {
+    if (!desktopClient) {
+      return null;
+    }
+
+    const targetWorkspace = workspace || selectedWorkspace;
+    if (!targetWorkspace) {
+      setPaneError(language === 'zh' ? '请先选择一个工作目录。' : 'Select a workspace first.');
+      return null;
+    }
+
+    const preferredProvider = normalizeProviderCommandArg(
+      paneView.session?.provider
+      || selectedSession?.provider
+      || appState.defaultProvider,
+    );
+
+    try {
+      const nextState = await desktopClient.createSession({
+        preferredProvider,
+        workspaceId: targetWorkspace.id,
+      });
+
+      setAppState((current) => integrateCreatedSessionResult(current, nextState));
+      setSessionSnapshot(nextState?.activeSession && typeof nextState.activeSession === 'object'
+        ? nextState.activeSession
+        : null);
+      setPendingTurn(null);
+      setIsSending(false);
+      notifyHost('assign-session', {
+        paneId: paneDescriptor.id,
+        sessionId: nextState?.selectedSessionId || '',
+        workspaceId: nextState?.selectedWorkspaceId || '',
+      });
+      return nextState;
+    } catch (error) {
+      setPaneError(error.message);
+      return null;
+    }
+  }
+
+  async function pickAttachmentsForPane() {
+    if (!desktopClient || isBootstrapping) {
+      return [];
+    }
+
+    try {
+      const pickedAttachments = await desktopClient.pickAttachments();
+      return Array.isArray(pickedAttachments) ? pickedAttachments : [];
+    } catch (error) {
+      setPaneError(error.message);
+      return [];
+    }
+  }
+
+  async function preparePastedAttachmentsForPane(clipboardData) {
+    if (!desktopClient || isBootstrapping) {
+      return [];
+    }
+
+    const clipboardFiles = getClipboardFiles(clipboardData);
+    if (clipboardFiles.length === 0) {
+      return [];
+    }
+
+    try {
+      const preparedAttachments = await Promise.all(clipboardFiles.map((file) => createPastedAttachmentPayload(file)));
+      const nextAttachments = await desktopClient.preparePastedAttachments({
+        attachments: preparedAttachments.filter(Boolean),
+      });
+      return Array.isArray(nextAttachments) ? nextAttachments : [];
+    } catch (error) {
+      setPaneError(error.message);
+      return [];
+    }
+  }
+
+  async function submitPromptForPane(prompt, {
+    attachments = [],
+    displayKind = '',
+    displayPrompt,
+    displayTitle = '',
+  } = {}) {
+    if (!desktopClient) {
+      return false;
+    }
+
+    const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
+    const normalizedAttachments = normalizeComposerAttachments(attachments);
+    if (!normalizedPrompt && normalizedAttachments.length === 0) {
+      return false;
+    }
+
+    if (!paneView.session || !workspace) {
+      setPaneError(
+        language === 'zh'
+          ? '请先在这个分屏里创建或选择一个会话。'
+          : 'Create or select a conversation in this pane first.',
+      );
+      return false;
+    }
+
+    if (paneView.isBusy) {
+      setPaneError(
+        language === 'zh'
+          ? '这个分屏里的对话仍在运行，请先停止或等待完成。'
+          : 'This conversation is still running. Stop it or wait for it to finish first.',
+      );
+      return false;
+    }
+
+    setIsSending(true);
+    setPendingTurn(createPendingPaneTurn({
+      attachments: normalizedAttachments,
+      displayKind,
+      displayPrompt,
+      displayTitle,
+      paneId: paneDescriptor.id,
+      prompt: normalizedPrompt,
+      session: paneView.session,
+      workspaceId: workspace.id,
+    }));
+
+    try {
+      await desktopClient.sendMessage({
+        attachments: normalizedAttachments,
+        displayKind,
+        displayPrompt,
+        displayTitle,
+        prompt: normalizedPrompt,
+        sessionId: paneView.session.id,
+        workspaceId: workspace.id,
+      });
+      return true;
+    } catch (error) {
+      setPendingTurn(null);
+      setIsSending(false);
+      setPaneError(error.message);
+      return false;
+    }
+  }
+
+  async function updateSessionModelForPane(nextModel) {
+    if (!desktopClient || !workspace || !paneView.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingModel(true);
+
+    try {
+      const nextState = await desktopClient.updateSessionModel({
+        model: nextModel,
+        sessionId: paneView.session.id,
+        workspaceId: workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingModel(false);
+    }
+  }
+
+  async function updateSessionReasoningEffortForPane(nextReasoningEffort) {
+    if (!desktopClient || !workspace || !paneView.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingReasoningEffort(true);
+
+    try {
+      const nextState = await desktopClient.updateSessionReasoningEffort({
+        reasoningEffort: nextReasoningEffort,
+        sessionId: paneView.session.id,
+        workspaceId: workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingReasoningEffort(false);
+    }
+  }
+
+  async function updateSessionPermissionModeForPane(nextPermissionMode) {
+    if (!desktopClient || !workspace || !paneView.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingPermissionMode(true);
+
+    try {
+      const nextState = await desktopClient.updateSessionPermissionMode({
+        permissionMode: nextPermissionMode,
+        sessionId: paneView.session.id,
+        workspaceId: workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingPermissionMode(false);
+    }
+  }
+
+  async function updateSessionProviderForPane(nextProvider) {
+    if (!desktopClient || !workspace || !paneView.session) {
+      throw new Error(language === 'zh' ? '请先打开一个对话。' : 'Open a conversation first.');
+    }
+
+    setIsUpdatingProvider(true);
+
+    try {
+      const nextState = await desktopClient.updateSessionProvider({
+        provider: nextProvider,
+        sessionId: paneView.session.id,
+        workspaceId: workspace.id,
+      });
+      setAppState(nextState);
+    } finally {
+      setIsUpdatingProvider(false);
+    }
+  }
+
+  async function runSlashCommandForPane(_paneId, rawInput) {
+    const parsedCommand = parseSlashCommand(rawInput);
+    if (!parsedCommand) {
+      return { handled: false };
+    }
+
+    const currentProvider = normalizeProviderKey(paneView.session?.provider || appState.defaultProvider);
+    const currentProviderInfo = getProviderInfo(providerCatalog, currentProvider, appState.defaultProvider);
+    const commandSkills = Array.isArray(currentProviderInfo.skills) ? currentProviderInfo.skills : [];
+    const commandName = resolveSlashCommandName(parsedCommand.name, currentProvider);
+    const installedSkill = findInstalledSkillCommand(parsedCommand.name, commandSkills);
+
+    try {
+      if (commandName === 'help') {
+        return {
+          handled: true,
+          nextInputValue: '/',
+        };
+      }
+
+      if (commandName === 'clear') {
+        const createdState = await createSessionForPane();
+        return {
+          handled: true,
+          nextInputValue: createdState ? '' : rawInput,
+        };
+      }
+
+      if (commandName === 'theme') {
+        const nextTheme = normalizeThemeCommandArg(parsedCommand.args);
+        if (!nextTheme) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /theme light、/theme dark 或 /theme system。'
+              : 'Use /theme light, /theme dark, or /theme system.',
+          );
+        }
+
+        setThemePreference(nextTheme);
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'model') {
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /model <模型名>，或 /model default 恢复默认模型。'
+              : 'Use /model <name>, or /model default to restore the default model.',
+          );
+        }
+
+        await updateSessionModelForPane(normalizeModelCommandArg(parsedCommand.args));
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'reasoning') {
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /reasoning low、/reasoning medium、/reasoning high、/reasoning xhigh 或 /reasoning default。'
+              : 'Use /reasoning low, /reasoning medium, /reasoning high, /reasoning xhigh, or /reasoning default.',
+          );
+        }
+
+        const nextReasoningEffort = normalizeReasoningEffortCommandArg(parsedCommand.args);
+        if (nextReasoningEffort === null) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /reasoning low、/reasoning medium、/reasoning high、/reasoning xhigh 或 /reasoning default。'
+              : 'Use /reasoning low, /reasoning medium, /reasoning high, /reasoning xhigh, or /reasoning default.',
+          );
+        }
+
+        await updateSessionReasoningEffortForPane(nextReasoningEffort);
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'mode') {
+        if (!parsedCommand.args) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /mode ask、/mode auto 或 /mode plan。'
+              : 'Use /mode ask, /mode auto, or /mode plan.',
+          );
+        }
+
+        const nextPermissionMode = normalizeModeCommandArg(parsedCommand.args);
+        if (!nextPermissionMode) {
+          throw new Error(
+            language === 'zh'
+              ? '请使用 /mode ask、/mode auto 或 /mode plan。'
+              : 'Use /mode ask, /mode auto, or /mode plan.',
+          );
+        }
+
+        await updateSessionPermissionModeForPane(nextPermissionMode);
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'provider') {
+        const nextProvider = normalizeProviderCommandArg(parsedCommand.args);
+        if (!nextProvider) {
+          throw new Error(language === 'zh' ? '请使用 /provider claude 或 /provider codex。' : 'Use /provider claude or /provider codex.');
+        }
+
+        await updateSessionProviderForPane(nextProvider);
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'mcp') {
+        if (!workspace || !paneView.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        if (!parsedCommand.args) {
+          throw new Error(language === 'zh' ? '请使用 /mcp list、/mcp get <name>、/mcp add ... 或 /mcp remove <name>。' : 'Use /mcp list, /mcp get <name>, /mcp add ..., or /mcp remove <name>.');
+        }
+
+        const nextState = await desktopClient.runMcpCommand({
+          args: parsedCommand.args,
+          sessionId: paneView.session.id,
+          workspaceId: workspace.id,
+        });
+        setAppState(nextState);
+        return {
+          handled: true,
+          nextInputValue: '',
+        };
+      }
+
+      if (commandName === 'skills') {
+        if (!workspace || !paneView.session) {
+          throw new Error(language === 'zh' ? '请先创建或选择一个对话。' : 'Create or select a conversation first.');
+        }
+
+        const tokens = tokenizeSlashArgs(parsedCommand.args);
+        const action = (tokens[0] || 'list').toLowerCase();
+
+        if (action === 'list') {
+          const nextState = await desktopClient.listSkills({
+            sessionId: paneView.session.id,
+            workspaceId: workspace.id,
+          });
+          setAppState(nextState);
+          return {
+            handled: true,
+            nextInputValue: '',
+          };
+        }
+
+        if (action === 'install') {
+          const installArgs = parsedCommand.args.slice(parsedCommand.args.toLowerCase().indexOf('install') + 'install'.length).trim();
+          if (!installArgs) {
+            throw new Error(language === 'zh' ? '请使用 /skills install <path> [--scope user|project]。' : 'Use /skills install <path> [--scope user|project].');
+          }
+
+          const nextState = await desktopClient.installSkill({
+            args: installArgs,
+            sessionId: paneView.session.id,
+            workspaceId: workspace.id,
+          });
+          setAppState(nextState);
+          return {
+            handled: true,
+            nextInputValue: '',
+          };
+        }
+
+        throw new Error(language === 'zh' ? '当前只支持 /skills list 和 /skills install <path> [--scope user|project]。' : 'Currently supported: /skills list and /skills install <path> [--scope user|project].');
+      }
+
+      if (installedSkill) {
+        const handled = await submitPromptForPane(
+          buildSkillInvocationPrompt(installedSkill, parsedCommand.args, language),
+          {
+            displayKind: 'command',
+            displayPrompt: rawInput.trim(),
+            displayTitle: rawInput.trim(),
+          },
+        );
+
+        return {
+          handled,
+          nextInputValue: handled ? '' : rawInput,
+        };
+      }
+
+      if (!commandName) {
+        const handled = await submitPromptForPane(rawInput.trim(), {
+          displayKind: 'command',
+          displayPrompt: rawInput.trim(),
+          displayTitle: rawInput.trim(),
+        });
+        return {
+          handled,
+          nextInputValue: handled ? '' : rawInput,
+        };
+      }
+    } catch (error) {
+      setPaneError(error.message);
+      return {
+        handled: true,
+      };
+    }
+
+    return {
+      handled: false,
+    };
+  }
+
+  async function stopRunForPane() {
+    if (!desktopClient || !workspace || !paneView.session || !paneView.isBusy) {
+      return;
+    }
+
+    try {
+      const nextState = await desktopClient.stopRun({
+        sessionId: paneView.session.id,
+        workspaceId: workspace.id,
+      });
+      setAppState(nextState);
+      setPendingTurn(null);
+      setIsSending(false);
+    } catch (error) {
+      setPaneError(error.message);
+    }
+  }
+
+  async function respondToApproval(requestId, decision) {
+    if (!desktopClient || !requestId) {
+      return;
+    }
+
+    setPendingApprovalActionId(requestId);
+
+    try {
+      const nextState = await desktopClient.respondToApproval({ decision, requestId });
+      setAppState(nextState);
+    } catch (error) {
+      setPaneError(error.message);
+      setPendingApprovalActionId('');
+    }
+  }
+
+  const handlePaneFocus = useEventCallback((paneId) => {
+    setIsPaneFocused(true);
+    setShouldFlashFinishedBorder(false);
+    notifyHost('focus-pane', { paneId });
+  });
+  const handlePaneClear = useEventCallback((paneId) => {
+    notifyHost('clear-pane', { paneId });
+  });
+  const handlePaneSendMessage = useEventCallback((_paneId, prompt, options) => submitPromptForPane(prompt, options));
+  const handlePaneRunSlashCommand = useEventCallback((paneId, rawInput) => runSlashCommandForPane(paneId, rawInput));
+  const handlePaneStopRun = useEventCallback(() => stopRunForPane());
+  const handlePaneUpdateSessionProvider = useEventCallback((_paneId, nextProvider) => updateSessionProviderForPane(nextProvider));
+  const handlePaneUpdateSessionModel = useEventCallback((_paneId, nextModel) => updateSessionModelForPane(nextModel));
+  const handlePaneUpdateSessionReasoningEffort = useEventCallback((_paneId, nextReasoningEffort) => updateSessionReasoningEffortForPane(nextReasoningEffort));
+  const handlePaneUpdateSessionPermissionMode = useEventCallback((_paneId, nextPermissionMode) => updateSessionPermissionModeForPane(nextPermissionMode));
+  const handleApprovalDecision = useEventCallback((requestId, decision) => respondToApproval(requestId, decision));
+
+  if (!desktopClient && !isBootstrapping) {
+    return (
+      <div className="flex h-full items-center justify-center bg-background px-6 text-center text-sm text-muted-foreground">
+        {copy.bridgeUnavailable}
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+      <ToastViewport items={toastItems} onDismiss={dismissToast} />
+      <ConversationPane
+        canClear={!paneView.isBusy}
+        copy={copy}
+        defaultProvider={appState.defaultProvider}
+        isUpdatingModel={isUpdatingModel}
+        isUpdatingPermissionMode={isUpdatingPermissionMode}
+        isUpdatingProvider={isUpdatingProvider}
+        isUpdatingReasoningEffort={isUpdatingReasoningEffort}
+        language={language}
+        maxPaneCount={paneParams.paneCount}
+        pane={paneView}
+        paneNumber={paneParams.paneNumber}
+        paneShortcutLabel={getPaneHeaderLabel(appState.platform, paneParams.paneNumber)}
+        pendingApprovalActionId={pendingApprovalActionId}
+        platform={appState.platform}
+        providerCatalog={providerCatalog}
+        shouldFlashFinishedBorder={shouldFlashFinishedBorder}
+        onApprovalDecision={handleApprovalDecision}
+        onClear={handlePaneClear}
+        onFocus={handlePaneFocus}
+        onPickAttachments={pickAttachmentsForPane}
+        onPreparePastedAttachments={preparePastedAttachmentsForPane}
+        onRunSlashCommand={handlePaneRunSlashCommand}
+        onSendMessage={handlePaneSendMessage}
+        onStopRun={handlePaneStopRun}
+        onUpdateSessionModel={handlePaneUpdateSessionModel}
+        onUpdateSessionPermissionMode={handlePaneUpdateSessionPermissionMode}
+        onUpdateSessionProvider={handlePaneUpdateSessionProvider}
+        onUpdateSessionReasoningEffort={handlePaneUpdateSessionReasoningEffort}
+      />
+    </div>
+  );
+}
+
+const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
+  desktopClient,
+  pane,
+  paneCount,
+  paneNumber,
+  onPaneAssignSession,
+  onPaneClear,
+  onPaneFocus,
+}) {
+  const containerRef = useRef(null);
+  const webviewRef = useRef(null);
+  const [guestLoadError, setGuestLoadError] = useState('');
+  const src = useMemo(
+    () => buildEmbeddedPaneViewUrl({
+      paneCount,
+      paneId: pane.id,
+      paneNumber,
+      sessionId: pane.sessionId,
+      workspaceId: pane.workspaceId,
+    }),
+    [pane.id, pane.sessionId, pane.workspaceId, paneCount, paneNumber],
+  );
+  const preloadUrl = desktopClient?.embeddedPanePreloadUrl || '';
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !preloadUrl) {
+      if (container) {
+        container.replaceChildren();
+      }
+      webviewRef.current = null;
+      return undefined;
+    }
+
+    const createWebviewElement = () => {
+      const element = document.createElement('webview');
+      element.className = 'h-full w-full bg-background outline-none';
+      element.setAttribute('preload', preloadUrl);
+      element.setAttribute('webpreferences', 'contextIsolation=yes,sandbox=no');
+      element.setAttribute('src', src);
+      container.replaceChildren(element);
+      webviewRef.current = element;
+      return element;
+    };
+
+    const needsFreshElement = (
+      !webviewRef.current
+      || !webviewRef.current.isConnected
+      || webviewRef.current.getAttribute('preload') !== preloadUrl
+    );
+    const element = needsFreshElement
+      ? createWebviewElement()
+      : webviewRef.current;
+
+    if (element.parentElement !== container) {
+      container.replaceChildren(element);
+    }
+
+    if (element.getAttribute('src') !== src) {
+      element.setAttribute('src', src);
+    }
+
+    setGuestLoadError('');
+
+    const handleIpcMessage = (event) => {
+      if (event.channel !== 'claude:host-event') {
+        return;
+      }
+
+      const payload = event.args?.[0];
+      const eventType = payload?.type;
+      const eventPayload = payload?.payload && typeof payload.payload === 'object'
+        ? payload.payload
+        : {};
+      const targetPaneId = eventPayload.paneId || pane.id;
+
+      if (eventType === 'focus-pane') {
+        onPaneFocus?.(targetPaneId);
+        return;
+      }
+
+      if (eventType === 'clear-pane') {
+        onPaneClear?.(targetPaneId);
+        return;
+      }
+
+      if (eventType === 'assign-session') {
+        onPaneAssignSession?.({
+          paneId: targetPaneId,
+          sessionId: eventPayload.sessionId || '',
+          workspaceId: eventPayload.workspaceId || '',
+        });
+      }
+    };
+
+    const handleFocus = () => {
+      onPaneFocus?.(pane.id);
+    };
+
+    const handleDidFailLoad = (event) => {
+      if (event.errorCode === -3) {
+        return;
+      }
+
+      setGuestLoadError(event.errorDescription || 'Failed to load pane renderer.');
+    };
+
+    const handleRenderProcessGone = (event) => {
+      const reason = event.reason || 'unknown';
+      setGuestLoadError(`Pane renderer exited unexpectedly (${reason}).`);
+    };
+
+    element.addEventListener('ipc-message', handleIpcMessage);
+    element.addEventListener('focus', handleFocus);
+    element.addEventListener('did-fail-load', handleDidFailLoad);
+    element.addEventListener('render-process-gone', handleRenderProcessGone);
+
+    return () => {
+      element.removeEventListener('ipc-message', handleIpcMessage);
+      element.removeEventListener('focus', handleFocus);
+      element.removeEventListener('did-fail-load', handleDidFailLoad);
+      element.removeEventListener('render-process-gone', handleRenderProcessGone);
+    };
+  }, [onPaneAssignSession, onPaneClear, onPaneFocus, pane.id, preloadUrl, src]);
+
+  return (
+    <div className="relative min-h-0 min-w-0 overflow-hidden bg-background">
+      <div ref={containerRef} className="h-full w-full" />
+      {guestLoadError ? (
+        <div className="absolute inset-0 z-[1] flex items-center justify-center bg-background px-6 text-center text-sm text-muted-foreground">
+          {guestLoadError}
+        </div>
+      ) : null}
+    </div>
+  );
+}, function areEmbeddedPaneHostPropsEqual(previousProps, nextProps) {
+  return (
+    previousProps.desktopClient === nextProps.desktopClient
+    && previousProps.paneCount === nextProps.paneCount
+    && previousProps.paneNumber === nextProps.paneNumber
+    && previousProps.onPaneAssignSession === nextProps.onPaneAssignSession
+    && previousProps.onPaneClear === nextProps.onPaneClear
+    && previousProps.onPaneFocus === nextProps.onPaneFocus
+    && arePaneViewModelsEqual(previousProps.pane, nextProps.pane)
+  );
+});
+
 function MainApp({ desktopClient }) {
   const [appState, setAppState] = useState(EMPTY_APP_STATE);
+  const appStateRef = useRef(EMPTY_APP_STATE);
   const [language, setLanguage] = useState(() => getInitialLanguage());
   const [themePreference, setThemePreference] = useState(() => getInitialThemePreference());
   const [isPaneSizeLimitIgnored, setIsPaneSizeLimitIgnored] = useState(() => getInitialPaneSizeLimitIgnored());
@@ -839,7 +1993,6 @@ function MainApp({ desktopClient }) {
   const [isRemovingWorkspace, setIsRemovingWorkspace] = useState(false);
   const [pendingPaneTurns, setPendingPaneTurns] = useState({});
   const [sendingPaneIds, setSendingPaneIds] = useState([]);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isModePickerOpen, setIsModePickerOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [isUpdatingPermissionMode, setIsUpdatingPermissionMode] = useState(false);
@@ -869,6 +2022,12 @@ function MainApp({ desktopClient }) {
   const collapsedSidebarRef = useRef(null);
   const [paneBoardElement, setPaneBoardElement] = useState(null);
   const paneLayoutRef = useRef(paneLayout);
+  const pendingFocusedPaneSelectionRef = useRef({
+    paneId: '',
+    sessionId: '',
+    timerId: 0,
+    workspaceId: '',
+  });
   const paneCompletionStatusRef = useRef({});
   const paneRecentIdsRef = useRef(paneRecentIds);
   const sidebarFlyoutRef = useRef(null);
@@ -1016,6 +2175,7 @@ function MainApp({ desktopClient }) {
       appState,
       copy,
       focusedPaneId: paneLayout.focusedPaneId,
+      includeRenderableMessages: false,
       pendingPaneTurns,
       sendingPaneIds,
       language,
@@ -1100,6 +2260,16 @@ function MainApp({ desktopClient }) {
   const handlePaneFocus = useEventCallback((paneId) => {
     void focusPane(paneId);
   });
+  const handleEmbeddedPaneAssignSession = useEventCallback(({ paneId, sessionId, workspaceId }) => {
+    if (!paneId || !sessionId || !workspaceId) {
+      return;
+    }
+
+    setPaneLayout((current) => assignSessionToPaneState(current, paneId, {
+      sessionId,
+      workspaceId,
+    }));
+  });
   const handlePanePickAttachments = useEventCallback(() => pickAttachmentsForPane());
   const handlePanePreparePastedAttachments = useEventCallback((clipboardData) => preparePastedAttachmentsForPane(clipboardData));
   const handlePaneRunSlashCommand = useEventCallback((paneId, rawInput) => runSlashCommandForPane(paneId, rawInput));
@@ -1109,7 +2279,6 @@ function MainApp({ desktopClient }) {
   const handlePaneUpdateSessionModel = useEventCallback((paneId, nextModel) => updateSessionModelForPane(paneId, nextModel));
   const handlePaneUpdateSessionReasoningEffort = useEventCallback((paneId, nextReasoningEffort) => updateSessionReasoningEffortForPane(paneId, nextReasoningEffort));
   const handlePaneUpdateSessionPermissionMode = useEventCallback((paneId, nextPermissionMode) => updateSessionPermissionModeForPane(paneId, nextPermissionMode));
-  const handleSettingsClose = useEventCallback(() => setIsSettingsOpen(false));
   const handleSettingsRefreshProviderStatus = useEventCallback(() => refreshProviderStatus());
   const handleSettingsSetProviderEnabled = useEventCallback((provider, enabled) => setProviderEnabled(provider, enabled));
   const handleSettingsSetProviderSystemPrompt = useEventCallback((provider, systemPrompt) => (
@@ -1238,7 +2407,7 @@ function MainApp({ desktopClient }) {
   );
   const openSettings = useCallback(() => {
     setSidebarFlyoutView(null);
-    setIsSettingsOpen(true);
+    void openSettingsWindow();
   }, []);
 
   useEffect(() => {
@@ -1263,7 +2432,6 @@ function MainApp({ desktopClient }) {
 
   useEffect(() => {
     if (isSlashCommandMenuOpen) {
-      setIsSettingsOpen(false);
       setIsModePickerOpen(false);
       setIsModelPickerOpen(false);
     }
@@ -1276,14 +2444,6 @@ function MainApp({ desktopClient }) {
 
     refreshAppStateSilently();
   }, [isSlashCommandMenuOpen]);
-
-  useEffect(() => {
-    if (!isSettingsOpen) {
-      return;
-    }
-
-    refreshAppStateSilently();
-  }, [isSettingsOpen]);
 
   useEffect(() => {
     if (!desktopClient || typeof document === 'undefined') {
@@ -1332,23 +2492,6 @@ function MainApp({ desktopClient }) {
   }, [focusedSession]);
 
   useEffect(() => {
-    if (!isSettingsOpen || typeof document === 'undefined') {
-      return undefined;
-    }
-
-    const closeOnEscape = (event) => {
-      if (event.key === 'Escape') {
-        setIsSettingsOpen(false);
-      }
-    };
-
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [isSettingsOpen]);
-
-  useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
@@ -1367,12 +2510,6 @@ function MainApp({ desktopClient }) {
       setSidebarFlyoutView(null);
     }
   }, [hasHiddenPanes, sidebarFlyoutView]);
-
-  useEffect(() => {
-    if (isSettingsOpen) {
-      setSidebarFlyoutView(null);
-    }
-  }, [isSettingsOpen]);
 
   useEffect(() => {
     if (!isSidebarCollapsed || !sidebarFlyoutView || typeof document === 'undefined') {
@@ -1728,8 +2865,19 @@ function MainApp({ desktopClient }) {
   }, [paneLayout]);
 
   useEffect(() => {
+    appStateRef.current = appState;
+  }, [appState]);
+
+  useEffect(() => {
     paneRecentIdsRef.current = paneRecentIds;
   }, [paneRecentIds]);
+
+  useEffect(() => () => {
+    const timerId = pendingFocusedPaneSelectionRef.current.timerId;
+    if (timerId) {
+      window.clearTimeout(timerId);
+    }
+  }, []);
 
   useEffect(() => {
     if (typeof document === 'undefined') {
@@ -1748,6 +2896,39 @@ function MainApp({ desktopClient }) {
 
     window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
   }, [themePreference]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const handleStorage = (event) => {
+      if (event.storageArea !== window.localStorage) {
+        return;
+      }
+
+      if (event.key === LANGUAGE_STORAGE_KEY) {
+        setLanguage(getInitialLanguage());
+      }
+
+      if (event.key === THEME_STORAGE_KEY) {
+        setThemePreference(getInitialThemePreference());
+      }
+
+      if (event.key === PANE_SIZE_LIMIT_IGNORED_STORAGE_KEY) {
+        setIsPaneSizeLimitIgnored(getInitialPaneSizeLimitIgnored());
+      }
+
+      if (event.key === PANE_FINISH_FLASH_ENABLED_STORAGE_KEY) {
+        setIsPaneFinishFlashEnabled(getInitialPaneFinishFlashEnabled());
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -1882,7 +3063,9 @@ function MainApp({ desktopClient }) {
 
     const unsubscribe = desktopClient.onStateChange((event) => {
       if (event?.type === 'state' && event.state) {
-        setAppState(event.state);
+        startTransition(() => {
+          setAppState(event.state);
+        });
       }
     });
 
@@ -1952,74 +3135,65 @@ function MainApp({ desktopClient }) {
       return;
     }
 
-    const pendingFetches = paneLayout.panes
-      .filter((pane) => pane.workspaceId && pane.sessionId)
-      .filter((pane) => (
-        !selectedSession
-        || pane.workspaceId !== selectedSession.workspaceId
-        || pane.sessionId !== selectedSession.id
-      ))
-      .filter((pane) => {
-        const workspace = appState.workspaces.find((entry) => entry.id === pane.workspaceId);
-        const sessionMeta = workspace?.sessions.find((entry) => entry.id === pane.sessionId) || null;
-        const cacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
-        const cachedSession = sessionViewCache[cacheKey];
-        if (!cachedSession || !sessionMeta) {
-          return !cachedSession;
-        }
+    const focusedHydrationTarget = focusedPane?.workspaceId && focusedPane?.sessionId
+      ? {
+        sessionId: focusedPane.sessionId,
+        workspaceId: focusedPane.workspaceId,
+      }
+      : null;
 
-        return (
-          cachedSession.updatedAt !== sessionMeta.updatedAt
-          || cachedSession.status !== sessionMeta.status
-          || Boolean(cachedSession.isRunning) !== Boolean(sessionMeta.isRunning)
-        );
-      });
+    if (!focusedHydrationTarget) {
+      return;
+    }
 
-    if (pendingFetches.length === 0) {
+    const workspace = appState.workspaces.find((entry) => entry.id === focusedHydrationTarget.workspaceId);
+    const sessionMeta = workspace?.sessions.find((entry) => entry.id === focusedHydrationTarget.sessionId) || null;
+    const cacheKey = createSessionCacheKey(
+      focusedHydrationTarget.workspaceId,
+      focusedHydrationTarget.sessionId,
+    );
+    const cachedSession = sessionViewCache[cacheKey];
+    const shouldFetchFocusedSession = (
+      !cachedSession
+      || !sessionMeta
+      || cachedSession.updatedAt !== sessionMeta.updatedAt
+      || cachedSession.status !== sessionMeta.status
+      || Boolean(cachedSession.isRunning) !== Boolean(sessionMeta.isRunning)
+    );
+
+    if (!shouldFetchFocusedSession) {
       return;
     }
 
     let cancelled = false;
 
-    Promise.all(
-      pendingFetches.map(async (pane) => {
-        try {
-          const session = await desktopClient.getSession({
-            sessionId: pane.sessionId,
-            workspaceId: pane.workspaceId,
-          });
-          return session;
-        } catch {
-          return null;
-        }
-      }),
-    ).then((sessions) => {
-      if (cancelled) {
+    desktopClient.getSession({
+      sessionId: focusedHydrationTarget.sessionId,
+      workspaceId: focusedHydrationTarget.workspaceId,
+    }).then((session) => {
+      if (cancelled || !session) {
         return;
       }
 
-      setSessionViewCache((current) => {
-        let mutated = false;
-        const next = { ...current };
-
-        for (const session of sessions.filter(Boolean)) {
-          const cacheKey = createSessionCacheKey(session.workspaceId, session.id);
-          if (areSessionSnapshotsEqual(next[cacheKey], session)) {
-            continue;
+      startTransition(() => {
+        setSessionViewCache((current) => {
+          const nextCacheKey = createSessionCacheKey(session.workspaceId, session.id);
+          if (areSessionSnapshotsEqual(current[nextCacheKey], session)) {
+            return current;
           }
 
-          next[cacheKey] = session;
-          mutated = true;
-        }
-
-        return mutated ? next : current;
+          return {
+            ...current,
+            [nextCacheKey]: session,
+          };
+        });
       });
-    });
+    }).catch(() => {});
 
     return () => {
       cancelled = true;
     };
-  }, [appState.workspaces, desktopClient, isBootstrapping, paneLayout.panes, selectedSession, sessionViewCache]);
+  }, [appState.workspaces, desktopClient, focusedPane, isBootstrapping, sessionViewCache]);
 
   useEffect(() => {
     if (!desktopClient || isBootstrapping || hasInitializedPaneSelectionRef.current) {
@@ -2199,6 +3373,20 @@ function MainApp({ desktopClient }) {
     }
   }
 
+  async function openSettingsWindow() {
+    if (!desktopClient) {
+      return;
+    }
+
+    setSidebarError('');
+
+    try {
+      await desktopClient.openSettingsWindow();
+    } catch (error) {
+      setSidebarError(error.message);
+    }
+  }
+
   async function openWorkspaceInFinder(workspaceId) {
     if (!desktopClient || !workspaceId) {
       return;
@@ -2312,6 +3500,7 @@ function MainApp({ desktopClient }) {
       return null;
     }
 
+    clearPendingFocusedPaneSessionSync();
     setSidebarError('');
 
     try {
@@ -2402,6 +3591,8 @@ function MainApp({ desktopClient }) {
       return;
     }
 
+    clearPendingFocusedPaneSessionSync();
+
     const requestedPaneId = paneLayout.panes.some((pane) => pane.id === paneId) ? paneId : '';
     const existingPane = paneLayout.panes.find((pane) => (
       pane.id !== requestedPaneId
@@ -2442,9 +3633,101 @@ function MainApp({ desktopClient }) {
     await openSessionInPane(workspaceId, sessionId, options);
   }
 
-  async function focusPane(paneId) {
+  function clearPendingFocusedPaneSessionSync() {
+    const timerId = pendingFocusedPaneSelectionRef.current.timerId;
+    if (timerId) {
+      window.clearTimeout(timerId);
+    }
+
+    pendingFocusedPaneSelectionRef.current = {
+      paneId: '',
+      sessionId: '',
+      timerId: 0,
+      workspaceId: '',
+    };
+  }
+
+  function scheduleFocusedPaneSessionSync(pane) {
+    if (!desktopClient || !pane?.sessionId || !pane.workspaceId) {
+      return;
+    }
+
+    const pendingSelection = pendingFocusedPaneSelectionRef.current;
+    if (
+      pendingSelection.timerId
+      && pendingSelection.paneId === pane.id
+      && pendingSelection.sessionId === pane.sessionId
+      && pendingSelection.workspaceId === pane.workspaceId
+    ) {
+      return;
+    }
+
+    clearPendingFocusedPaneSessionSync();
+
+    const timerId = window.setTimeout(async () => {
+      pendingFocusedPaneSelectionRef.current = {
+        paneId: '',
+        sessionId: '',
+        timerId: 0,
+        workspaceId: '',
+      };
+
+      const latestLayout = paneLayoutRef.current;
+      const latestPane = latestLayout.panes.find((entry) => entry.id === pane.id);
+      if (
+        !latestPane
+        || latestLayout.focusedPaneId !== pane.id
+        || latestPane.sessionId !== pane.sessionId
+        || latestPane.workspaceId !== pane.workspaceId
+      ) {
+        return;
+      }
+
+      if (
+        appStateRef.current.selectedWorkspaceId === pane.workspaceId
+        && appStateRef.current.selectedSessionId === pane.sessionId
+      ) {
+        return;
+      }
+
+      try {
+        const nextState = await desktopClient.selectSession({
+          sessionId: pane.sessionId,
+          workspaceId: pane.workspaceId,
+        });
+
+        startTransition(() => {
+          setAppState(nextState);
+        });
+      } catch (error) {
+        setSidebarError(error.message);
+      }
+    }, PANE_FOCUS_SESSION_SYNC_DELAY_MS);
+
+    pendingFocusedPaneSelectionRef.current = {
+      paneId: pane.id,
+      sessionId: pane.sessionId,
+      timerId,
+      workspaceId: pane.workspaceId,
+    };
+  }
+
+  function focusPane(paneId) {
     const pane = paneLayout.panes.find((entry) => entry.id === paneId);
     if (!pane) {
+      return;
+    }
+
+    const isAlreadyFocused = paneLayout.focusedPaneId === paneId;
+    const isSessionAlreadySelected = (
+      appState.selectedWorkspaceId === pane.workspaceId
+      && appState.selectedSessionId === pane.sessionId
+    );
+
+    if (
+      isAlreadyFocused
+      && (!pane.sessionId || !pane.workspaceId || isSessionAlreadySelected)
+    ) {
       return;
     }
 
@@ -2458,30 +3741,24 @@ function MainApp({ desktopClient }) {
       return next;
     });
 
-    setPaneLayout((current) => focusPaneInLayout(current, paneId));
+    if (!isAlreadyFocused) {
+      setPaneLayout((current) => (
+        current.focusedPaneId === paneId ? current : focusPaneInLayout(current, paneId)
+      ));
+    }
 
     if (!desktopClient || !pane.sessionId || !pane.workspaceId) {
+      clearPendingFocusedPaneSessionSync();
       return;
     }
 
-    if (
-      appState.selectedWorkspaceId === pane.workspaceId
-      && appState.selectedSessionId === pane.sessionId
-    ) {
+    if (isSessionAlreadySelected) {
+      clearPendingFocusedPaneSessionSync();
       return;
     }
 
     setSidebarError('');
-
-    try {
-      const nextState = await desktopClient.selectSession({
-        sessionId: pane.sessionId,
-        workspaceId: pane.workspaceId,
-      });
-      setAppState(nextState);
-    } catch (error) {
-      setSidebarError(error.message);
-    }
+    scheduleFocusedPaneSessionSync(pane);
   }
 
   function clearPane(paneId) {
@@ -3964,36 +5241,15 @@ function MainApp({ desktopClient }) {
                 }}
               >
                 {visiblePaneViews.map((pane, paneIndex) => (
-                  <ConversationPane
+                  <EmbeddedPaneHost
                     key={pane.id}
-                    canClear={!pane.isBusy}
-                    copy={copy}
-                    language={language}
-                    maxPaneCount={maxPaneCount}
+                    desktopClient={desktopClient}
                     pane={pane}
+                    paneCount={paneLayout.panes.length}
                     paneNumber={paneIndex + 1}
-                    paneShortcutLabel={getPaneHeaderLabel(appState.platform, paneIndex + 1)}
-                    shouldFlashFinishedBorder={Boolean(paneCompletionAttention[pane.id])}
-                    onClear={handlePaneClear}
-                    onFocus={handlePaneFocus}
-                    onApprovalDecision={handleApprovalDecision}
-                    onPickAttachments={handlePanePickAttachments}
-                    platform={appState.platform}
-                    onPreparePastedAttachments={handlePanePreparePastedAttachments}
-                    onRunSlashCommand={handlePaneRunSlashCommand}
-                    onSendMessage={handlePaneSendMessage}
-                    onStopRun={handlePaneStopRun}
-                    onUpdateSessionProvider={handlePaneUpdateSessionProvider}
-                    onUpdateSessionModel={handlePaneUpdateSessionModel}
-                    onUpdateSessionReasoningEffort={handlePaneUpdateSessionReasoningEffort}
-                    onUpdateSessionPermissionMode={handlePaneUpdateSessionPermissionMode}
-                    defaultProvider={appState.defaultProvider}
-                    providerCatalog={providerCatalog}
-                    isUpdatingModel={isUpdatingModel}
-                    isUpdatingReasoningEffort={isUpdatingReasoningEffort}
-                    isUpdatingPermissionMode={isUpdatingPermissionMode}
-                    isUpdatingProvider={isUpdatingProvider}
-                    pendingApprovalActionId={pendingApprovalActionId}
+                    onPaneAssignSession={handleEmbeddedPaneAssignSession}
+                    onPaneClear={handlePaneClear}
+                    onPaneFocus={handlePaneFocus}
                   />
                 ))}
               </div>
@@ -4036,34 +5292,6 @@ function MainApp({ desktopClient }) {
             }
           }}
           onConfirm={confirmRemoveWorkspace}
-        />
-      )}
-
-      {isSettingsOpen && (
-        <SettingsDialog
-          appInfo={appInfo}
-          codeEditors={codeEditors}
-          copy={copy}
-          isPaneFinishFlashEnabled={isPaneFinishFlashEnabled}
-          isPaneSizeLimitIgnored={isPaneSizeLimitIgnored}
-          isUpdatingCodeEditor={isUpdatingCodeEditorSettings}
-          isUpdatingProviders={isUpdatingProviderSettings}
-          savingProviderSystemPromptKey={savingProviderSystemPromptKey}
-          isRefreshingProviderStatus={isRefreshingProviderStatus}
-          language={language}
-          onCodeEditorChange={handleSettingsCodeEditorChange}
-          onRefreshProviderStatus={handleSettingsRefreshProviderStatus}
-          providerSettings={providerSettings}
-          platform={appState.platform}
-          selectedCodeEditor={selectedCodeEditor}
-          themePreference={themePreference}
-          onClose={handleSettingsClose}
-          onLanguageChange={setLanguage}
-          onPaneFinishFlashEnabledChange={setIsPaneFinishFlashEnabled}
-          onPaneSizeLimitIgnoredChange={setIsPaneSizeLimitIgnored}
-          onSetProviderEnabled={handleSettingsSetProviderEnabled}
-          onSetProviderSystemPrompt={handleSettingsSetProviderSystemPrompt}
-          onThemeChange={setThemePreference}
         />
       )}
     </div>
@@ -4494,10 +5722,12 @@ const ConversationPane = memo(function ConversationPane({
     <div
       data-conversation-pane="true"
       onMouseDownCapture={() => {
-        void onFocus?.(pane.id);
+        if (!pane.isFocused) {
+          void onFocus?.(pane.id);
+        }
       }}
       className={cn(
-        'relative flex min-h-0 min-w-0 flex-col overflow-visible bg-background transition-colors duration-150',
+        'relative flex h-full min-h-0 min-w-0 flex-col overflow-visible bg-background transition-colors duration-150',
         hasFloatingOverlayOpen ? 'z-20' : (pane.isFocused ? 'z-10' : 'z-0'),
         pane.isFocused
           ? 'bg-background'
@@ -4748,7 +5978,7 @@ const ConversationPane = memo(function ConversationPane({
                     : (isComposerExpanded ? copy.noSessionCommandHintExpanded : copy.noSessionCommandHint))
               }
               className={cn(
-                'resize-none rounded-[inherit] border-0 bg-transparent pb-14 pl-3 pr-14 text-[13px] shadow-none focus-visible:ring-0',
+                'resize-none rounded-[inherit] border-0 bg-transparent pb-20 pl-3 pr-14 text-[13px] shadow-none focus-visible:ring-0',
                 hasComposerAttachments ? 'pt-16' : 'pt-3',
                 isComposerExpanded
                   ? 'h-full min-h-0 flex-1 overflow-y-auto'
@@ -5114,14 +6344,62 @@ function arePaneViewModelsEqual(left, right) {
     && left?.isOnlyPane === right?.isOnlyPane
     && left?.isOutputInProgress === right?.isOutputInProgress
     && left?.isSending === right?.isSending
+    && left?.sessionId === right?.sessionId
     && left?.shouldShowRunIndicator === right?.shouldShowRunIndicator
     && left?.title === right?.title
+    && left?.workspaceId === right?.workspaceId
     && left?.workspaceName === right?.workspaceName
     && left?.displayMessages === right?.displayMessages
     && left?.renderableMessages === right?.renderableMessages
-    && left?.session === right?.session
-    && left?.sessionMeta === right?.sessionMeta
-    && left?.workspace === right?.workspace
+    && areSessionSnapshotsEqual(left?.session, right?.session)
+    && arePaneSessionMetaEquivalent(left?.sessionMeta, right?.sessionMeta)
+    && arePaneWorkspaceEquivalent(left?.workspace, right?.workspace)
+  );
+}
+
+function arePaneSessionMetaEquivalent(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (!left && !right) {
+    return true;
+  }
+
+  if (!left || !right) {
+    return false;
+  }
+
+  return (
+    (left.id || '') === (right.id || '')
+    && Boolean(left.isRunning) === Boolean(right.isRunning)
+    && Boolean(left.providerLocked) === Boolean(right.providerLocked)
+    && (left.status || '') === (right.status || '')
+    && (left.title || '') === (right.title || '')
+    && (left.updatedAt || '') === (right.updatedAt || '')
+  );
+}
+
+function arePaneWorkspaceEquivalent(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (!left && !right) {
+    return true;
+  }
+
+  if (!left || !right) {
+    return false;
+  }
+
+  return (
+    (left.id || '') === (right.id || '')
+    && (left.name || '') === (right.name || '')
+    && (left.path || '') === (right.path || '')
+    && (left.exists !== false) === (right.exists !== false)
+    && Boolean(left.gitDirty) === Boolean(right.gitDirty)
+    && (left.gitBranch || '') === (right.gitBranch || '')
   );
 }
 
@@ -10361,6 +11639,10 @@ function areSessionSnapshotsEqual(left, right) {
     return true;
   }
 
+  if (!left && !right) {
+    return true;
+  }
+
   if (!left || !right) {
     return false;
   }
@@ -10411,16 +11693,20 @@ function resolvePaneSessionSnapshot(pane, activeSession, sessionViewCache) {
     return null;
   }
 
+  const sessionCacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
+  const cachedSession = sessionViewCache[sessionCacheKey] || null;
+
   if (
     activeSession
     && activeSession.workspaceId === pane.workspaceId
     && activeSession.id === pane.sessionId
   ) {
-    return activeSession;
+    return areSessionSnapshotsEqual(cachedSession, activeSession)
+      ? cachedSession
+      : activeSession;
   }
 
-  const sessionCacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
-  return sessionViewCache[sessionCacheKey] || null;
+  return cachedSession;
 }
 
 function createPendingPaneTurn({
@@ -10512,6 +11798,7 @@ function buildPaneViewModel({
   appState,
   copy,
   focusedPaneId,
+  includeRenderableMessages = true,
   pendingPaneTurns,
   sendingPaneIds,
   language,
@@ -10535,12 +11822,14 @@ function buildPaneViewModel({
     || sessionMeta?.status === 'running'
   );
   const isRunning = Boolean(pendingTurn || sessionRunning);
-  const renderableMessages = getRenderableMessages(
-    session,
-    language,
-    sessionRunning,
-    pendingApprovals,
-  );
+  const renderableMessages = includeRenderableMessages
+    ? getRenderableMessages(
+      session,
+      language,
+      sessionRunning,
+      pendingApprovals,
+    )
+    : EMPTY_LIST;
   const displayMessages = pendingTurn
     ? appendPendingTurnMessage(renderableMessages, pendingTurn)
     : renderableMessages;
@@ -10580,10 +11869,12 @@ function buildPaneViewModel({
     displayMessages,
     renderableMessages,
     session,
+    sessionId: pane.sessionId || session?.id || sessionMeta?.id || '',
     sessionMeta,
     shouldShowRunIndicator,
     title: sessionMeta?.title || session?.title || copy.paneEmptyTitle,
     workspace,
+    workspaceId: pane.workspaceId || workspace?.id || '',
     workspaceName: workspace?.name || '',
   };
 }
@@ -10775,6 +12066,124 @@ function getWindowView() {
   }
 
   return new URLSearchParams(window.location.search).get('view') || 'main';
+}
+
+function getWindowQueryParam(name) {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+
+  return new URLSearchParams(window.location.search).get(name) || '';
+}
+
+function getWindowNumericQueryParam(name, fallbackValue) {
+  const value = Number.parseInt(getWindowQueryParam(name), 10);
+  return Number.isInteger(value) && value > 0 ? value : fallbackValue;
+}
+
+function getWindowPaneParams() {
+  return {
+    paneCount: getWindowNumericQueryParam('paneCount', 1),
+    paneId: getWindowQueryParam('paneId') || 'pane-1',
+    paneNumber: getWindowNumericQueryParam('paneNumber', 1),
+    sessionId: getWindowQueryParam('sessionId'),
+    workspaceId: getWindowQueryParam('workspaceId'),
+  };
+}
+
+function buildEmbeddedPaneViewUrl({
+  paneCount = 1,
+  paneId = '',
+  paneNumber = 1,
+  sessionId = '',
+  workspaceId = '',
+}) {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+
+  const url = new URL(window.location.href);
+  url.searchParams.set('view', 'pane');
+  url.searchParams.set('paneCount', String(Math.max(1, paneCount || 1)));
+  url.searchParams.set('paneId', paneId || 'pane-1');
+  url.searchParams.set('paneNumber', String(Math.max(1, paneNumber || 1)));
+
+  if (workspaceId) {
+    url.searchParams.set('workspaceId', workspaceId);
+  } else {
+    url.searchParams.delete('workspaceId');
+  }
+
+  if (sessionId) {
+    url.searchParams.set('sessionId', sessionId);
+  } else {
+    url.searchParams.delete('sessionId');
+  }
+
+  return url.toString();
+}
+
+function areStandalonePaneAppStatesEquivalent(left, right, paneParams) {
+  if (left === right) {
+    return true;
+  }
+
+  return (
+    (left?.defaultProvider || '') === (right?.defaultProvider || '')
+    && (left?.platform || '') === (right?.platform || '')
+    && (left?.selectedWorkspaceId || '') === (right?.selectedWorkspaceId || '')
+    && areProviderCatalogsEquivalent(left?.providers, right?.providers)
+    && arePaneWorkspaceEquivalent(
+      getWorkspaceFromAppState(left, paneParams?.workspaceId),
+      getWorkspaceFromAppState(right, paneParams?.workspaceId),
+    )
+    && arePaneWorkspaceEquivalent(
+      getWorkspaceFromAppState(left, left?.selectedWorkspaceId),
+      getWorkspaceFromAppState(right, right?.selectedWorkspaceId),
+    )
+    && arePaneSessionMetaEquivalent(
+      getSessionMetaFromAppState(left, paneParams?.workspaceId, paneParams?.sessionId),
+      getSessionMetaFromAppState(right, paneParams?.workspaceId, paneParams?.sessionId),
+    )
+    && areSessionSnapshotsEqual(
+      getRelevantActiveSessionForPane(left, paneParams),
+      getRelevantActiveSessionForPane(right, paneParams),
+    )
+  );
+}
+
+function getWorkspaceFromAppState(state, workspaceId) {
+  if (!workspaceId || !Array.isArray(state?.workspaces)) {
+    return null;
+  }
+
+  return state.workspaces.find((workspace) => workspace.id === workspaceId) || null;
+}
+
+function getSessionMetaFromAppState(state, workspaceId, sessionId) {
+  if (!workspaceId || !sessionId) {
+    return null;
+  }
+
+  const workspace = getWorkspaceFromAppState(state, workspaceId);
+  if (!workspace || !Array.isArray(workspace.sessions)) {
+    return null;
+  }
+
+  return workspace.sessions.find((session) => session.id === sessionId) || null;
+}
+
+function getRelevantActiveSessionForPane(state, paneParams) {
+  const activeSession = state?.activeSession;
+  if (
+    !activeSession
+    || activeSession.workspaceId !== paneParams?.workspaceId
+    || activeSession.id !== paneParams?.sessionId
+  ) {
+    return null;
+  }
+
+  return activeSession;
 }
 
 function formatProviderStatusLabel(providerInfo, language) {

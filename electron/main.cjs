@@ -18,6 +18,7 @@ function createWindow() {
       nodeIntegration: false,
       preload: path.join(__dirname, 'preload.cjs'),
       sandbox: false,
+      webviewTag: true,
     },
   });
 

@@ -41,6 +41,8 @@ CC Desktop Proxy 不是一个云端代理服务，而是一个运行在你本机
   支持 provider、model、Claude mode、Codex reasoning effort、Codex plan mode 等会话级选项。
 - Provider 设置
   支持为每个 provider 单独配置启用状态、system prompt 和本地状态刷新。
+- 网络代理
+  支持在设置页为 `Claude` / `Codex` CLI 配置自定义代理环境变量，并内置连接测试；可按需覆盖子进程的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。
 
   ![Settings dialog](example_img/settings.png)
 - Slash 命令
@@ -112,6 +114,8 @@ npm run build
 | `CODEX_BIN` | Codex CLI 可执行文件路径或命令名 | `codex` |
 | `CLAUDE_CONFIG_DIR` | Claude 本地配置根目录 | `~/.claude` |
 | `CODEX_HOME` | Codex 本地配置根目录 | `~/.codex` |
+
+网络代理也可以直接在应用设置中配置。启用后，应用会把设置页中填写的代理变量注入到 `claude` / `codex` 子进程环境里；关闭后则保持应用启动时继承到的原始环境变量。
 
 macOS 发布相关变量见：
 
@@ -227,6 +231,8 @@ It is meant for developers who want to manage multiple repos and multiple agent 
   Manage provider, model, Claude mode, Codex reasoning effort, and Codex plan mode per conversation.
 - Provider settings
   Configure provider enablement, provider-level system prompts, and local status refresh from settings.
+- Network proxy settings
+  Configure custom proxy environment variables for `Claude` / `Codex` CLI subprocesses from the settings window and run a built-in connectivity test for them, including `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
 - Slash commands
   Includes `/clear`, `/model`, `/provider`, `/theme`, `/mcp`, `/skills`, plus Claude-only `/mode` and Codex-only `/reasoning` with `/effort` compatibility.
 - Skill discovery and installation
@@ -296,6 +302,8 @@ Common variables for local development and runtime:
 | `CODEX_BIN` | Codex CLI executable path or command | `codex` |
 | `CLAUDE_CONFIG_DIR` | Claude local config root | `~/.claude` |
 | `CODEX_HOME` | Codex local config root | `~/.codex` |
+
+Proxy settings can also be configured directly in the app. When enabled, the app injects the configured proxy variables into `claude` / `codex` subprocesses; when disabled, it keeps the original environment inherited at launch.
 
 For macOS release configuration, see:
 

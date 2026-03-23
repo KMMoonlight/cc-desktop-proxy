@@ -740,7 +740,14 @@ class ClaudeDesktopRuntime {
     this.store.selectedSessionId = session.id;
     this.scheduleSave();
 
-    return this.getAppState();
+    const activeRunLookup = this.getActiveRunLookup();
+    return {
+      activeSession: serializeSession(workspace, session, activeRunLookup),
+      selectedSessionId: session.id,
+      selectedWorkspaceId: workspace.id,
+      sessionMeta: serializeSessionMeta(workspace, session, activeRunLookup),
+      workspaceUpdatedAt: workspace.updatedAt,
+    };
   }
 
   removeWorkspace(workspaceId) {

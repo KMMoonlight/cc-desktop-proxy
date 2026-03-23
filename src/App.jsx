@@ -252,6 +252,55 @@ function normalizeAppInfo(appInfo) {
   };
 }
 
+function integrateCreatedSessionResult(currentState, nextState) {
+  if (nextState && typeof nextState === 'object' && Array.isArray(nextState.workspaces)) {
+    return nextState;
+  }
+
+  const workspaceId = typeof nextState?.selectedWorkspaceId === 'string' ? nextState.selectedWorkspaceId : '';
+  const sessionId = typeof nextState?.selectedSessionId === 'string' ? nextState.selectedSessionId : '';
+  const sessionMeta = nextState?.sessionMeta && typeof nextState.sessionMeta === 'object'
+    ? nextState.sessionMeta
+    : null;
+  if (!workspaceId || !sessionId || !sessionMeta || !Array.isArray(currentState?.workspaces)) {
+    return currentState;
+  }
+
+  let foundWorkspace = false;
+  const nextWorkspaces = currentState.workspaces.map((workspace) => {
+    if (workspace.id !== workspaceId) {
+      return workspace;
+    }
+
+    foundWorkspace = true;
+    const existingSessions = Array.isArray(workspace.sessions)
+      ? workspace.sessions.filter((entry) => entry.id !== sessionId)
+      : [];
+
+    return {
+      ...workspace,
+      sessions: [sessionMeta, ...existingSessions],
+      updatedAt: typeof nextState?.workspaceUpdatedAt === 'string'
+        ? nextState.workspaceUpdatedAt
+        : workspace.updatedAt,
+    };
+  });
+
+  if (!foundWorkspace) {
+    return currentState;
+  }
+
+  return {
+    ...currentState,
+    activeSession: nextState?.activeSession && typeof nextState.activeSession === 'object'
+      ? nextState.activeSession
+      : currentState.activeSession,
+    selectedSessionId: sessionId,
+    selectedWorkspaceId: workspaceId,
+    workspaces: nextWorkspaces,
+  };
+}
+
 function getPaneHeaderLabel(platform, paneNumber) {
   if (Number.isInteger(paneNumber) && paneNumber >= 1 && paneNumber <= 9) {
     return formatShortcutLabel(platform, String(paneNumber));
@@ -812,6 +861,7 @@ function MainApp({ desktopClient }) {
   const [paneCompletionAttention, setPaneCompletionAttention] = useState({});
 
   const hasHydratedExpandedWorkspaceIdsRef = useRef(false);
+  const hasSkippedInitialExpandedWorkspacePersistRef = useRef(false);
   const hasHydratedPaneLayoutRef = useRef(false);
   const hasInitializedPaneSelectionRef = useRef(false);
   const modePickerRef = useRef(null);
@@ -1152,7 +1202,7 @@ function MainApp({ desktopClient }) {
         />
       </div>
 
-      <div className="max-h-[min(48vh,30rem)] overflow-y-auto pr-1">
+      <div className="pr-1">
         <div className="space-y-3">
           {appState.workspaces.length === 0 ? (
             <SidebarEmpty text={copy.emptyWorkspaces} />
@@ -1866,6 +1916,23 @@ function MainApp({ desktopClient }) {
   }, [appState.expandedWorkspaceIds, appState.workspaces, isBootstrapping]);
 
   useEffect(() => {
+    if (!desktopClient || isBootstrapping || !hasHydratedExpandedWorkspaceIdsRef.current) {
+      return;
+    }
+
+    if (!hasSkippedInitialExpandedWorkspacePersistRef.current) {
+      hasSkippedInitialExpandedWorkspacePersistRef.current = true;
+      return;
+    }
+
+    desktopClient.setExpandedWorkspaces(expandedWorkspaceIds)
+      .then(() => {})
+      .catch((error) => {
+        setSidebarError(error.message);
+      });
+  }, [desktopClient, expandedWorkspaceIds, isBootstrapping]);
+
+  useEffect(() => {
     if (isBootstrapping) {
       return;
     }
@@ -2225,7 +2292,7 @@ function MainApp({ desktopClient }) {
         preferredProvider: getPreferredProviderForNewSession(targetWorkspace.id),
         workspaceId: targetWorkspace.id,
       });
-      setAppState(nextState);
+      setAppState((current) => integrateCreatedSessionResult(current, nextState));
       setPaneLayout((current) => assignSessionToPaneState(
         appendPaneToLayout(current),
         nextPaneId,
@@ -2252,7 +2319,7 @@ function MainApp({ desktopClient }) {
         preferredProvider: getPreferredProviderForNewSession(workspaceId, options),
         workspaceId,
       });
-      setAppState(nextState);
+      setAppState((current) => integrateCreatedSessionResult(current, nextState));
       setPaneLayout((current) => assignSessionToPaneState(current, options.paneId || current.focusedPaneId, {
         sessionId: nextState.selectedSessionId,
         workspaceId: nextState.selectedWorkspaceId,
@@ -3663,25 +3730,11 @@ function MainApp({ desktopClient }) {
   }
 
   function toggleWorkspaceExpansion(workspaceId) {
-    let nextExpandedWorkspaceIds = [];
-
     setExpandedWorkspaceIds((current) => {
-      nextExpandedWorkspaceIds = current.includes(workspaceId)
+      return current.includes(workspaceId)
         ? current.filter((id) => id !== workspaceId)
         : [...current, workspaceId];
-
-      return nextExpandedWorkspaceIds;
     });
-
-    if (!desktopClient) {
-      return;
-    }
-
-    desktopClient.setExpandedWorkspaces(nextExpandedWorkspaceIds)
-      .then(() => {})
-      .catch((error) => {
-        setSidebarError(error.message);
-      });
   }
 
   const trimmedInputValue = inputValue.trim();
@@ -4062,7 +4115,6 @@ const ConversationPane = memo(function ConversationPane({
   const modelPickerRef = useRef(null);
   const slashMenuRef = useRef(null);
   const textareaRef = useRef(null);
-  const viewportRef = useRef(null);
   const isProviderLocked = Boolean(
     pane.sessionMeta?.providerLocked
     || isSessionProviderLocked(pane.session),
@@ -4308,41 +4360,6 @@ const ConversationPane = memo(function ConversationPane({
     };
   }, [isComposerExpanded]);
 
-  // Each pane maintains its own scroll position, including background panes that
-  // continue receiving messages while another pane is focused.
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      return undefined;
-    }
-
-    let nextFrameId = 0;
-    const frameId = window.requestAnimationFrame(() => {
-      nextFrameId = window.requestAnimationFrame(() => {
-        const top = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
-        viewport.scrollTo({
-          top,
-          behavior: pane.session?.status === 'running' || pane.shouldShowRunIndicator ? 'auto' : 'smooth',
-        });
-      });
-    });
-
-    return () => {
-      window.cancelAnimationFrame(frameId);
-      if (nextFrameId) {
-        window.cancelAnimationFrame(nextFrameId);
-      }
-    };
-  }, [
-    pane.id,
-    pane.displayMessages.length,
-    pane.session?.id,
-    pane.session?.pendingApprovals?.length,
-    pane.session?.status,
-    pane.session?.updatedAt,
-    pane.shouldShowRunIndicator,
-  ]);
-
   function applySlashCommand(command) {
     if (!command) {
       return;
@@ -4582,59 +4599,14 @@ const ConversationPane = memo(function ConversationPane({
       </div>
 
       <div className="relative z-[1] flex min-h-0 flex-1 flex-col">
-        <div
-          aria-hidden={isComposerExpanded}
-          className={cn(
-            'min-h-0 flex-1 transition-opacity duration-150',
-            isComposerExpanded && 'pointer-events-none opacity-0',
-          )}
-        >
-          {pane.isLoading ? (
-            <div className="flex h-full items-center justify-center px-5">
-              <div className="px-4 py-3 text-[13px] text-muted-foreground">
-                {copy.paneLoading}
-              </div>
-            </div>
-          ) : pane.session ? (
-            <ScrollArea
-              viewportRef={viewportRef}
-              className="h-full px-3"
-              viewportClassName="[&>div]:!block [&>div]:min-w-0 [&>div]:w-full [&>div]:max-w-full"
-            >
-              <div className="flex w-full min-w-0 flex-col gap-3 py-3">
-                {pane.displayMessages.length === 0 ? (
-                  <ConversationEmptyState
-                    icon={Bot}
-                    title={copy.conversationEmpty}
-                  />
-                ) : (
-                  <>
-                    {pane.displayMessages.map((message) => (
-                      <ChatMessage
-                        key={message.id}
-                        approvalActionId={pendingApprovalActionId}
-                        language={language}
-                        message={message}
-                        onApprovalDecision={onApprovalDecision}
-                      />
-                    ))}
-                    {pane.shouldShowRunIndicator && <RunIndicator language={language} />}
-                  </>
-                )}
-              </div>
-            </ScrollArea>
-          ) : (
-            <div className="flex h-full items-center justify-center px-5">
-              <div className="max-w-sm px-5 py-6 text-center">
-                <div className="mx-auto flex h-10 w-10 items-center justify-center text-secondary-foreground">
-                  <MessageSquarePlus className="h-5 w-5" />
-                </div>
-                <p className="mt-3 text-sm font-medium text-foreground">{copy.paneEmptyTitle}</p>
-                <p className="mt-1.5 text-[13px] leading-6 text-muted-foreground">{copy.paneEmptyDescription}</p>
-              </div>
-            </div>
-          )}
-        </div>
+        <ConversationPaneBody
+          copy={copy}
+          isComposerExpanded={isComposerExpanded}
+          language={language}
+          onApprovalDecision={onApprovalDecision}
+          pane={pane}
+          pendingApprovalActionId={pendingApprovalActionId}
+        />
 
         <div
           className={cn(
@@ -4967,6 +4939,108 @@ const ConversationPane = memo(function ConversationPane({
   );
 }, areConversationPanePropsEqual);
 
+const ConversationPaneBody = memo(function ConversationPaneBody({
+  copy,
+  isComposerExpanded,
+  language,
+  onApprovalDecision,
+  pane,
+  pendingApprovalActionId,
+}) {
+  const viewportRef = useRef(null);
+
+  // Each pane maintains its own scroll position, including background panes that
+  // continue receiving messages while another pane is focused.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return undefined;
+    }
+
+    let nextFrameId = 0;
+    const frameId = window.requestAnimationFrame(() => {
+      nextFrameId = window.requestAnimationFrame(() => {
+        const top = Math.max(viewport.scrollHeight - viewport.clientHeight, 0);
+        viewport.scrollTo({
+          top,
+          behavior: pane.session?.status === 'running' || pane.shouldShowRunIndicator ? 'auto' : 'smooth',
+        });
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      if (nextFrameId) {
+        window.cancelAnimationFrame(nextFrameId);
+      }
+    };
+  }, [
+    pane.id,
+    pane.displayMessages.length,
+    pane.session?.id,
+    pane.session?.pendingApprovals?.length,
+    pane.session?.status,
+    pane.session?.updatedAt,
+    pane.shouldShowRunIndicator,
+  ]);
+
+  return (
+    <div
+      aria-hidden={isComposerExpanded}
+      className={cn(
+        'min-h-0 flex-1 transition-opacity duration-150',
+        isComposerExpanded && 'pointer-events-none opacity-0',
+      )}
+    >
+      {pane.isLoading ? (
+        <div className="flex h-full items-center justify-center px-5">
+          <div className="px-4 py-3 text-[13px] text-muted-foreground">
+            {copy.paneLoading}
+          </div>
+        </div>
+      ) : pane.session ? (
+        <ScrollArea
+          viewportRef={viewportRef}
+          className="h-full px-3"
+          viewportClassName="[&>div]:!block [&>div]:min-w-0 [&>div]:w-full [&>div]:max-w-full"
+        >
+          <div className="flex w-full min-w-0 flex-col gap-3 py-3">
+            {pane.displayMessages.length === 0 ? (
+              <ConversationEmptyState
+                icon={Bot}
+                title={copy.conversationEmpty}
+              />
+            ) : (
+              <>
+                {pane.displayMessages.map((message) => (
+                  <ChatMessage
+                    key={message.id}
+                    approvalActionId={pendingApprovalActionId}
+                    language={language}
+                    message={message}
+                    onApprovalDecision={onApprovalDecision}
+                  />
+                ))}
+                {pane.shouldShowRunIndicator && <RunIndicator language={language} />}
+              </>
+            )}
+          </div>
+        </ScrollArea>
+      ) : (
+        <div className="flex h-full items-center justify-center px-5">
+          <div className="max-w-sm px-5 py-6 text-center">
+            <div className="mx-auto flex h-10 w-10 items-center justify-center text-secondary-foreground">
+              <MessageSquarePlus className="h-5 w-5" />
+            </div>
+            <p className="mt-3 text-sm font-medium text-foreground">{copy.paneEmptyTitle}</p>
+            <p className="mt-1.5 text-[13px] leading-6 text-muted-foreground">{copy.paneEmptyDescription}</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}, areConversationPaneBodyPropsEqual);
+
 function areConversationPanePropsEqual(previousProps, nextProps) {
   return (
     previousProps.canClear === nextProps.canClear
@@ -4996,6 +5070,34 @@ function areConversationPanePropsEqual(previousProps, nextProps) {
     && previousProps.onUpdateSessionPermissionMode === nextProps.onUpdateSessionPermissionMode
     && arePaneViewModelsEqual(previousProps.pane, nextProps.pane)
     && areProviderCatalogsEquivalent(previousProps.providerCatalog, nextProps.providerCatalog)
+  );
+}
+
+function areConversationPaneBodyPropsEqual(previousProps, nextProps) {
+  return (
+    previousProps.copy === nextProps.copy
+    && previousProps.isComposerExpanded === nextProps.isComposerExpanded
+    && previousProps.language === nextProps.language
+    && previousProps.onApprovalDecision === nextProps.onApprovalDecision
+    && previousProps.pendingApprovalActionId === nextProps.pendingApprovalActionId
+    && areConversationPaneBodyViewModelsEqual(previousProps.pane, nextProps.pane)
+  );
+}
+
+function areConversationPaneBodyViewModelsEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  return (
+    left?.displayMessages === right?.displayMessages
+    && left?.id === right?.id
+    && left?.isLoading === right?.isLoading
+    && left?.shouldShowRunIndicator === right?.shouldShowRunIndicator
+    && left?.session?.id === right?.session?.id
+    && (left?.session?.pendingApprovals?.length || 0) === (right?.session?.pendingApprovals?.length || 0)
+    && left?.session?.status === right?.session?.status
+    && left?.session?.updatedAt === right?.session?.updatedAt
   );
 }
 
@@ -6835,6 +6937,8 @@ const AssistantMarkdownSegment = memo(function AssistantMarkdownSegment({ conten
 ));
 
 const ChatMessage = memo(function ChatMessage({ approvalActionId, language, message, onApprovalDecision }) {
+  const [copied, setCopied] = useState(false);
+
   if (message.role === 'event') {
     return <EventMessage language={language} message={message} />;
   }
@@ -6889,31 +6993,36 @@ const ChatMessage = memo(function ChatMessage({ approvalActionId, language, mess
     if (!message.content) return;
     try {
       await copyTextToClipboard(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     } catch (error) {
       console.error('Failed to copy message:', error);
     }
   };
 
   return (
-    <div className="flex min-w-0 items-start justify-end gap-2.5">
+    <div className="flex min-w-0 items-start justify-end gap-1.5">
+      {message.content ? (
+        <button
+          type="button"
+          onClick={handleCopyMessage}
+          className={cn(
+            "mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded transition-colors",
+            copied
+              ? "text-green-600 dark:text-green-500"
+              : "text-muted-foreground/40 hover:bg-muted/50 hover:text-foreground"
+          )}
+          aria-label={language === 'zh' ? '复制消息' : 'Copy message'}
+          title={copied ? (language === 'zh' ? '已复制' : 'Copied') : (language === 'zh' ? '复制消息' : 'Copy message')}
+        >
+          {copied ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+        </button>
+      ) : null}
       <div className="user-bubble-message min-w-0 max-w-[min(100%,42rem)] overflow-hidden rounded-2xl border px-2.5 py-2">
         {messageAttachments.length > 0 ? <MessageAttachmentList attachments={messageAttachments} /> : null}
         {message.content ? (
           <div className={cn('whitespace-pre-wrap break-words text-[13px] leading-6', messageAttachments.length > 0 && 'mt-2')}>
             {message.content}
-          </div>
-        ) : null}
-        {message.content ? (
-          <div className="mt-1 flex justify-end">
-            <button
-              type="button"
-              onClick={handleCopyMessage}
-              className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-muted/50 hover:text-foreground"
-              aria-label={language === 'zh' ? '复制消息' : 'Copy message'}
-              title={language === 'zh' ? '复制消息' : 'Copy message'}
-            >
-              <Copy className="h-3.5 w-3.5" />
-            </button>
           </div>
         ) : null}
       </div>

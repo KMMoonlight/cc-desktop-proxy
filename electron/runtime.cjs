@@ -306,10 +306,12 @@ class ClaudeDesktopRuntime {
       return;
     }
 
-    const registerStateHandler = (channel, handler) => {
+    const registerStateHandler = (channel, handler, options = {}) => {
       ipcMain.handle(channel, async (event, payload) => {
         const result = await handler(event, payload);
-        this.emitState(event.sender);
+        this.emitState(event.sender, {
+          excludeSender: options.excludeSender === true,
+        });
         return this.projectResultForSender(event.sender, result);
       });
     };
@@ -357,9 +359,15 @@ class ClaudeDesktopRuntime {
       this.runMcpCommand(payload?.workspaceId, payload?.sessionId, payload?.args)
     ));
     registerStateHandler('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId));
-    registerStateHandler('desktop:select-session', (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId));
+    registerStateHandler(
+      'desktop:select-session',
+      (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId),
+    );
     registerStateHandler('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
-    registerStateHandler('desktop:set-pane-layout', (_event, paneLayout) => this.setPaneLayout(paneLayout));
+    registerStateHandler(
+      'desktop:set-pane-layout',
+      (_event, paneLayout) => this.setPaneLayout(paneLayout),
+    );
     ipcMain.handle('desktop:respond-to-approval', async (event, payload) => (
       this.projectResultForSender(event.sender, await this.respondToApproval(event.sender, payload))
     ));
@@ -524,8 +532,9 @@ class ClaudeDesktopRuntime {
   }
 
   buildPaneAppState(recipientContext, context) {
-    const paneWorkspace = this.findWorkspace(recipientContext?.workspaceId);
-    const paneSession = paneWorkspace?.sessions.find((session) => session.id === recipientContext?.sessionId && !session.archived) || null;
+    const resolvedRecipientContext = this.resolvePaneRecipientContext(recipientContext);
+    const paneWorkspace = this.findWorkspace(resolvedRecipientContext?.workspaceId);
+    const paneSession = paneWorkspace?.sessions.find((session) => session.id === resolvedRecipientContext?.sessionId && !session.archived) || null;
     const selectedWorkspaceId = paneWorkspace?.id || this.store.selectedWorkspaceId || null;
     const selectedSessionId = paneSession?.id || (paneWorkspace ? null : this.store.selectedSessionId);
     const providerWorkspacePath = paneWorkspace?.path
@@ -548,6 +557,25 @@ class ClaudeDesktopRuntime {
     });
   }
 
+  resolvePaneRecipientContext(recipientContext) {
+    if (recipientContext?.view !== 'pane' || !recipientContext.paneId) {
+      return recipientContext;
+    }
+
+    const pane = Array.isArray(this.store.paneLayout?.panes)
+      ? this.store.paneLayout.panes.find((entry) => entry?.id === recipientContext.paneId) || null
+      : null;
+    if (!pane) {
+      return recipientContext;
+    }
+
+    return {
+      ...recipientContext,
+      sessionId: pane.sessionId || '',
+      workspaceId: pane.workspaceId || '',
+    };
+  }
+
   getAppState(options = {}) {
     const context = this.createStateSerializationContext(options);
     return this.buildGlobalAppState(context, options);
@@ -555,7 +583,7 @@ class ClaudeDesktopRuntime {
 
   getAppStateForRecipient(contents, options = {}) {
     const context = this.createStateSerializationContext(options);
-    const recipientContext = getStateRecipientContext(contents);
+    const recipientContext = this.resolvePaneRecipientContext(getStateRecipientContext(contents));
 
     if (recipientContext?.view === 'pane') {
       return this.buildPaneAppState(recipientContext, context);
@@ -1751,11 +1779,14 @@ class ClaudeDesktopRuntime {
         }
 
         if (code !== 0 && !postRunApproval && !hasRecentErrorEvent(sessionRef.session)) {
+          const codexCapabilityFailure = normalizeSessionProvider(runState.provider || sessionRef.session.provider) === 'codex'
+            ? (typeof runState.codexCapabilityFailure === 'string' ? runState.codexCapabilityFailure.trim() : '')
+            : '';
           this.appendEventMessage(sessionRef.workspace, sessionRef.session, {
             kind: 'error',
             status: 'error',
-            title: `${providerLabel} 运行失败`,
-            content: formatProcessFailure(providerLabel, code, runState.stderrBuffer),
+            title: codexCapabilityFailure ? 'Codex 返回错误' : `${providerLabel} 运行失败`,
+            content: codexCapabilityFailure || formatProcessFailure(providerLabel, code, runState.stderrBuffer),
           });
         }
 
@@ -2118,7 +2149,10 @@ class ClaudeDesktopRuntime {
       session.updatedAt = now;
       this.touchWorkspace(workspace, now);
       const failureContent = formatCodexTurnFailure(event, runState.stderrBuffer);
-      if (!looksLikeCodexPermissionDenied(failureContent, runState.codexSandboxMode)) {
+      const pendingCapabilityApproval = shouldQueueCodexWriteApproval(session)
+        ? captureCodexCapabilityFailure(runState, failureContent)
+        : '';
+      if (!pendingCapabilityApproval) {
         this.appendEventMessage(workspace, session, {
           kind: 'error',
           status: 'error',
@@ -2135,7 +2169,10 @@ class ClaudeDesktopRuntime {
       session.updatedAt = now;
       this.touchWorkspace(workspace, now);
       const failureContent = formatCodexTurnFailure(event, runState.stderrBuffer);
-      if (!looksLikeCodexPermissionDenied(failureContent, runState.codexSandboxMode)) {
+      const pendingCapabilityApproval = shouldQueueCodexWriteApproval(session)
+        ? captureCodexCapabilityFailure(runState, failureContent)
+        : '';
+      if (!pendingCapabilityApproval) {
         this.appendEventMessage(workspace, session, {
           kind: 'error',
           status: 'error',
@@ -2681,6 +2718,7 @@ class ClaudeDesktopRuntime {
 
     runState.assistantMessageId = null;
     runState.codexApprovalPayload = null;
+    runState.codexCapabilityFailure = '';
     runState.codexSandboxMode = '';
     runState.currentAssistantText = '';
     runState.hasStreamedAssistantText = false;
@@ -2780,11 +2818,18 @@ class ClaudeDesktopRuntime {
 
     const context = this.createStateSerializationContext(options);
     const stateCache = new Map();
-    const senderContext = getStateRecipientContext(webContents);
+    const senderContext = this.resolvePaneRecipientContext(getStateRecipientContext(webContents));
+    const excludedSenderId = options.excludeSender && webContents && !webContents.isDestroyed()
+      ? webContents.id
+      : 0;
 
     for (const contents of this.getStateRecipients()) {
       try {
-        const recipientContext = getStateRecipientContext(contents);
+        if (excludedSenderId && contents.id === excludedSenderId) {
+          continue;
+        }
+
+        const recipientContext = this.resolvePaneRecipientContext(getStateRecipientContext(contents));
         if (!shouldEmitStateToRecipient(senderContext, recipientContext, options)) {
           continue;
         }
@@ -3629,12 +3674,7 @@ function maybeCreateCodexEscalationApproval(workspace, session, runState, assist
   }
 
   const targetSandboxMode = inferCodexEscalationSandboxMode(
-    [
-      typeof assistantMessage?.content === 'string' ? assistantMessage.content : '',
-      runState.stderrBuffer,
-    ]
-      .filter(Boolean)
-      .join('\n'),
+    getCodexEscalationContext(runState, assistantMessage),
     runState.codexSandboxMode,
   );
   if (!targetSandboxMode) {
@@ -3649,6 +3689,27 @@ function maybeCreateCodexEscalationApproval(workspace, session, runState, assist
     ...runState.codexApprovalPayload,
     sandboxMode: targetSandboxMode,
   });
+}
+
+function getCodexEscalationContext(runState, assistantMessage) {
+  return [
+    typeof assistantMessage?.content === 'string' ? assistantMessage.content : '',
+    typeof runState?.codexCapabilityFailure === 'string' ? runState.codexCapabilityFailure : '',
+    runState?.stderrBuffer,
+  ]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join('\n');
+}
+
+function captureCodexCapabilityFailure(runState, failureContent) {
+  if (!runState) {
+    return '';
+  }
+
+  const normalizedFailureContent = typeof failureContent === 'string' ? failureContent.trim() : '';
+  const targetSandboxMode = inferCodexEscalationSandboxMode(normalizedFailureContent, runState.codexSandboxMode);
+  runState.codexCapabilityFailure = targetSandboxMode ? normalizedFailureContent : '';
+  return targetSandboxMode;
 }
 
 function inferCodexEscalationSandboxMode(text, currentSandboxMode) {
@@ -3680,8 +3741,8 @@ function inferCodexEscalationSandboxMode(text, currentSandboxMode) {
     chineseWriteApprovalHintPattern.test(normalized) && chineseWriteActionPattern.test(normalized)
   );
 
-  const englishDangerRestrictionPattern = /network access|internet access|outbound network|socket access|dns resolution|resolve host|connection timed out|connection refused|tls handshake|certificate verify failed|outside the workspace|outside current workspace|outside of the workspace|outside the current working directory|outside the repo|not in writable roots|requires full access|dangerously-bypass-approvals-and-sandbox|blocked by sandbox|sandbox restriction|sandbox blocked|requires network|needs network|external path|outside allowed directories/;
-  const chineseDangerRestrictionPattern = /无法联网|不能联网|没法联网|网络受限|网络访问受限|无法访问网络|不能访问网络|无法访问外网|不能访问外网|无法解析域名|不能解析域名|dns|无法下载依赖|不能下载依赖|无法访问工作目录外|不能访问工作目录外|工作目录之外|当前工作目录之外|外部路径|沙箱限制|受沙箱限制|解除沙箱|完全访问|更高系统权限|更高权限的操作/;
+  const englishDangerRestrictionPattern = /network access|internet access|outbound network|socket access|dns resolution|resolve host|connection timed out|connection refused|tls handshake|certificate verify failed|outside the workspace|outside current workspace|outside of the workspace|outside the current working directory|outside the repo|not in writable roots|requires full access|dangerously-bypass-approvals-and-sandbox|blocked by sandbox|sandbox restriction|sandbox blocked|requires network|needs network|external path|outside allowed directories|environment restriction|environment restrictions|restricted environment|network is disabled|internet is disabled|host lookup|name resolution/;
+  const chineseDangerRestrictionPattern = /无法联网|不能联网|没法联网|网络受限|网络访问受限|无法访问网络|不能访问网络|无法访问外网|不能访问外网|无法解析域名|不能解析域名|dns|无法下载依赖|不能下载依赖|无法访问工作目录外|不能访问工作目录外|工作目录之外|当前工作目录之外|外部路径|沙箱限制|受沙箱限制|环境限制|环境受限|当前环境受限|解除沙箱|完全访问|更高系统权限|更高权限的操作/;
   const dangerPermissionDenied = (
     englishDangerRestrictionPattern.test(normalized) && englishFailurePattern.test(normalized)
   ) || (
@@ -3699,16 +3760,13 @@ function inferCodexEscalationSandboxMode(text, currentSandboxMode) {
   return writePermissionDenied ? 'workspace-write' : '';
 }
 
-function looksLikeCodexPermissionDenied(text, currentSandboxMode) {
-  return Boolean(inferCodexEscalationSandboxMode(text, currentSandboxMode));
-}
-
 function prepareRunStateForPendingApproval(runState, approval) {
   if (!runState || !approval) {
     return;
   }
 
   runState.assistantMessageId = null;
+  runState.codexCapabilityFailure = '';
   runState.currentAssistantText = '';
   runState.hasStreamedAssistantText = false;
   runState.process = null;
@@ -3748,6 +3806,7 @@ function resetRunStateForExecution(runState, provider, workspaceId, sessionId) {
 
   runState.assistantMessageId = null;
   runState.codexApprovalPayload = null;
+  runState.codexCapabilityFailure = '';
   runState.codexSandboxMode = '';
   runState.currentAssistantText = '';
   runState.hasStreamedAssistantText = false;
@@ -4499,6 +4558,7 @@ function createRunState(workspaceId = null, sessionId = null) {
   return {
     assistantMessageId: null,
     codexApprovalPayload: null,
+    codexCapabilityFailure: '',
     codexSandboxMode: '',
     currentAssistantText: '',
     hasStreamedAssistantText: false,
@@ -6674,11 +6734,20 @@ function truncateText(value, maxLength) {
     return '';
   }
 
-  if (value.length <= maxLength) {
-    return value;
+  const normalizedValue = typeof value === 'string'
+    ? value
+    : stringifyValue(value);
+  const text = typeof normalizedValue === 'string' ? normalizedValue : String(normalizedValue || '');
+
+  if (!text) {
+    return '';
   }
 
-  return `${value.slice(0, maxLength)}...`;
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, maxLength)}...`;
 }
 
 function stripAnsi(value) {

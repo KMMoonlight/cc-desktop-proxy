@@ -17,6 +17,7 @@ const {
 } = require('electron');
 
 const CONFIG_FILE_NAME = 'claude-desktop-config.json';
+const CONFIG_BACKUP_SUFFIX = '.bak';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const DEFAULT_PROVIDER = 'claude';
@@ -24,6 +25,7 @@ const EMPTY_ASSISTANT_TEXT = '（本轮没有收到可展示的文本输出）';
 const EMPTY_TREE_HASH = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const SCHEMA_VERSION = 9;
 const SAVE_DEBOUNCE_MS = 160;
+const RUN_STATE_SAVE_DEBOUNCE_MS = 1200;
 const CLAUDE_CHECK_TTL_MS = 30_000;
 const CODE_EDITOR_CHECK_TTL_MS = 30_000;
 const DEFAULT_NETWORK_PROXY_TEST_TARGET = 'google.com';
@@ -33,7 +35,8 @@ const STDERR_BUFFER_LIMIT = 6000;
 const SESSION_MESSAGE_SUMMARY_CACHE_MAX_SIZE = 600;
 const SERIALIZED_WORKSPACE_CACHE_MAX_SIZE = 120;
 const WORKSPACE_GIT_INFO_TTL_MS = 10_000;
-const STATE_EMIT_THROTTLE_MS = 120;
+const STATE_EMIT_THROTTLE_MS = 160;
+const BACKGROUND_STATE_EMIT_THROTTLE_MS = 240;
 const PASTED_ATTACHMENT_DIR_NAME = 'pasted-attachments';
 const SESSION_PERMISSION_MODES = new Set([
   'acceptEdits',
@@ -268,10 +271,13 @@ const MIME_TYPE_TO_EXTENSION = {
 class ClaudeDesktopRuntime {
   constructor() {
     this.configPath = path.join(app.getPath('userData'), CONFIG_FILE_NAME);
+    this.configBackupPath = `${this.configPath}${CONFIG_BACKUP_SUFFIX}`;
     this.defaultPickerPath = path.resolve(process.cwd());
     this.handlersRegistered = false;
     this.pendingStateEmitTimers = new Map();
     this.saveTimer = null;
+    this.saveInFlight = null;
+    this.saveQueued = false;
     this.claudeInfo = {
       available: null,
       checkedAt: 0,
@@ -311,6 +317,7 @@ class ClaudeDesktopRuntime {
         const result = await handler(event, payload);
         this.emitState(event.sender, {
           excludeSender: options.excludeSender === true,
+          lightweight: options.lightweight === true,
         });
         return this.projectResultForSender(event.sender, result);
       });
@@ -340,33 +347,61 @@ class ClaudeDesktopRuntime {
       const browserWindow = this.resolveBrowserWindowForSender(event.sender);
       return this.pickWorkspaceDirectory(browserWindow);
     });
-    registerStateHandler('desktop:add-workspace', (_event, workspacePath) => this.addWorkspace(workspacePath));
-    registerStateHandler('desktop:archive-session', (_event, payload) => this.archiveSession(payload?.workspaceId, payload?.sessionId));
+    registerStateHandler('desktop:add-workspace', (_event, workspacePath) => this.addWorkspace(workspacePath), {
+      excludeSender: true,
+    });
+    registerStateHandler('desktop:archive-session', (_event, payload) => this.archiveSession(payload?.workspaceId, payload?.sessionId), {
+      excludeSender: true,
+    });
     registerStateHandler('desktop:create-session', (_event, payload) => (
       this.createSession(
         typeof payload === 'string' ? payload : payload?.workspaceId,
         typeof payload === 'string' ? '' : payload?.preferredProvider,
       )
-    ));
+    ), {
+      excludeSender: true,
+    });
     registerStateHandler('desktop:install-skill', (_event, payload) => (
       this.installSkill(payload?.workspaceId, payload?.sessionId, payload?.args)
     ));
     registerStateHandler('desktop:list-skills', (_event, payload) => (
       this.listSkills(payload?.workspaceId, payload?.sessionId)
     ));
-    registerStateHandler('desktop:remove-workspace', (_event, workspaceId) => this.removeWorkspace(workspaceId));
-    registerStateHandler('desktop:run-mcp-command', (_event, payload) => (
-      this.runMcpCommand(payload?.workspaceId, payload?.sessionId, payload?.args)
+    registerStateHandler('desktop:remove-workspace', (_event, workspaceId) => this.removeWorkspace(workspaceId), {
+      excludeSender: true,
+    });
+    registerStateHandler('desktop:run-mcp-command', (event, payload) => (
+      this.runMcpCommand(event.sender, payload?.workspaceId, payload?.sessionId, payload?.args)
     ));
-    registerStateHandler('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId));
+    registerStateHandler('desktop:select-workspace', (_event, workspaceId) => this.selectWorkspace(workspaceId), {
+      excludeSender: true,
+    });
     registerStateHandler(
       'desktop:select-session',
       (_event, payload) => this.selectSession(payload?.workspaceId, payload?.sessionId),
+      {
+        excludeSender: true,
+      },
     );
-    registerStateHandler('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds));
+    registerStateHandler('desktop:set-expanded-workspaces', (_event, workspaceIds) => this.setExpandedWorkspaces(workspaceIds), {
+      excludeSender: true,
+      lightweight: true,
+    });
     registerStateHandler(
       'desktop:set-pane-layout',
       (_event, paneLayout) => this.setPaneLayout(paneLayout),
+      {
+        excludeSender: true,
+        lightweight: true,
+      },
+    );
+    registerStateHandler(
+      'desktop:set-pane-focus',
+      (_event, payload) => this.setPaneFocus(payload?.paneId),
+      {
+        excludeSender: true,
+        lightweight: true,
+      },
     );
     ipcMain.handle('desktop:respond-to-approval', async (event, payload) => (
       this.projectResultForSender(event.sender, await this.respondToApproval(event.sender, payload))
@@ -531,7 +566,7 @@ class ClaudeDesktopRuntime {
     });
   }
 
-  buildPaneAppState(recipientContext, context) {
+  buildPaneAppState(recipientContext, context, options = {}) {
     const resolvedRecipientContext = this.resolvePaneRecipientContext(recipientContext);
     const paneWorkspace = this.findWorkspace(resolvedRecipientContext?.workspaceId);
     const paneSession = paneWorkspace?.sessions.find((session) => session.id === resolvedRecipientContext?.sessionId && !session.archived) || null;
@@ -540,9 +575,11 @@ class ClaudeDesktopRuntime {
     const providerWorkspacePath = paneWorkspace?.path
       || this.findWorkspace(selectedWorkspaceId)?.path
       || '';
-    const activeSession = paneWorkspace && paneSession
+    const activeSession = options?.includeActiveSession === false
+      ? null
+      : (paneWorkspace && paneSession
       ? serializeSession(paneWorkspace, paneSession, context.activeRunLookup)
-      : null;
+      : null);
 
     return this.createAppStatePayload(context, {
       activeSession,
@@ -555,6 +592,33 @@ class ClaudeDesktopRuntime {
         true,
       ),
     });
+  }
+
+  buildSessionMetaDelta(recipientContext, context) {
+    const resolvedRecipientContext = this.resolvePaneRecipientContext(recipientContext);
+    if (
+      resolvedRecipientContext?.view !== 'pane'
+      || !resolvedRecipientContext.workspaceId
+      || !resolvedRecipientContext.sessionId
+    ) {
+      return null;
+    }
+
+    const workspace = this.findWorkspace(resolvedRecipientContext.workspaceId);
+    const session = workspace?.sessions.find((entry) => (
+      entry.id === resolvedRecipientContext.sessionId && !entry.archived
+    )) || null;
+    if (!workspace || !session) {
+      return null;
+    }
+
+    return {
+      sessionId: session.id,
+      sessionMeta: serializeSessionMeta(workspace, session, context.activeRunLookup),
+      type: 'session-meta-delta',
+      workspaceId: workspace.id,
+      workspaceUpdatedAt: workspace.updatedAt,
+    };
   }
 
   resolvePaneRecipientContext(recipientContext) {
@@ -995,10 +1059,18 @@ class ClaudeDesktopRuntime {
     }
 
     this.store.selectedWorkspaceId = workspace.id;
-    this.store.selectedSessionId = getLatestVisibleSession(workspace)?.id || null;
+    const session = getLatestVisibleSession(workspace) || null;
+    this.store.selectedSessionId = session?.id || null;
     this.scheduleSave();
 
-    return this.getAppState();
+    const activeRunLookup = this.getActiveRunLookup();
+    return {
+      activeSession: session ? serializeSession(workspace, session, activeRunLookup) : null,
+      selectedSessionId: session?.id || null,
+      selectedWorkspaceId: workspace.id,
+      sessionMeta: session ? serializeSessionMeta(workspace, session, activeRunLookup) : null,
+      workspaceUpdatedAt: workspace.updatedAt,
+    };
   }
 
   selectSession(workspaceId, sessionId) {
@@ -1016,7 +1088,14 @@ class ClaudeDesktopRuntime {
     this.store.selectedSessionId = session.id;
     this.scheduleSave();
 
-    return this.getAppState();
+    const activeRunLookup = this.getActiveRunLookup();
+    return {
+      activeSession: serializeSession(workspace, session, activeRunLookup),
+      selectedSessionId: session.id,
+      selectedWorkspaceId: workspace.id,
+      sessionMeta: serializeSessionMeta(workspace, session, activeRunLookup),
+      workspaceUpdatedAt: workspace.updatedAt,
+    };
   }
 
   archiveSession(workspaceId, sessionId) {
@@ -1065,6 +1144,24 @@ class ClaudeDesktopRuntime {
   setPaneLayout(paneLayout) {
     this.store.paneLayout = normalizePaneLayoutState(paneLayout);
     this.scheduleSave();
+    return this.store.paneLayout;
+  }
+
+  setPaneFocus(paneId) {
+    const normalizedPaneId = typeof paneId === 'string' ? paneId.trim() : '';
+    const currentLayout = normalizePaneLayoutState(this.store.paneLayout);
+    if (!normalizedPaneId || !currentLayout?.panes.some((pane) => pane.id === normalizedPaneId)) {
+      return currentLayout;
+    }
+
+    if (currentLayout.focusedPaneId === normalizedPaneId) {
+      return currentLayout;
+    }
+
+    this.store.paneLayout = {
+      ...currentLayout,
+      focusedPaneId: normalizedPaneId,
+    };
     return this.store.paneLayout;
   }
 
@@ -1380,13 +1477,47 @@ class ClaudeDesktopRuntime {
     return testNetworkProxyConnections(networkProxy, testTarget);
   }
 
-  runMcpCommand(workspaceId, sessionId, rawArgs) {
+  runMcpCommand(webContents, workspaceId, sessionId, rawArgs) {
     const { workspace, session } = this.requireCommandSession(workspaceId, sessionId);
     const provider = this.assertProviderEnabled(session.provider);
+    const providerLabel = getProviderLabel(provider);
     const args = tokenizeCliArgs(rawArgs);
     if (args.length === 0) {
       throw new Error('请使用 /mcp list、/mcp get <name>、/mcp add ... 或 /mcp remove <name>。');
     }
+
+    const existingRun = this.findActiveRunState(workspace.id, session.id);
+    if (existingRun) {
+      throw new Error(`当前已有正在运行或等待审批的 ${providerLabel} 任务，请等待完成或先处理审批。`);
+    }
+
+    this.assertDirectory(workspace.path);
+
+    const cliEnv = getCliProcessEnv(false, this.store.networkProxy);
+    const executablePath = this.getProviderInfo(provider).executablePath || resolveProviderExecutablePath(provider, cliEnv);
+    if (!executablePath) {
+      throw new Error(`未检测到可用的 ${providerLabel} CLI。`);
+    }
+
+    const runState = this.getRunState(webContents.id, workspace.id, session.id);
+    const pendingApproval = createMcpCommandPendingApproval(workspace, {
+      args,
+      provider,
+      rawArgs,
+    });
+
+    resetRunStateForExecution(runState, provider, workspace.id, session.id);
+    runState.pendingApprovalRequests.set(pendingApproval.requestId, pendingApproval);
+    session.updatedAt = pendingApproval.createdAt;
+    this.touchWorkspace(workspace, session.updatedAt);
+    this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+    this.scheduleStateEmit(webContents);
+
+    return this.getAppState();
+  }
+
+  executeMcpCommand(workspace, session, provider, rawArgs, args) {
+    this.assertDirectory(workspace.path);
 
     const cliEnv = getCliProcessEnv(false, this.store.networkProxy);
     const executablePath = this.getProviderInfo(provider).executablePath || resolveProviderExecutablePath(provider, cliEnv);
@@ -1400,17 +1531,18 @@ class ClaudeDesktopRuntime {
       env: cliEnv,
     });
 
-    const content = [result.stdout, result.stderr].filter(Boolean).join('\n').trim() || '命令已执行，但没有返回内容。';
+    const content = [result.stdout, result.stderr, result.error?.message]
+      .filter(Boolean)
+      .join('\n')
+      .trim() || '命令已执行，但没有返回内容。';
     this.appendEventMessage(workspace, session, {
       commandSource: 'slash',
       kind: 'command',
-      status: result.status === 0 ? 'info' : 'error',
-      title: `/mcp ${args.join(' ')}`,
+      status: result.status === 0 && !result.error ? 'info' : 'error',
+      title: formatSlashMcpCommandTitle(rawArgs, args),
       content: truncateText(content, STDERR_BUFFER_LIMIT),
     });
     this.scheduleSave();
-
-    return this.getAppState();
   }
 
   listSkills(workspaceId, sessionId) {
@@ -1535,12 +1667,16 @@ class ClaudeDesktopRuntime {
     this.store.selectedSessionId = session.id;
 
     const autoApprovedCodexSandboxMode = getAutoApprovedCodexSandboxMode(workspace, session) || undefined;
+    const resolvedCodexSandboxMode = provider === 'codex'
+      ? resolveCodexSandboxMode(session.permissionMode, autoApprovedCodexSandboxMode)
+      : '';
+    const promptRequestedCodexSandboxMode = provider === 'codex' && shouldQueueCodexWriteApproval(session)
+      ? inferCodexPromptSandboxMode(prompt, displayPrompt, displayKind)
+      : '';
     if (
       provider === 'codex'
       && shouldQueueCodexWriteApproval(session)
-      && !autoApprovedCodexSandboxMode
-      && resolveCodexSandboxMode(session.permissionMode, autoApprovedCodexSandboxMode) === 'read-only'
-      && promptLikelyNeedsCodexWorkspaceWrite(prompt, displayPrompt, displayKind)
+      && needsCodexSandboxEscalation(resolvedCodexSandboxMode, promptRequestedCodexSandboxMode)
     ) {
       const runState = this.getRunState(webContents.id, workspace.id, session.id);
       this.enqueueCodexWriteApproval(webContents, workspace, session, runState, {
@@ -1549,6 +1685,7 @@ class ClaudeDesktopRuntime {
         displayPrompt,
         displayTitle,
         prompt,
+        sandboxMode: promptRequestedCodexSandboxMode,
       });
       return this.getAppState();
     }
@@ -1601,7 +1738,7 @@ class ClaudeDesktopRuntime {
     }
 
     this.touchWorkspace(workspace, now);
-    this.scheduleSave();
+    this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
     this.scheduleStateEmit(webContents);
     return { ok: true };
   }
@@ -1711,7 +1848,7 @@ class ClaudeDesktopRuntime {
     runState.codexSandboxMode = codexSandboxMode;
     runState.targetCodexPlanModeActive = codexTurn.targetPlanModeActive;
     this.touchWorkspace(workspace, now);
-    this.scheduleSave();
+    this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
     this.scheduleStateEmit(webContents);
 
     let buffer = '';
@@ -1813,16 +1950,16 @@ class ClaudeDesktopRuntime {
       if (postRunApproval) {
         rewindSessionMessagesForPendingApproval(sessionRef.session, runState);
         prepareRunStateForPendingApproval(runState, postRunApproval);
-        this.scheduleSave();
-        this.emitState(webContents);
+        this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+        this.emitState(webContents, { sessionScoped: true });
         return;
       }
 
       this.resetRunState(runState);
       this.deleteRunState(webContents.id, workspace.id, session.id);
 
-      this.scheduleSave();
-      this.emitState(webContents);
+      this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+      this.emitState(webContents, { sessionScoped: true });
     });
 
     proc.on('error', (error) => {
@@ -1855,8 +1992,8 @@ class ClaudeDesktopRuntime {
       this.resetRunState(runState);
       this.deleteRunState(webContents.id, workspace.id, session.id);
 
-      this.scheduleSave();
-      this.emitState(webContents);
+      this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+      this.emitState(webContents, { sessionScoped: true });
     });
 
     if (provider !== 'codex') {
@@ -1893,27 +2030,47 @@ class ClaudeDesktopRuntime {
     }
 
     if (!runState.process) {
-      if (!isQueuedCodexWriteApproval(pendingApproval)) {
-        throw new Error('当前没有正在运行的任务。');
-      }
-
       const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
       if (!sessionRef) {
         throw new Error('找不到对应的历史对话。');
       }
 
       runState.pendingApprovalRequests.delete(requestId);
-      if (decision === 'allow_always') {
-        addWorkspaceApprovalRule(sessionRef.workspace, createApprovalRuleFromPendingApproval(pendingApproval));
-        this.touchWorkspace(sessionRef.workspace);
-        this.scheduleSave();
-      }
       if (decision === 'deny') {
         this.resetRunState(runState);
         this.deleteRunState(webContents.id, sessionRef.workspace.id, sessionRef.session.id);
         this.scheduleSave();
-        this.emitState(webContents);
+        this.emitState(webContents, { sessionScoped: true });
         return this.getAppState();
+      }
+
+      if (isQueuedMcpCommandApproval(pendingApproval)) {
+        const queuedMcpOptions = getQueuedMcpCommandApprovalOptions(pendingApproval);
+        try {
+          this.executeMcpCommand(
+            sessionRef.workspace,
+            sessionRef.session,
+            queuedMcpOptions?.provider || sessionRef.session.provider,
+            queuedMcpOptions?.rawArgs || '',
+            queuedMcpOptions?.args || [],
+          );
+        } finally {
+          this.resetRunState(runState);
+          this.deleteRunState(webContents.id, sessionRef.workspace.id, sessionRef.session.id);
+          this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+          this.emitState(webContents, { sessionScoped: true });
+        }
+        return this.getAppState();
+      }
+
+      if (!isQueuedCodexWriteApproval(pendingApproval)) {
+        throw new Error('当前没有正在运行的任务。');
+      }
+
+      if (decision === 'allow_always') {
+        addWorkspaceApprovalRule(sessionRef.workspace, createApprovalRuleFromPendingApproval(pendingApproval));
+        this.touchWorkspace(sessionRef.workspace);
+        this.scheduleSave();
       }
 
       const queuedApprovalOptions = getQueuedCodexWriteApprovalOptions(pendingApproval);
@@ -1943,7 +2100,7 @@ class ClaudeDesktopRuntime {
     );
 
     runState.pendingApprovalRequests.delete(requestId);
-    this.emitState(webContents);
+    this.emitState(webContents, { sessionScoped: true });
     return this.getAppState();
   }
 
@@ -1972,8 +2129,8 @@ class ClaudeDesktopRuntime {
     this.resetRunState(runState);
     this.deleteRunState(webContents.id, sessionRef?.workspace.id, sessionRef?.session.id);
 
-    this.scheduleSave();
-    this.emitState(webContents);
+    this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+    this.emitState(webContents, { sessionScoped: true });
 
     return this.getAppState();
   }
@@ -2008,7 +2165,7 @@ class ClaudeDesktopRuntime {
     this.windowRuns.delete(contentsId);
   }
 
-  disposeAll() {
+  async disposeAll() {
     for (const browserWindow of this.gitDiffWindows.values()) {
       if (!browserWindow.isDestroyed()) {
         browserWindow.destroy();
@@ -2020,7 +2177,7 @@ class ClaudeDesktopRuntime {
       this.disposeWindow(contentsId);
     }
 
-    this.flushSave();
+    await this.flushSave();
   }
 
   processLine(webContents, runState, line) {
@@ -2045,7 +2202,7 @@ class ClaudeDesktopRuntime {
     } else {
       this.handleClaudeEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
     }
-    this.scheduleSave();
+    this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
     this.scheduleStateEmit(webContents);
   }
 
@@ -2255,6 +2412,10 @@ class ClaudeDesktopRuntime {
     }
 
     const nextStatus = itemSummary.status || 'completed';
+    if (nextStatus === 'error' && shouldQueueCodexWriteApproval(session)) {
+      captureCodexCapabilityFailure(runState, extractCodexItemFailureText(item, itemSummary));
+    }
+
     if (itemSummary.toolUseId) {
       runState.toolUses.set(itemSummary.toolUseId, itemSummary);
       const updated = this.refreshCodexItemMessage(session, itemSummary.toolUseId, itemSummary, nextStatus);
@@ -2764,6 +2925,19 @@ class ClaudeDesktopRuntime {
     this.pendingStateEmitTimers.delete(contentsId);
   }
 
+  getStateEmitThrottleMs(webContents) {
+    const recipientContext = this.resolvePaneRecipientContext(getStateRecipientContext(webContents));
+    if (
+      recipientContext?.view === 'pane'
+      && recipientContext.paneId
+      && this.store.paneLayout?.focusedPaneId !== recipientContext.paneId
+    ) {
+      return BACKGROUND_STATE_EMIT_THROTTLE_MS;
+    }
+
+    return STATE_EMIT_THROTTLE_MS;
+  }
+
   scheduleStateEmit(webContents) {
     if (!webContents || webContents.isDestroyed()) {
       return;
@@ -2777,7 +2951,7 @@ class ClaudeDesktopRuntime {
     const timer = setTimeout(() => {
       this.pendingStateEmitTimers.delete(contentsId);
       this.emitState(webContents, { lightweight: true });
-    }, STATE_EMIT_THROTTLE_MS);
+    }, this.getStateEmitThrottleMs(webContents));
 
     this.pendingStateEmitTimers.set(contentsId, timer);
   }
@@ -2819,6 +2993,7 @@ class ClaudeDesktopRuntime {
     const context = this.createStateSerializationContext(options);
     const stateCache = new Map();
     const senderContext = this.resolvePaneRecipientContext(getStateRecipientContext(webContents));
+    let sessionMetaDelta = undefined;
     const excludedSenderId = options.excludeSender && webContents && !webContents.isDestroyed()
       ? webContents.id
       : 0;
@@ -2834,12 +3009,55 @@ class ClaudeDesktopRuntime {
           continue;
         }
 
-        const cacheKey = createStateRecipientCacheKey(recipientContext, options);
+        if (
+          (options?.lightweight === true || options?.sessionScoped === true)
+          && recipientContext?.view
+          && recipientContext.view !== 'main'
+          && recipientContext.view !== 'pane'
+        ) {
+          continue;
+        }
+
+        const shouldEmitMainSessionMetaDelta = (
+          (options?.lightweight === true || options?.sessionScoped === true)
+          && senderContext?.view === 'pane'
+          && recipientContext?.view === 'main'
+        );
+        const shouldEmitPaneSessionMetaDelta = (
+          (options?.lightweight === true || options?.sessionScoped === true)
+          && senderContext?.view === 'pane'
+          && recipientContext?.view === 'pane'
+          && this.store.paneLayout?.focusedPaneId !== recipientContext?.paneId
+        );
+        if (shouldEmitMainSessionMetaDelta || shouldEmitPaneSessionMetaDelta) {
+          if (sessionMetaDelta === undefined) {
+            sessionMetaDelta = this.buildSessionMetaDelta(senderContext, context);
+          }
+
+          if (sessionMetaDelta) {
+            contents.send('claude:event', sessionMetaDelta);
+          }
+          continue;
+        }
+
+        const includePaneActiveSession = recipientContext?.view === 'pane'
+          ? (
+            (options?.lightweight === true || options?.sessionScoped === true)
+              ? this.store.paneLayout?.focusedPaneId === recipientContext?.paneId
+              : true
+          )
+          : true;
+        const cacheKey = createStateRecipientCacheKey({
+          ...recipientContext,
+          includeActiveSession: includePaneActiveSession,
+        }, options);
         let state = stateCache.get(cacheKey);
 
         if (!state) {
           state = recipientContext?.view === 'pane'
-            ? this.buildPaneAppState(recipientContext, context)
+            ? this.buildPaneAppState(recipientContext, context, {
+              includeActiveSession: includePaneActiveSession,
+            })
             : this.buildGlobalAppState(context, {
               ...options,
               includeActiveSession: options?.lightweight !== true,
@@ -2848,6 +3066,7 @@ class ClaudeDesktopRuntime {
         }
 
         contents.send('claude:event', {
+          lightweight: options?.lightweight === true,
           state,
           type: 'state',
         });
@@ -3007,87 +3226,104 @@ class ClaudeDesktopRuntime {
     }
 
     try {
-      const content = fs.readFileSync(this.configPath, 'utf8');
-      const parsed = JSON.parse(content);
-
-      if (parsed?.workspaceDir) {
-        const migratedPath = this.resolveWorkspacePath(parsed.workspaceDir);
-      const migratedWorkspace = {
-          approvalRules: [],
-          createdAt: new Date().toISOString(),
-          id: randomUUID(),
-          name: path.basename(migratedPath) || migratedPath,
-          path: migratedPath,
-          sessions: [],
-          updatedAt: new Date().toISOString(),
-        };
-
-        return {
-          codeEditor: '',
-          enabledProviders: SESSION_PROVIDER_KEYS.slice(),
-          expandedWorkspaceIds: [migratedWorkspace.id],
-          networkProxy: normalizeNetworkProxySettings(),
-          paneLayout: null,
-          providerSystemPrompts: normalizeProviderSystemPrompts(),
-          schemaVersion: SCHEMA_VERSION,
-          selectedSessionId: null,
-          selectedWorkspaceId: migratedWorkspace.id,
-          workspaces: [migratedWorkspace],
-        };
-      }
-
-      if (!Array.isArray(parsed?.workspaces)) {
-        return emptyStore;
-      }
-
-      const workspaces = parsed.workspaces
-        .map((workspace) => normalizeWorkspace(workspace))
-        .filter(Boolean);
-
-      const selectedWorkspaceId = workspaces.some((workspace) => workspace.id === parsed.selectedWorkspaceId)
-        ? parsed.selectedWorkspaceId
-        : workspaces[0]?.id || null;
-
-      const selectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspaceId) || null;
-      const selectedSessionId = selectedWorkspace?.sessions.some((session) => session.id === parsed.selectedSessionId)
-        ? parsed.selectedSessionId
-        : selectedWorkspace?.sessions[0]?.id || null;
-      const expandedWorkspaceIds = Array.isArray(parsed.expandedWorkspaceIds)
-        ? parsed.expandedWorkspaceIds.filter((workspaceId, index, items) => (
-          typeof workspaceId === 'string'
-          && workspaces.some((workspace) => workspace.id === workspaceId)
-          && items.indexOf(workspaceId) === index
-        ))
-        : [];
-
-      return {
-        codeEditor: normalizeCodeEditorKey(parsed.codeEditor),
-        enabledProviders: normalizeEnabledProviders(parsed.enabledProviders),
-        expandedWorkspaceIds,
-        networkProxy: normalizeNetworkProxySettings(parsed.networkProxy),
-        paneLayout: normalizePaneLayoutState(parsed.paneLayout),
-        providerSystemPrompts: normalizeProviderSystemPrompts(parsed.providerSystemPrompts),
-        schemaVersion: SCHEMA_VERSION,
-        selectedSessionId,
-        selectedWorkspaceId,
-        workspaces,
-      };
+      return this.loadStoreSnapshot(this.configPath, emptyStore);
     } catch (error) {
       console.warn(`Failed to load desktop config from ${this.configPath}: ${error.message}`);
+      if (fs.existsSync(this.configBackupPath)) {
+        try {
+          const recoveredStore = this.loadStoreSnapshot(this.configBackupPath, emptyStore);
+          console.warn(`Recovered desktop config from backup ${this.configBackupPath}.`);
+          return recoveredStore;
+        } catch (backupError) {
+          console.warn(`Failed to load desktop config backup from ${this.configBackupPath}: ${backupError.message}`);
+        }
+      }
       return emptyStore;
     }
   }
 
-  scheduleSave() {
-    clearTimeout(this.saveTimer);
-    this.saveTimer = setTimeout(() => {
-      this.flushSave();
-    }, SAVE_DEBOUNCE_MS);
+  loadStoreSnapshot(filePath, emptyStore) {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(content);
+
+    if (parsed?.workspaceDir) {
+      const migratedPath = this.resolveWorkspacePath(parsed.workspaceDir);
+      const migratedWorkspace = {
+        approvalRules: [],
+        createdAt: new Date().toISOString(),
+        id: randomUUID(),
+        name: path.basename(migratedPath) || migratedPath,
+        path: migratedPath,
+        sessions: [],
+        updatedAt: new Date().toISOString(),
+      };
+
+      return {
+        codeEditor: '',
+        enabledProviders: SESSION_PROVIDER_KEYS.slice(),
+        expandedWorkspaceIds: [migratedWorkspace.id],
+        networkProxy: normalizeNetworkProxySettings(),
+        paneLayout: null,
+        providerSystemPrompts: normalizeProviderSystemPrompts(),
+        schemaVersion: SCHEMA_VERSION,
+        selectedSessionId: null,
+        selectedWorkspaceId: migratedWorkspace.id,
+        workspaces: [migratedWorkspace],
+      };
+    }
+
+    if (!Array.isArray(parsed?.workspaces)) {
+      return emptyStore;
+    }
+
+    const workspaces = parsed.workspaces
+      .map((workspace) => normalizeWorkspace(workspace))
+      .filter(Boolean);
+
+    const selectedWorkspaceId = workspaces.some((workspace) => workspace.id === parsed.selectedWorkspaceId)
+      ? parsed.selectedWorkspaceId
+      : workspaces[0]?.id || null;
+
+    const selectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspaceId) || null;
+    const selectedSessionId = selectedWorkspace?.sessions.some((session) => session.id === parsed.selectedSessionId)
+      ? parsed.selectedSessionId
+      : selectedWorkspace?.sessions[0]?.id || null;
+    const expandedWorkspaceIds = Array.isArray(parsed.expandedWorkspaceIds)
+      ? parsed.expandedWorkspaceIds.filter((workspaceId, index, items) => (
+        typeof workspaceId === 'string'
+        && workspaces.some((workspace) => workspace.id === workspaceId)
+        && items.indexOf(workspaceId) === index
+      ))
+      : [];
+
+    return {
+      codeEditor: normalizeCodeEditorKey(parsed.codeEditor),
+      enabledProviders: normalizeEnabledProviders(parsed.enabledProviders),
+      expandedWorkspaceIds,
+      networkProxy: normalizeNetworkProxySettings(parsed.networkProxy),
+      paneLayout: normalizePaneLayoutState(parsed.paneLayout),
+      providerSystemPrompts: normalizeProviderSystemPrompts(parsed.providerSystemPrompts),
+      schemaVersion: SCHEMA_VERSION,
+      selectedSessionId,
+      selectedWorkspaceId,
+      workspaces,
+    };
   }
 
-  flushSave() {
+  scheduleSave(delayMs = SAVE_DEBOUNCE_MS) {
+    clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => {
+      void this.flushSave();
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  async flushSave() {
     clearTimeout(this.saveTimer);
     this.saveTimer = null;
+    if (this.saveInFlight) {
+      this.saveQueued = true;
+      return this.saveInFlight;
+    }
 
     const payload = {
       codeEditor: this.getSelectedCodeEditor(),
@@ -3102,7 +3338,21 @@ class ClaudeDesktopRuntime {
       workspaces: this.store.workspaces,
     };
 
-    fs.writeFileSync(this.configPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    const serializedPayload = `${JSON.stringify(payload)}\n`;
+    this.saveQueued = false;
+    this.saveInFlight = writeTextFileAtomic(this.configPath, serializedPayload, {
+      backupPath: this.configBackupPath,
+    }).catch((error) => {
+      console.warn(`Failed to save desktop config to ${this.configPath}: ${error.message}`);
+    })
+      .finally(() => {
+        this.saveInFlight = null;
+        if (this.saveQueued) {
+          this.saveQueued = false;
+          this.scheduleSave();
+        }
+      });
+    return this.saveInFlight;
   }
 
   resolveWorkspacePath(input) {
@@ -3228,6 +3478,55 @@ function normalizePaneLayoutState(paneLayout) {
     panes: normalizedPanes,
     recentPaneIds,
   };
+}
+
+async function writeTextFileAtomic(filePath, content, options = {}) {
+  const directoryPath = path.dirname(filePath);
+  const backupPath = typeof options?.backupPath === 'string' ? options.backupPath : '';
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  let fileHandle = null;
+  let tempWritten = false;
+
+  await fs.promises.mkdir(directoryPath, { recursive: true });
+
+  try {
+    fileHandle = await fs.promises.open(tempPath, 'w');
+    await fileHandle.writeFile(content, 'utf8');
+    await fileHandle.sync();
+    tempWritten = true;
+  } finally {
+    if (fileHandle) {
+      await fileHandle.close();
+    }
+  }
+
+  try {
+    if (backupPath && fs.existsSync(filePath)) {
+      await fs.promises.copyFile(filePath, backupPath);
+    }
+
+    await fs.promises.rename(tempPath, filePath);
+    await syncDirectory(directoryPath);
+  } catch (error) {
+    if (tempWritten && fs.existsSync(tempPath)) {
+      await fs.promises.unlink(tempPath).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function syncDirectory(directoryPath) {
+  let directoryHandle = null;
+  try {
+    directoryHandle = await fs.promises.open(directoryPath, 'r');
+    await directoryHandle.sync();
+  } catch {
+    // Directory fsync is best effort and may not be supported on every platform.
+  } finally {
+    if (directoryHandle) {
+      await directoryHandle.close().catch(() => {});
+    }
+  }
 }
 
 function normalizeWorkspaceApprovalRules(value) {
@@ -3372,8 +3671,10 @@ function createStateRecipientCacheKey(recipientContext, options = {}) {
   if (recipientContext?.view === 'pane') {
     return [
       'pane',
+      recipientContext.paneId || '',
       recipientContext.workspaceId || '',
       recipientContext.sessionId || '',
+      recipientContext.includeActiveSession === false ? 'meta' : 'full',
     ].join('\u0000');
   }
 
@@ -3384,7 +3685,11 @@ function createStateRecipientCacheKey(recipientContext, options = {}) {
 }
 
 function shouldEmitStateToRecipient(senderContext, recipientContext, options = {}) {
-  if (recipientContext?.view !== 'pane' || options?.lightweight !== true) {
+  const requiresPaneSessionScoping = (
+    options?.lightweight === true
+    || options?.sessionScoped === true
+  );
+  if (recipientContext?.view !== 'pane' || !requiresPaneSessionScoping) {
     return true;
   }
 
@@ -3476,6 +3781,40 @@ function normalizeCodexSandboxMode(value) {
   return CODEX_SANDBOX_MODES.has(normalized) ? normalized : '';
 }
 
+function getCodexSandboxModeLevel(value) {
+  const normalized = normalizeCodexSandboxMode(value);
+  if (normalized === 'read-only') {
+    return 0;
+  }
+  if (normalized === 'workspace-write') {
+    return 1;
+  }
+  if (normalized === 'danger-full-access') {
+    return 2;
+  }
+  return -1;
+}
+
+function getCodexApprovalPolicyForSandboxMode(sandboxMode) {
+  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode);
+  if (!normalizedSandboxMode) {
+    return 'on-request';
+  }
+
+  return normalizedSandboxMode === 'danger-full-access'
+    ? 'never'
+    : 'on-request';
+}
+
+function needsCodexSandboxEscalation(currentMode, requiredMode) {
+  const normalizedRequiredMode = normalizeCodexSandboxMode(requiredMode);
+  if (!normalizedRequiredMode) {
+    return false;
+  }
+
+  return getCodexSandboxModeLevel(normalizedRequiredMode) > getCodexSandboxModeLevel(currentMode);
+}
+
 function resolveCodexSandboxMode(permissionMode, overrideMode) {
   const normalizedOverride = normalizeCodexSandboxMode(overrideMode);
   if (normalizedOverride) {
@@ -3523,6 +3862,50 @@ function promptLikelyNeedsCodexWorkspaceWrite(prompt, displayPrompt = '', displa
   const englishWritePattern = /\b(edit|modify|update|change|rewrite|refactor|patch|fix|implement|create|add|delete|remove|rename|save|write)\b[\s\S]{0,80}\b(file|files|code|project|component|function|bug|issue|workspace)\b|\bapply\s+patch\b|\bmake\s+the\s+change\b|\bship\s+it\b/;
   const chineseWritePattern = /改一下|改下|修改|编辑|更新|补上|修复|实现|新增|添加|创建|新建|删除|移除|重命名|写入|落盘|保存|直接改|直接修改|改代码|改文件|修这个|修下|补这个|补一下/;
   return englishWritePattern.test(normalized) || chineseWritePattern.test(normalized);
+}
+
+function promptLikelyNeedsCodexDangerousAccess(prompt, displayPrompt = '') {
+  const normalized = [prompt, displayPrompt]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join('\n')
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  const negativePattern = /不要联网|别联网|不需要联网|无需联网|离线即可|不要访问外网|don't use (?:the )?network|do not use (?:the )?network|no network|offline only/;
+  if (negativePattern.test(normalized)) {
+    return false;
+  }
+
+  const englishGithubCommandPattern = /\bgh\b[\s\S]{0,24}\b(api|auth|browse|codespace|gist|issue|pr|release|repo|run|search|secret|ssh-key|workflow)\b/;
+  const englishNetworkPattern = /\b(curl|wget)\b[\s\S]{0,80}\bhttps?:\/\/|\b(api\.github\.com|github api|http request|https request|network access|internet access|outbound network|external api|download from|fetch from)\b/;
+  const englishGithubWritePattern = /\b(post|leave|add|submit|send|publish)\b[\s\S]{0,48}\b(comment|review)\b[\s\S]{0,48}\b(pr|pull request|issue|github)\b|\b(approve|review|comment on|reply to)\b[\s\S]{0,48}\b(pr|pull request|issue)\b/;
+  const englishMcpPattern = /\b(use|call|invoke|run)\b[\s\S]{0,20}\bmcp\b|\bmcp__[a-z0-9_]+\b|\bmcp tool\b|\bmodel context protocol\b/;
+  const chineseGithubPattern = /gh\s+(?:api|auth|browse|issue|pr|repo|run|workflow)|api\.github\.com|github\s*api|github.*(?:评论|review)|(?:发|留|写|加|提交|发送|发布).{0,16}(?:评论|comment|review).{0,16}(?:pr|pull request|issue|github)|(?:批准|approve|review|评论).{0,16}(?:pr|pull request|issue)|访问网络|联网|访问外网|外部\s*api|发送\s*http\s*请求|下载远程资源|拉取远程资源/;
+  const chineseMcpPattern = /(?:调用|使用|通过|运行).{0,12}mcp|mcp\s*工具|mcp__[a-z0-9_]+/;
+
+  return (
+    englishGithubCommandPattern.test(normalized)
+    || englishNetworkPattern.test(normalized)
+    || englishGithubWritePattern.test(normalized)
+    || englishMcpPattern.test(normalized)
+    || chineseGithubPattern.test(normalized)
+    || chineseMcpPattern.test(normalized)
+  );
+}
+
+function inferCodexPromptSandboxMode(prompt, displayPrompt = '', displayKind = '') {
+  if (promptLikelyNeedsCodexDangerousAccess(prompt, displayPrompt, displayKind)) {
+    return 'danger-full-access';
+  }
+
+  if (promptLikelyNeedsCodexWorkspaceWrite(prompt, displayPrompt, displayKind)) {
+    return 'workspace-write';
+  }
+
+  return '';
 }
 
 function isQueuedCodexWriteApproval(approval) {
@@ -3606,6 +3989,28 @@ function getQueuedCodexWriteApprovalOptions(approval) {
   };
 }
 
+function isQueuedMcpCommandApproval(approval) {
+  const approvalKind = typeof approval?.approvalKind === 'string'
+    ? approval.approvalKind.trim()
+    : (typeof approval?.input?.approvalKind === 'string' ? approval.input.approvalKind.trim() : '');
+  return approvalKind === 'mcp_command';
+}
+
+function getQueuedMcpCommandApprovalOptions(approval) {
+  if (!isQueuedMcpCommandApproval(approval)) {
+    return null;
+  }
+
+  const input = approval.input && typeof approval.input === 'object' ? approval.input : {};
+  return {
+    args: Array.isArray(input.args)
+      ? input.args.filter((value) => typeof value === 'string' && value.trim())
+      : [],
+    provider: normalizeSessionProvider(input.provider),
+    rawArgs: typeof input.rawArgs === 'string' ? input.rawArgs : '',
+  };
+}
+
 function createOutboundUserMessage({ attachments, displayKind, displayPrompt, displayTitle, now }) {
   return displayKind === 'command'
     ? createEventMessage({
@@ -3664,6 +4069,39 @@ function createCodexWritePendingApproval(workspace, options = {}) {
   };
 }
 
+function createMcpCommandPendingApproval(workspace, options = {}) {
+  const args = Array.isArray(options.args)
+    ? options.args.filter((value) => typeof value === 'string' && value.trim())
+    : [];
+  const rawArgs = typeof options.rawArgs === 'string' ? options.rawArgs.trim() : '';
+  const provider = normalizeSessionProvider(options.provider);
+  const providerLabel = getProviderLabel(provider);
+  const blockedPath = normalizeApprovalBlockedPath(workspace?.path);
+  const now = options.now || new Date().toISOString();
+  const detail = formatSlashMcpCommandTitle(rawArgs, args);
+
+  return {
+    approvalKind: 'mcp_command',
+    blockedPath,
+    category: 'mcp',
+    createdAt: now,
+    description: `允许后会在当前工作目录执行本机 ${providerLabel} CLI 的 MCP 命令。`,
+    detail,
+    displayName: 'MCP command',
+    input: {
+      approvalKind: 'mcp_command',
+      args,
+      provider,
+      rawArgs,
+      workspacePath: blockedPath,
+    },
+    requestId: typeof options.requestId === 'string' && options.requestId.trim() ? options.requestId.trim() : randomUUID(),
+    title: 'MCP 命令审批',
+    toolName: 'mcp_command',
+    toolUseId: '',
+  };
+}
+
 function maybeCreateCodexEscalationApproval(workspace, session, runState, assistantMessage) {
   if (!workspace || !session || !runState || runState.pendingApprovalRequests.size > 0) {
     return null;
@@ -3712,6 +4150,28 @@ function captureCodexCapabilityFailure(runState, failureContent) {
   return targetSandboxMode;
 }
 
+function extractCodexItemFailureText(item, itemSummary) {
+  const errorText = typeof item?.error === 'string'
+    ? item.error
+    : (
+      typeof item?.error?.message === 'string'
+        ? item.error.message
+        : (item?.error ? stringifyValue(item.error) : '')
+    );
+
+  return [
+    typeof itemSummary?.detail === 'string' ? itemSummary.detail : '',
+    typeof itemSummary?.completedDetail === 'string' ? itemSummary.completedDetail : '',
+    errorText,
+    typeof item?.output === 'string' ? item.output : '',
+    typeof item?.aggregated_output === 'string' ? item.aggregated_output : '',
+    typeof item?.result === 'string' ? item.result : '',
+    typeof item?.stderr === 'string' ? item.stderr : '',
+  ]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join('\n');
+}
+
 function inferCodexEscalationSandboxMode(text, currentSandboxMode) {
   const normalized = String(text || '').trim().toLowerCase();
   if (!normalized) {
@@ -3724,7 +4184,7 @@ function inferCodexEscalationSandboxMode(text, currentSandboxMode) {
   }
 
   const englishRestrictionPattern = /read-only|readonly|operation not permitted|permission denied|write attempt failed|mounted read-only|filesystem is read-only|workspace is mounted read-only|write to .* was denied|sandbox denied|requires workspace-write|requires a writable workspace|needs workspace-write/;
-  const englishFailurePattern = /can't|cannot|couldn't|unable to|failed to|denied|not permitted|could not|requires|needs/;
+  const englishFailurePattern = /can't|cannot|couldn't|unable to|failed to|denied|not permitted|could not|requires|needs|timed out|refused|unreachable|blocked|eacces|eperm|no such host|could not resolve host/;
   const chineseRestrictionPattern = /当前环境不能落盘|当前环境没法落盘|无法落盘|不能落盘|没法落盘|没有写权限|无写权限|写权限受限|可写会话|可写权限|可写环境|可写工作区|可写目录|只读环境|当前环境只读|工作区只读|只读沙箱|只读权限|无法写入|不能写入|无法修改文件|不能修改文件|无法编辑文件|不能编辑文件|工作目录权限/;
   const chineseFailurePattern = /无法|不能|没法|未能|受限|拒绝|需要|请切到|切到|才能|才可以/;
   const englishWriteApprovalHintPattern = /writable environment|writable workspace|write access|workspace write access|workspace-write/;
@@ -3741,13 +4201,30 @@ function inferCodexEscalationSandboxMode(text, currentSandboxMode) {
     chineseWriteApprovalHintPattern.test(normalized) && chineseWriteActionPattern.test(normalized)
   );
 
-  const englishDangerRestrictionPattern = /network access|internet access|outbound network|socket access|dns resolution|resolve host|connection timed out|connection refused|tls handshake|certificate verify failed|outside the workspace|outside current workspace|outside of the workspace|outside the current working directory|outside the repo|not in writable roots|requires full access|dangerously-bypass-approvals-and-sandbox|blocked by sandbox|sandbox restriction|sandbox blocked|requires network|needs network|external path|outside allowed directories|environment restriction|environment restrictions|restricted environment|network is disabled|internet is disabled|host lookup|name resolution/;
+  const englishDangerRestrictionPattern = /network access|internet access|outbound network|socket access|dns resolution|resolve host|connection timed out|connection refused|tls handshake|certificate verify failed|outside the workspace|outside current workspace|outside of the workspace|outside the current working directory|outside the repo|not in writable roots|requires full access|dangerously-bypass-approvals-and-sandbox|blocked by sandbox|sandbox restriction|sandbox blocked|requires network|needs network|external path|outside allowed directories|environment restriction|environment restrictions|restricted environment|network is disabled|internet is disabled|host lookup|name resolution|api\.github\.com|github\.com|dial tcp|no such host|could not resolve host|temporary failure in name resolution|network is unreachable|eai_again|enotfound|socket hang up/;
   const chineseDangerRestrictionPattern = /无法联网|不能联网|没法联网|网络受限|网络访问受限|无法访问网络|不能访问网络|无法访问外网|不能访问外网|无法解析域名|不能解析域名|dns|无法下载依赖|不能下载依赖|无法访问工作目录外|不能访问工作目录外|工作目录之外|当前工作目录之外|外部路径|沙箱限制|受沙箱限制|环境限制|环境受限|当前环境受限|解除沙箱|完全访问|更高系统权限|更高权限的操作/;
+  // MCP transport failures often surface as server/stream disconnects instead of an
+  // explicit "network disabled" message, especially with streamable-http or stdio servers.
+  const englishMcpContextPattern = /\bmcp\b|\bmodel context protocol\b|\bmcp server\b|\bmcp tool\b|\bstreamable http\b|\bsse\b|\bstdio\b|\btransport\b/;
+  const chineseMcpContextPattern = /mcp|模型上下文协议|mcp\s*服务|mcp\s*工具|流式\s*http|stdio|传输层|服务端传输/;
+  const englishMcpTransportPattern = /failed to connect|could not connect|unable to connect|connection reset|connection aborted|connection closed|server disconnected|transport closed|transport error|broken pipe|econnreset|econnaborted|epipe|failed to start server|server startup failed|stdio closed|stdio ended|sse connection|streamable http.*(?:failed|error|closed)|upstream connect error|(?:open\.feishu\.cn|open\.larksuite\.com|feishu|lark)[\s\S]{0,48}(?:connection|timeout|timed out|dns|resolve|network|socket|host)/;
+  const chineseMcpTransportPattern = /连接.*(?:失败|中断|关闭|重置)|服务.*(?:断开|关闭|未启动|启动失败)|传输.*(?:失败|错误|中断|关闭)|管道.*(?:断开|关闭)|无法连接.*(?:mcp|服务)|启动.*(?:mcp|服务).*(?:失败|异常)|sse.*(?:失败|错误|中断)|streamable http.*(?:失败|错误|中断)|(?:飞书|lark).{0,24}(?:连接|超时|网络|dns|域名|socket)/;
+  const englishAuthFailurePattern = /unauthorized|forbidden|authentication failed|auth failed|invalid token|expired token|missing token|permission scope|insufficient scope|401\b|403\b/;
+  const chineseAuthFailurePattern = /未授权|鉴权失败|认证失败|token.*(?:无效|失效|过期|缺失)|权限范围不足|缺少权限|401|403/;
+  const mcpTransportFailure = (
+    englishMcpContextPattern.test(normalized) || chineseMcpContextPattern.test(normalized)
+  ) && (
+    englishMcpTransportPattern.test(normalized) || chineseMcpTransportPattern.test(normalized)
+  ) && (
+    englishFailurePattern.test(normalized) || chineseFailurePattern.test(normalized)
+  ) && !(
+    englishAuthFailurePattern.test(normalized) || chineseAuthFailurePattern.test(normalized)
+  );
   const dangerPermissionDenied = (
     englishDangerRestrictionPattern.test(normalized) && englishFailurePattern.test(normalized)
   ) || (
     chineseDangerRestrictionPattern.test(normalized) && chineseFailurePattern.test(normalized)
-  );
+  ) || mcpTransportFailure;
 
   if (dangerPermissionDenied) {
     return 'danger-full-access';
@@ -3781,6 +4258,15 @@ function prepareRunStateForPendingApproval(runState, approval) {
   runState.responseStartIndex = 0;
   runState.resultIsError = false;
   runState.resultReceived = false;
+}
+
+function formatSlashMcpCommandTitle(rawArgs, args) {
+  const normalizedRawArgs = typeof rawArgs === 'string' ? rawArgs.trim() : '';
+  const normalizedArgs = Array.isArray(args)
+    ? args.filter((value) => typeof value === 'string' && value.trim())
+    : [];
+  const detail = normalizedRawArgs || normalizedArgs.join(' ');
+  return detail ? `/mcp ${detail}` : '/mcp';
 }
 
 function rewindSessionMessagesForPendingApproval(session, runState) {
@@ -4653,6 +5139,7 @@ function serializeSession(workspace, session, activeRunLookup) {
     messages: session.messages,
     model: session.model,
     pendingApprovals,
+    pendingApprovalCount: pendingApprovals.length,
     path: workspace.path,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
     reasoningEffort: configuredReasoningEffort,
@@ -4671,6 +5158,9 @@ function serializeSessionMeta(workspace, session, activeRunLookup) {
   const effectiveDefaults = getEffectiveSessionDefaults(workspace.path, session);
   const configuredReasoningEffort = normalizeSessionReasoningEffort(session.reasoningEffort);
   const messageSummary = getSessionMessageSummary(session);
+  const pendingApprovalCount = activeRun
+    ? activeRun.pendingApprovalRequests.size
+    : 0;
 
   return {
     archived: Boolean(session.archived),
@@ -4681,6 +5171,7 @@ function serializeSessionMeta(workspace, session, activeRunLookup) {
     id: session.id,
     isRunning: Boolean(activeRun?.process),
     messageCount: messageSummary.messageCount,
+    pendingApprovalCount,
     permissionMode: normalizeSessionPermissionMode(session.permissionMode),
     reasoningEffort: configuredReasoningEffort,
     provider: normalizeSessionProvider(session.provider),
@@ -5274,6 +5765,16 @@ function buildCodexExecArgs({
   sandboxMode,
   sessionId,
 }) {
+  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode);
+  const approvalPolicy = getCodexApprovalPolicyForSandboxMode(normalizedSandboxMode);
+  const rootOptions = [];
+  if (approvalPolicy) {
+    rootOptions.push('-a', approvalPolicy);
+  }
+  if (normalizedSandboxMode) {
+    rootOptions.push('-s', normalizedSandboxMode);
+  }
+
   const options = ['--json', '--skip-git-repo-check'];
   if (model) {
     options.push('--model', model);
@@ -5282,17 +5783,6 @@ function buildCodexExecArgs({
   const normalizedDeveloperInstructions = normalizeProviderSystemPrompt(developerInstructions);
   if (normalizedDeveloperInstructions) {
     options.push('-c', `developer_instructions=${encodeTomlString(normalizedDeveloperInstructions)}`);
-  }
-
-  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode);
-  if (sessionId) {
-    if (normalizedSandboxMode === 'workspace-write') {
-      options.push('--full-auto');
-    } else if (normalizedSandboxMode === 'danger-full-access') {
-      options.push('--dangerously-bypass-approvals-and-sandbox');
-    }
-  } else if (normalizedSandboxMode) {
-    options.push('--sandbox', normalizedSandboxMode);
   }
 
   const normalizedReasoningEffort = normalizeSessionReasoningEffort(reasoningEffort);
@@ -5320,6 +5810,7 @@ function buildCodexExecArgs({
 
   if (sessionId) {
     return [
+      ...rootOptions,
       'exec',
       'resume',
       ...options,
@@ -5332,6 +5823,7 @@ function buildCodexExecArgs({
   }
 
   return [
+    ...rootOptions,
     'exec',
     ...options,
     // Keep the prompt positional separate from any preceding `--image` values.

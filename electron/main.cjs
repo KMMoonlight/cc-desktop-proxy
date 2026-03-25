@@ -4,6 +4,7 @@ const { app, BrowserWindow } = require('electron');
 const { ClaudeDesktopRuntime } = require('./runtime.cjs');
 
 let runtime = null;
+let hasStartedQuitTeardown = false;
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -49,8 +50,19 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
-  runtime?.disposeAll();
+app.on('before-quit', (event) => {
+  if (hasStartedQuitTeardown) {
+    return;
+  }
+
+  hasStartedQuitTeardown = true;
+  event.preventDefault();
+
+  Promise.resolve(runtime?.disposeAll())
+    .catch(() => {})
+    .finally(() => {
+      app.exit(0);
+    });
 });
 
 app.on('window-all-closed', () => {

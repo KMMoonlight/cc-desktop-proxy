@@ -97,6 +97,8 @@ const SIDEBAR_EXPANDED_WIDTH = 280;
 const SIDEBAR_COLLAPSED_WIDTH = 68;
 const SIDEBAR_VIEW_WORKSPACES = 'workspaces';
 const SIDEBAR_VIEW_HIDDEN_PANES = 'hidden-panes';
+const LIGHTWEIGHT_STATE_DEBOUNCE_MS = 80;
+const COMPOSER_FOCUS_TRANSFER_RETRY_DELAYS_MS = [0, 24, 64, 120, 200];
 const DEFAULT_PANE_LAYOUT = {
   focusedPaneId: 'pane-1',
   mode: 'single',
@@ -376,6 +378,186 @@ function integrateCreatedSessionResult(currentState, nextState) {
   };
 }
 
+function integrateSelectedSessionResult(currentState, nextState) {
+  if (nextState && typeof nextState === 'object' && Array.isArray(nextState.workspaces)) {
+    return nextState;
+  }
+
+  const workspaceId = typeof nextState?.selectedWorkspaceId === 'string' ? nextState.selectedWorkspaceId : '';
+  if (!workspaceId || !Array.isArray(currentState?.workspaces)) {
+    return currentState;
+  }
+
+  const sessionId = typeof nextState?.selectedSessionId === 'string' ? nextState.selectedSessionId : '';
+  const sessionMeta = nextState?.sessionMeta && typeof nextState.sessionMeta === 'object'
+    ? nextState.sessionMeta
+    : null;
+  const nextWorkspaceUpdatedAt = typeof nextState?.workspaceUpdatedAt === 'string'
+    ? nextState.workspaceUpdatedAt
+    : '';
+  const hasActiveSession = Object.prototype.hasOwnProperty.call(nextState || {}, 'activeSession');
+  const mergedActiveSession = hasActiveSession
+    ? mergeSessionSnapshot(currentState.activeSession, nextState.activeSession)
+    : currentState.activeSession;
+
+  let foundWorkspace = false;
+  let mutated = false;
+  const nextWorkspaces = currentState.workspaces.map((workspace) => {
+    if (workspace.id !== workspaceId) {
+      return workspace;
+    }
+
+    foundWorkspace = true;
+
+    const currentSessions = Array.isArray(workspace.sessions) ? workspace.sessions : [];
+    let nextSessions = currentSessions;
+    if (sessionMeta && sessionId) {
+      let sessionMutated = false;
+      nextSessions = currentSessions.map((session) => {
+        if (session?.id !== sessionId) {
+          return session;
+        }
+
+        const mergedSession = areSerializedSessionMetaEqual(session, sessionMeta)
+          ? session
+          : { ...session, ...sessionMeta };
+        if (mergedSession !== session) {
+          sessionMutated = true;
+        }
+        return mergedSession;
+      });
+
+      if (sessionMutated) {
+        mutated = true;
+      }
+    }
+
+    if (!nextWorkspaceUpdatedAt || nextWorkspaceUpdatedAt === workspace.updatedAt) {
+      return nextSessions === currentSessions ? workspace : { ...workspace, sessions: nextSessions };
+    }
+
+    mutated = true;
+    return {
+      ...workspace,
+      sessions: nextSessions,
+      updatedAt: nextWorkspaceUpdatedAt,
+    };
+  });
+
+  if (!foundWorkspace) {
+    return currentState;
+  }
+
+  const nextSelectedSessionId = sessionId || null;
+  const selectionChanged = (
+    currentState.selectedWorkspaceId !== workspaceId
+    || (currentState.selectedSessionId || null) !== nextSelectedSessionId
+  );
+  const workspaces = mutated ? nextWorkspaces : currentState.workspaces;
+  const shouldUpdate = selectionChanged || workspaces !== currentState.workspaces || mergedActiveSession !== currentState.activeSession;
+
+  if (!shouldUpdate) {
+    return currentState;
+  }
+
+  return {
+    ...currentState,
+    activeSession: mergedActiveSession,
+    selectedSessionId: nextSelectedSessionId,
+    selectedWorkspaceId: workspaceId,
+    workspaces,
+  };
+}
+
+function mergeSessionIntoViewCache(currentCache, sessionSnapshot) {
+  if (
+    !sessionSnapshot
+    || typeof sessionSnapshot !== 'object'
+    || !sessionSnapshot.workspaceId
+    || !sessionSnapshot.id
+  ) {
+    return currentCache;
+  }
+
+  const cacheKey = createSessionCacheKey(sessionSnapshot.workspaceId, sessionSnapshot.id);
+  const mergedSession = mergeSessionSnapshot(currentCache?.[cacheKey], sessionSnapshot);
+  if (mergedSession === currentCache?.[cacheKey]) {
+    return currentCache;
+  }
+
+  return {
+    ...(currentCache && typeof currentCache === 'object' ? currentCache : {}),
+    [cacheKey]: mergedSession,
+  };
+}
+
+function mergeSessionMetaDeltaIntoAppState(currentState, nextState) {
+  const workspaceId = typeof nextState?.workspaceId === 'string' ? nextState.workspaceId : '';
+  const sessionId = typeof nextState?.sessionId === 'string' ? nextState.sessionId : '';
+  const sessionMeta = nextState?.sessionMeta && typeof nextState.sessionMeta === 'object'
+    ? nextState.sessionMeta
+    : null;
+  if (!workspaceId || !sessionId || !sessionMeta || !Array.isArray(currentState?.workspaces)) {
+    return currentState;
+  }
+
+  let foundWorkspace = false;
+  let mutated = false;
+  const nextWorkspaces = currentState.workspaces.map((workspace) => {
+    if (workspace.id !== workspaceId) {
+      return workspace;
+    }
+
+    foundWorkspace = true;
+    const currentSessions = Array.isArray(workspace.sessions) ? workspace.sessions : [];
+    let foundSession = false;
+    const nextSessions = currentSessions.map((session) => {
+      if (session?.id !== sessionId) {
+        return session;
+      }
+
+      foundSession = true;
+      const mergedSession = areSerializedSessionMetaEqual(session, sessionMeta)
+        ? session
+        : { ...session, ...sessionMeta };
+      if (mergedSession !== session) {
+        mutated = true;
+      }
+      return mergedSession;
+    });
+    if (!foundSession) {
+      return workspace;
+    }
+
+    const nextWorkspaceUpdatedAt = typeof nextState?.workspaceUpdatedAt === 'string'
+      ? nextState.workspaceUpdatedAt
+      : workspace.updatedAt;
+    if (nextWorkspaceUpdatedAt !== workspace.updatedAt) {
+      mutated = true;
+    }
+
+    return (
+      nextSessions === currentSessions
+      && nextWorkspaceUpdatedAt === workspace.updatedAt
+    )
+      ? workspace
+      : {
+        ...workspace,
+        sessions: nextSessions,
+        updatedAt: nextWorkspaceUpdatedAt,
+      };
+  });
+
+  if (!foundWorkspace || !mutated) {
+    return currentState;
+  }
+
+  return {
+    ...currentState,
+    workspaces: nextWorkspaces,
+  };
+}
+
 function getPaneHeaderLabel(platform, paneNumber) {
   if (Number.isInteger(paneNumber) && paneNumber >= 1 && paneNumber <= 9) {
     return formatShortcutLabel(platform, String(paneNumber));
@@ -392,6 +574,51 @@ function useEventCallback(callback) {
   });
 
   return useCallback((...args) => callbackRef.current?.(...args), []);
+}
+
+function useBufferedIncomingAppState(applyIncomingAppState) {
+  const pendingStateRef = useRef(null);
+  const timerIdRef = useRef(0);
+
+  const bufferedApply = useEventCallback((nextState, options = {}) => {
+    if (!nextState) {
+      return;
+    }
+
+    const lightweight = options.lightweight === true;
+    const useTransition = options.useTransition !== false;
+
+    if (!lightweight || typeof window === 'undefined') {
+      pendingStateRef.current = null;
+      clearTimeout(timerIdRef.current);
+      timerIdRef.current = 0;
+      applyIncomingAppState(nextState, { useTransition });
+      return;
+    }
+
+    pendingStateRef.current = nextState;
+    if (timerIdRef.current) {
+      return;
+    }
+
+    timerIdRef.current = window.setTimeout(() => {
+      timerIdRef.current = 0;
+      const pendingState = pendingStateRef.current;
+      pendingStateRef.current = null;
+
+      if (pendingState) {
+        applyIncomingAppState(pendingState, { useTransition });
+      }
+    }, LIGHTWEIGHT_STATE_DEBOUNCE_MS);
+  });
+
+  useEffect(() => () => {
+    clearTimeout(timerIdRef.current);
+    timerIdRef.current = 0;
+    pendingStateRef.current = null;
+  }, []);
+
+  return bufferedApply;
 }
 
 const COPY = {
@@ -979,10 +1206,12 @@ export function StandalonePaneApp({ desktopClient }) {
   const [shouldFlashFinishedBorder, setShouldFlashFinishedBorder] = useState(false);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [blockingPaneBindingIssue, setBlockingPaneBindingIssue] = useState(null);
+  const [composerFocusRequestToken, setComposerFocusRequestToken] = useState(0);
   const paneCompletionStatusRef = useRef({
     isOutputInProgress: false,
     sessionCacheKey: '',
   });
+  const paneFocusSyncPaneIdRef = useRef('');
 
   const copy = COPY[language];
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
@@ -1125,6 +1354,7 @@ export function StandalonePaneApp({ desktopClient }) {
 
     commit();
   });
+  const bufferIncomingAppState = useBufferedIncomingAppState(applyIncomingAppState);
 
   useEffect(() => {
     appStateRef.current = appState;
@@ -1226,12 +1456,43 @@ export function StandalonePaneApp({ desktopClient }) {
     }
 
     const unsubscribe = desktopClient.onStateChange((event) => {
+      if (event?.type === 'focus-composer') {
+        try {
+          window.focus();
+        } catch {}
+        setComposerFocusRequestToken((current) => current + 1);
+        return;
+      }
+
+      if (event?.type === 'blur-composer') {
+        if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+          try {
+            document.activeElement.blur();
+          } catch {}
+        }
+        return;
+      }
+
+      if (event?.type === 'session-meta-delta') {
+        startTransition(() => {
+          setAppState((current) => mergeSessionMetaDeltaIntoAppState(current, event));
+        });
+        return;
+      }
+
       if (event?.type === 'state' && event.state) {
         if (areStandalonePaneAppStatesEquivalent(appStateRef.current, event.state, paneParams)) {
           return;
         }
 
-        applyIncomingAppState(event.state, { useTransition: true });
+        const shouldBufferLightweightState = (
+          event.lightweight === true
+          && shouldBufferStandalonePaneLightweightState(appStateRef.current, event.state, paneParams)
+        );
+        bufferIncomingAppState(event.state, {
+          lightweight: shouldBufferLightweightState,
+          useTransition: true,
+        });
       }
     });
 
@@ -1260,7 +1521,7 @@ export function StandalonePaneApp({ desktopClient }) {
       cancelled = true;
       unsubscribe?.();
     };
-  }, [applyIncomingAppState, copy.bridgeUnavailable, desktopClient, paneParams, setPaneError]);
+  }, [bufferIncomingAppState, applyIncomingAppState, copy.bridgeUnavailable, desktopClient, paneParams, setPaneError]);
 
   useEffect(() => {
     if (!paneDescriptor.workspaceId || !paneDescriptor.sessionId) {
@@ -1268,6 +1529,48 @@ export function StandalonePaneApp({ desktopClient }) {
       setIsSending(false);
     }
   }, [paneDescriptor.sessionId, paneDescriptor.workspaceId]);
+
+  useEffect(() => {
+    if (
+      !desktopClient
+      || isBootstrapping
+      || !paneRuntimeMeta.isSelected
+      || !paneDescriptor.workspaceId
+      || !paneDescriptor.sessionId
+    ) {
+      return undefined;
+    }
+
+    const activeSessionMatches = Boolean(
+      appState.activeSession
+      && appState.activeSession.workspaceId === paneDescriptor.workspaceId
+      && appState.activeSession.id === paneDescriptor.sessionId
+    );
+    if (activeSessionMatches) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    desktopClient.getAppState()
+      .then((state) => {
+        if (!cancelled) {
+          applyIncomingAppState(state);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    appState.activeSession,
+    applyIncomingAppState,
+    desktopClient,
+    isBootstrapping,
+    paneDescriptor.sessionId,
+    paneDescriptor.workspaceId,
+    paneRuntimeMeta.isSelected,
+  ]);
 
   useEffect(() => {
     if (!pendingTurn) {
@@ -1343,7 +1646,10 @@ export function StandalonePaneApp({ desktopClient }) {
     };
 
     window.addEventListener('focus', syncPaneFocus);
-    syncPaneFocus();
+    if (paneFocusSyncPaneIdRef.current !== paneDescriptor.id) {
+      paneFocusSyncPaneIdRef.current = paneDescriptor.id;
+      syncPaneFocus();
+    }
 
     return () => {
       window.removeEventListener('focus', syncPaneFocus);
@@ -1418,6 +1724,15 @@ export function StandalonePaneApp({ desktopClient }) {
       }
 
       event.preventDefault();
+      if (
+        shortcutIntent.type === 'focus-pane-index'
+        && document.activeElement instanceof HTMLElement
+        && typeof document.activeElement.blur === 'function'
+      ) {
+        try {
+          document.activeElement.blur();
+        } catch {}
+      }
       notifyHost('global-pane-shortcut', {
         ...shortcutIntent,
         paneId: paneDescriptor.id,
@@ -1454,7 +1769,9 @@ export function StandalonePaneApp({ desktopClient }) {
         workspaceId: targetWorkspace.id,
       });
 
-      setAppState((current) => integrateCreatedSessionResult(current, nextState));
+      startTransition(() => {
+        setAppState((current) => integrateCreatedSessionResult(current, nextState));
+      });
       setPendingTurn(null);
       setIsSending(false);
       notifyHost('assign-session', {
@@ -1962,6 +2279,7 @@ export function StandalonePaneApp({ desktopClient }) {
         platform={appState.platform}
         providerCatalog={providerCatalog}
         shouldFlashFinishedBorder={shouldFlashFinishedBorder}
+        focusComposerRequestToken={composerFocusRequestToken}
         onApprovalDecision={handleApprovalDecision}
         onClear={handlePaneClear}
         onFocus={handlePaneFocus}
@@ -1980,6 +2298,8 @@ export function StandalonePaneApp({ desktopClient }) {
 }
 
 const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
+  composerBlurRequestToken,
+  composerFocusRequestToken,
   desktopClient,
   pane,
   paneCount,
@@ -2114,6 +2434,79 @@ const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
     };
   }, [onPaneAssignSession, onPaneClear, onPaneFocus, onPaneShortcut, pane.id, preloadUrl, src]);
 
+  useEffect(() => {
+    const element = webviewRef.current;
+    if (!element || !pane.isFocused || !composerFocusRequestToken) {
+      return undefined;
+    }
+
+    const timeoutIds = [];
+    const sendComposerFocus = () => {
+      try {
+        if (typeof element.send === 'function') {
+          element.send('claude:event', {
+            type: 'focus-composer',
+          });
+        }
+      } catch {}
+    };
+
+    COMPOSER_FOCUS_TRANSFER_RETRY_DELAYS_MS.forEach((delay) => {
+      const timeoutId = window.setTimeout(() => {
+        try {
+          element.focus();
+        } catch {}
+
+        sendComposerFocus();
+      }, delay);
+      timeoutIds.push(timeoutId);
+    });
+
+    return () => {
+      timeoutIds.forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+    };
+  }, [composerFocusRequestToken, pane.isFocused]);
+
+  useEffect(() => {
+    const element = webviewRef.current;
+    if (!element || !composerBlurRequestToken) {
+      return undefined;
+    }
+
+    try {
+      if (typeof element.send === 'function') {
+        element.send('claude:event', {
+          type: 'blur-composer',
+        });
+      }
+    } catch {}
+
+    if (typeof element.blur === 'function') {
+      try {
+        element.blur();
+      } catch {}
+    }
+
+    return undefined;
+  }, [composerBlurRequestToken]);
+
+  useEffect(() => {
+    const element = webviewRef.current;
+    if (!element || pane.isFocused || typeof document === 'undefined') {
+      return;
+    }
+
+    if (document.activeElement !== element || typeof element.blur !== 'function') {
+      return;
+    }
+
+    try {
+      element.blur();
+    } catch {}
+  }, [pane.isFocused]);
+
   return (
     <div
       onMouseDownCapture={() => {
@@ -2140,7 +2533,9 @@ const EmbeddedPaneHost = memo(function EmbeddedPaneHost({
   );
 }, function areEmbeddedPaneHostPropsEqual(previousProps, nextProps) {
   return (
-    previousProps.desktopClient === nextProps.desktopClient
+    previousProps.composerBlurRequestToken === nextProps.composerBlurRequestToken
+    && previousProps.composerFocusRequestToken === nextProps.composerFocusRequestToken
+    && previousProps.desktopClient === nextProps.desktopClient
     && previousProps.onPaneAssignSession === nextProps.onPaneAssignSession
     && previousProps.onPaneClear === nextProps.onPaneClear
     && previousProps.onPaneFocus === nextProps.onPaneFocus
@@ -2189,11 +2584,20 @@ function MainApp({ desktopClient }) {
   const [sessionViewCache, setSessionViewCache] = useState({});
   const [sessionSearchQuery, setSessionSearchQuery] = useState('');
   const [paneCompletionAttention, setPaneCompletionAttention] = useState({});
+  const [paneComposerBlurRequest, setPaneComposerBlurRequest] = useState({
+    paneId: '',
+    token: 0,
+  });
+  const [paneComposerFocusRequest, setPaneComposerFocusRequest] = useState({
+    paneId: '',
+    token: 0,
+  });
 
   const hasHydratedExpandedWorkspaceIdsRef = useRef(false);
   const hasSkippedInitialExpandedWorkspacePersistRef = useRef(false);
   const hasHydratedPaneLayoutRef = useRef(false);
   const hasInitializedPaneSelectionRef = useRef(false);
+  const lastPersistedPaneLayoutSignatureRef = useRef('');
   const modePickerRef = useRef(null);
   const modelPickerRef = useRef(null);
   const collapsedSidebarRef = useRef(null);
@@ -2459,6 +2863,26 @@ function MainApp({ desktopClient }) {
   const topBarOffsetClass = isMac ? 'pt-10' : 'pt-11';
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference;
   const handleApprovalDecision = useEventCallback((requestId, decision) => respondToApproval(requestId, decision));
+  const requestPaneComposerFocus = useEventCallback((paneId) => {
+    if (!paneId) {
+      return;
+    }
+
+    setPaneComposerFocusRequest((current) => ({
+      paneId,
+      token: current.token + 1,
+    }));
+  });
+  const requestPaneComposerBlur = useEventCallback((paneId) => {
+    if (!paneId) {
+      return;
+    }
+
+    setPaneComposerBlurRequest((current) => ({
+      paneId,
+      token: current.token + 1,
+    }));
+  });
   const handlePaneClear = useEventCallback((paneId) => clearPane(paneId));
   const handlePaneFocus = useEventCallback((paneId) => {
     setSidebarFlyoutView(null);
@@ -2494,7 +2918,7 @@ function MainApp({ desktopClient }) {
         return;
       }
 
-      void focusPane(nextPane.id);
+      void focusPane(nextPane.id, { focusComposer: true });
       return;
     }
 
@@ -2591,7 +3015,7 @@ function MainApp({ desktopClient }) {
   });
   const handleSidebarSelectSession = useEventCallback((workspaceId, sessionId) => {
     setSidebarFlyoutView(null);
-    void selectSession(workspaceId, sessionId);
+    void selectSession(workspaceId, sessionId, { focusComposer: true });
   });
   const handleSidebarSelectWorkspace = useEventCallback((workspaceId) => {
     setSidebarFlyoutView(null);
@@ -2610,7 +3034,7 @@ function MainApp({ desktopClient }) {
       }}
       onFocusPane={(paneId) => {
         setSidebarFlyoutView(null);
-        void focusPane(paneId);
+        void focusPane(paneId, { focusComposer: true });
       }}
     />
   ) : null;
@@ -3165,11 +3589,27 @@ function MainApp({ desktopClient }) {
       return;
     }
 
+    const layoutSignature = getPersistablePaneLayoutSignature(paneLayout);
+    if (lastPersistedPaneLayoutSignatureRef.current === layoutSignature) {
+      return;
+    }
+
+    lastPersistedPaneLayoutSignatureRef.current = layoutSignature;
     desktopClient.setPaneLayout?.({
       ...paneLayout,
       recentPaneIds: paneRecentIds,
     }).catch(() => {});
   }, [desktopClient, paneLayout, paneRecentIds]);
+
+  useEffect(() => {
+    if (!desktopClient || !hasHydratedPaneLayoutRef.current || !paneLayout.focusedPaneId) {
+      return;
+    }
+
+    desktopClient.setPaneFocus?.({
+      paneId: paneLayout.focusedPaneId,
+    }).catch(() => {});
+  }, [desktopClient, paneLayout.focusedPaneId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -3270,6 +3710,13 @@ function MainApp({ desktopClient }) {
     const unsubscribe = desktopClient.onStateChange((event) => {
       if (event?.type === 'state' && event.state) {
         applyIncomingAppState(event.state, { useTransition: true });
+        return;
+      }
+
+      if (event?.type === 'session-meta-delta') {
+        startTransition(() => {
+          setAppState((current) => mergeSessionMetaDeltaIntoAppState(current, event));
+        });
       }
     });
 
@@ -3474,12 +3921,21 @@ function MainApp({ desktopClient }) {
     try {
       const state = await desktopClient.getAppState();
       const remotePaneLayout = state?.paneLayout ? normalizePaneLayout(state.paneLayout) : null;
-      const hydratedPaneState = resolveHydratedPaneState({
+      const resolvedHydratedPaneState = resolveHydratedPaneState({
         localLayout: paneLayoutRef.current,
         localRecentIds: paneRecentIdsRef.current,
         remoteLayout: remotePaneLayout,
         remoteRecentIds: state?.paneLayout?.recentPaneIds,
       });
+      const sanitizedHydratedLayout = normalizePaneLayoutWithAppState(resolvedHydratedPaneState.layout, state);
+      const hydratedPaneState = {
+        layout: sanitizedHydratedLayout,
+        recentPaneIds: syncPaneRecentIds(
+          resolvedHydratedPaneState.recentPaneIds,
+          sanitizedHydratedLayout.panes,
+          sanitizedHydratedLayout.focusedPaneId,
+        ),
+      };
       const remoteRecentIds = normalizePaneRecentIds(state?.paneLayout?.recentPaneIds, hydratedPaneState.layout.panes);
 
       applyIncomingAppState(state);
@@ -3492,6 +3948,7 @@ function MainApp({ desktopClient }) {
         return arePaneIdListsEqual(current, next) ? current : next;
       });
       hasHydratedPaneLayoutRef.current = true;
+      lastPersistedPaneLayoutSignatureRef.current = getPersistablePaneLayoutSignature(hydratedPaneState.layout);
       if (
         !remotePaneLayout
         || !arePaneLayoutsEqual(remotePaneLayout, hydratedPaneState.layout)
@@ -3690,7 +4147,10 @@ function MainApp({ desktopClient }) {
         ),
         workspaceId: targetWorkspace.id,
       });
-      setAppState((current) => integrateCreatedSessionResult(current, nextState));
+      startTransition(() => {
+        setAppState((current) => integrateCreatedSessionResult(current, nextState));
+        setSessionViewCache((current) => mergeSessionIntoViewCache(current, nextState?.activeSession));
+      });
       setPaneLayout((current) => assignSessionToPaneState(
         appendPaneToLayout(current),
         nextPaneId,
@@ -3718,7 +4178,10 @@ function MainApp({ desktopClient }) {
         preferredProvider: getPreferredProviderForNewSession(workspaceId, options),
         workspaceId,
       });
-      setAppState((current) => integrateCreatedSessionResult(current, nextState));
+      startTransition(() => {
+        setAppState((current) => integrateCreatedSessionResult(current, nextState));
+        setSessionViewCache((current) => mergeSessionIntoViewCache(current, nextState?.activeSession));
+      });
       setPaneLayout((current) => assignSessionToPaneState(current, options.paneId || current.focusedPaneId, {
         sessionId: nextState.selectedSessionId,
         workspaceId: nextState.selectedWorkspaceId,
@@ -3790,13 +4253,16 @@ function MainApp({ desktopClient }) {
 
     try {
       const nextState = await desktopClient.selectWorkspace(workspaceId);
-      setAppState(nextState);
+      startTransition(() => {
+        setAppState((current) => integrateSelectedSessionResult(current, nextState));
+        setSessionViewCache((current) => mergeSessionIntoViewCache(current, nextState?.activeSession));
+      });
     } catch (error) {
       setSidebarError(error.message);
     }
   }
 
-  async function openSessionInPane(workspaceId, sessionId, { paneId = '', preferPaneId = false } = {}) {
+  async function openSessionInPane(workspaceId, sessionId, { paneId = '', preferPaneId = false, focusComposer = false } = {}) {
     if (!desktopClient || !workspaceId || !sessionId) {
       return;
     }
@@ -3819,6 +4285,10 @@ function MainApp({ desktopClient }) {
       return;
     }
 
+    if (focusComposer && latestLayout.focusedPaneId && latestLayout.focusedPaneId !== targetPaneId) {
+      requestPaneComposerBlur(latestLayout.focusedPaneId);
+    }
+
     paneLayoutRef.current = assignSessionToPaneState(
       focusPaneInLayout(latestLayout, targetPaneId),
       targetPaneId,
@@ -3831,6 +4301,10 @@ function MainApp({ desktopClient }) {
       return next;
     });
 
+    if (focusComposer) {
+      requestPaneComposerFocus(targetPaneId);
+    }
+
     if (
       appState.selectedWorkspaceId === workspaceId
       && appState.selectedSessionId === sessionId
@@ -3842,7 +4316,10 @@ function MainApp({ desktopClient }) {
 
     try {
       const nextState = await desktopClient.selectSession({ sessionId, workspaceId });
-      setAppState(nextState);
+      startTransition(() => {
+        setAppState((current) => integrateSelectedSessionResult(current, nextState));
+        setSessionViewCache((current) => mergeSessionIntoViewCache(current, nextState?.activeSession));
+      });
     } catch (error) {
       setSidebarError(error.message);
     }
@@ -3916,7 +4393,8 @@ function MainApp({ desktopClient }) {
         });
 
         startTransition(() => {
-          setAppState(nextState);
+          setAppState((current) => integrateSelectedSessionResult(current, nextState));
+          setSessionViewCache((current) => mergeSessionIntoViewCache(current, nextState?.activeSession));
         });
       } catch (error) {
         setSidebarError(error.message);
@@ -3931,7 +4409,7 @@ function MainApp({ desktopClient }) {
     };
   }
 
-  function focusPane(paneId) {
+  function focusPane(paneId, options = {}) {
     const latestLayout = paneLayoutRef.current;
     const pane = latestLayout.panes.find((entry) => entry.id === paneId);
     if (!pane) {
@@ -3944,10 +4422,17 @@ function MainApp({ desktopClient }) {
       && appState.selectedSessionId === pane.sessionId
     );
 
+    if (options.focusComposer && latestLayout.focusedPaneId && latestLayout.focusedPaneId !== paneId) {
+      requestPaneComposerBlur(latestLayout.focusedPaneId);
+    }
+
     if (
       isAlreadyFocused
       && (!pane.sessionId || !pane.workspaceId || isSessionAlreadySelected)
     ) {
+      if (options.focusComposer) {
+        requestPaneComposerFocus(paneId);
+      }
       return;
     }
 
@@ -3969,13 +4454,23 @@ function MainApp({ desktopClient }) {
     }
 
     if (!desktopClient || !pane.sessionId || !pane.workspaceId) {
+      if (options.focusComposer) {
+        requestPaneComposerFocus(paneId);
+      }
       clearPendingFocusedPaneSessionSync();
       return;
     }
 
     if (isSessionAlreadySelected) {
+      if (options.focusComposer) {
+        requestPaneComposerFocus(paneId);
+      }
       clearPendingFocusedPaneSessionSync();
       return;
+    }
+
+    if (options.focusComposer) {
+      requestPaneComposerFocus(paneId);
     }
 
     setSidebarError('');
@@ -4000,6 +4495,8 @@ function MainApp({ desktopClient }) {
         };
       });
     });
+
+    scheduleFocusedPaneSessionSync(pane);
   }
 
   function clearPane(paneId) {
@@ -5483,6 +5980,8 @@ function MainApp({ desktopClient }) {
               >
                 {visiblePaneViews.map((pane, paneIndex) => (
                   <EmbeddedPaneHost
+                    composerBlurRequestToken={paneComposerBlurRequest.paneId === pane.id ? paneComposerBlurRequest.token : 0}
+                    composerFocusRequestToken={paneComposerFocusRequest.paneId === pane.id ? paneComposerFocusRequest.token : 0}
                     key={pane.id}
                     desktopClient={desktopClient}
                     pane={pane}
@@ -5544,6 +6043,7 @@ const ConversationPane = memo(function ConversationPane({
   canClear,
   copy,
   defaultProvider,
+  focusComposerRequestToken,
   isUpdatingModel,
   isUpdatingReasoningEffort,
   isUpdatingPermissionMode,
@@ -5721,7 +6221,7 @@ const ConversationPane = memo(function ConversationPane({
   const deferredBodyPaneCandidate = useDeferredValue(bodyPaneCandidate);
   const currentBodyRenderMode = getPaneBodyRenderMode(bodyPaneCandidate, shouldRenderBackgroundCard);
   const deferredBodyRenderMode = getPaneBodyRenderMode(deferredBodyPaneCandidate, deferredBackgroundCardMode);
-  const isBodyTransitionPending = currentBodyRenderMode === 'full' && deferredBodyRenderMode === 'background';
+  const isBodyTransitionPending = currentBodyRenderMode !== deferredBodyRenderMode;
   const paneForBody = isBodyTransitionPending ? deferredBodyPaneCandidate : bodyPaneCandidate;
   const backgroundCardModeForBody = isBodyTransitionPending
     ? deferredBackgroundCardMode
@@ -5743,6 +6243,19 @@ const ConversationPane = memo(function ConversationPane({
       setIsReasoningPickerOpen(false);
       setIsModelPickerOpen(false);
     }
+  }, [pane.isFocused]);
+
+  useEffect(() => {
+    if (pane.isFocused || typeof document === 'undefined') {
+      return;
+    }
+
+    const textarea = textareaRef.current;
+    if (!textarea || document.activeElement !== textarea) {
+      return;
+    }
+
+    textarea.blur();
   }, [pane.isFocused]);
 
   useEffect(() => {
@@ -5882,6 +6395,39 @@ const ConversationPane = memo(function ConversationPane({
       window.cancelAnimationFrame(frameId);
     };
   }, [isComposerExpanded]);
+
+  useEffect(() => {
+    if (!focusComposerRequestToken || !pane.isFocused || !pane.workspace || !canUseSessionProvider) {
+      return undefined;
+    }
+
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return undefined;
+    }
+
+    const focusComposerTextarea = () => {
+      try {
+        window.focus();
+      } catch {}
+
+      textarea.focus();
+      const cursorPosition = textarea.value.length;
+      textarea.setSelectionRange(cursorPosition, cursorPosition);
+    };
+
+    const timeoutIds = COMPOSER_FOCUS_TRANSFER_RETRY_DELAYS_MS.map((delay) => (
+      window.setTimeout(() => {
+        focusComposerTextarea();
+      }, delay)
+    ));
+
+    return () => {
+      timeoutIds.forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+    };
+  }, [canUseSessionProvider, focusComposerRequestToken, pane.isFocused, pane.workspace]);
 
   function applySlashCommand(command) {
     if (!command) {
@@ -6639,7 +7185,7 @@ const ConversationPaneBody = memo(function ConversationPaneBody({
 }, areConversationPaneBodyPropsEqual);
 
 function BackgroundPaneStatusCard({ copy, isPendingFullRender = false, pane }) {
-  const pendingApprovalCount = pane.session?.pendingApprovals?.length || 0;
+  const pendingApprovalCount = pane.pendingApprovalCount || 0;
   const isWaitingForApproval = pendingApprovalCount > 0;
   const statusTone = isWaitingForApproval
     ? 'muted'
@@ -6686,6 +7232,7 @@ function areConversationPanePropsEqual(previousProps, nextProps) {
     previousProps.canClear === nextProps.canClear
     && previousProps.copy === nextProps.copy
     && previousProps.defaultProvider === nextProps.defaultProvider
+    && previousProps.focusComposerRequestToken === nextProps.focusComposerRequestToken
     && previousProps.isUpdatingModel === nextProps.isUpdatingModel
     && previousProps.isUpdatingReasoningEffort === nextProps.isUpdatingReasoningEffort
     && previousProps.isUpdatingPermissionMode === nextProps.isUpdatingPermissionMode
@@ -6741,9 +7288,9 @@ function areConversationPaneBodyViewModelsEqual(left, right, isBackgroundCardMod
       && left?.isFocused === right?.isFocused
       && left?.isLoading === right?.isLoading
       && left?.isOutputInProgress === right?.isOutputInProgress
+      && Number(left?.pendingApprovalCount || 0) === Number(right?.pendingApprovalCount || 0)
       && left?.title === right?.title
       && left?.session?.id === right?.session?.id
-      && (left?.session?.pendingApprovals?.length || 0) === (right?.session?.pendingApprovals?.length || 0)
     );
   }
 
@@ -6757,9 +7304,9 @@ function areConversationPaneBodyViewModelsEqual(left, right, isBackgroundCardMod
     && (!requiresFocusAwareComparison || left?.isFocused === right?.isFocused)
     && left?.isLoading === right?.isLoading
     && left?.isOutputInProgress === right?.isOutputInProgress
+    && Number(left?.pendingApprovalCount || 0) === Number(right?.pendingApprovalCount || 0)
     && left?.shouldShowRunIndicator === right?.shouldShowRunIndicator
     && left?.session?.id === right?.session?.id
-    && (left?.session?.pendingApprovals?.length || 0) === (right?.session?.pendingApprovals?.length || 0)
     && left?.session?.status === right?.session?.status
     && left?.session?.updatedAt === right?.session?.updatedAt
   );
@@ -6807,6 +7354,7 @@ function arePaneSessionMetaEquivalent(left, right) {
   return (
     (left.id || '') === (right.id || '')
     && Boolean(left.isRunning) === Boolean(right.isRunning)
+    && Number(left.pendingApprovalCount || 0) === Number(right.pendingApprovalCount || 0)
     && Boolean(left.providerLocked) === Boolean(right.providerLocked)
     && (left.status || '') === (right.status || '')
     && (left.title || '') === (right.title || '')
@@ -11991,6 +12539,16 @@ function countAssignedPaneBindings(layout) {
   return normalizePaneLayout(layout).panes.filter((pane) => pane.sessionId && pane.workspaceId).length;
 }
 
+function getPersistablePaneLayoutSignature(layout) {
+  return JSON.stringify(
+    normalizePaneLayout(layout).panes.map((pane) => ({
+      id: pane.id,
+      sessionId: pane.sessionId || '',
+      workspaceId: pane.workspaceId || '',
+    })),
+  );
+}
+
 function resolveHydratedPaneState({ localLayout, localRecentIds, remoteLayout, remoteRecentIds }) {
   const normalizedLocalLayout = normalizePaneLayout(localLayout);
   const normalizedRemoteLayout = remoteLayout ? normalizePaneLayout(remoteLayout) : null;
@@ -12035,7 +12593,7 @@ function shouldPreferLocalPaneLayout(localLayout, remoteLayout) {
     return localLayout.panes.length > remoteLayout.panes.length;
   }
 
-  return true;
+  return false;
 }
 
 function shouldPreferLocalPaneRecentIds({ localRecentIds, preferredLayoutSource, remoteRecentIds }) {
@@ -12261,7 +12819,10 @@ function normalizePaneLayoutWithAppState(currentLayout, appState) {
       return pane;
     }
 
-    return pane;
+    return {
+      ...pane,
+      sessionId: null,
+    };
   });
 
   return normalizePaneLayout({
@@ -12594,6 +13155,31 @@ function appendPendingTurnMessage(messages, pendingTurn) {
   ];
 }
 
+function reconcilePaneSessionSnapshotWithMeta(session, sessionMeta) {
+  if (!session || !sessionMeta || typeof session !== 'object' || typeof sessionMeta !== 'object') {
+    return session;
+  }
+
+  const nextSession = {
+    ...session,
+    currentModel: typeof sessionMeta.currentModel === 'string' ? sessionMeta.currentModel : session.currentModel,
+    effectiveModel: typeof sessionMeta.effectiveModel === 'string' ? sessionMeta.effectiveModel : session.effectiveModel,
+    effectiveReasoningEffort: typeof sessionMeta.effectiveReasoningEffort === 'string'
+      ? sessionMeta.effectiveReasoningEffort
+      : session.effectiveReasoningEffort,
+    isRunning: Boolean(sessionMeta.isRunning),
+    permissionMode: typeof sessionMeta.permissionMode === 'string' ? sessionMeta.permissionMode : session.permissionMode,
+    provider: typeof sessionMeta.provider === 'string' ? sessionMeta.provider : session.provider,
+    providerLocked: Boolean(sessionMeta.providerLocked),
+    reasoningEffort: typeof sessionMeta.reasoningEffort === 'string' ? sessionMeta.reasoningEffort : session.reasoningEffort,
+    status: typeof sessionMeta.status === 'string' ? sessionMeta.status : session.status,
+    title: typeof sessionMeta.title === 'string' ? sessionMeta.title : session.title,
+    updatedAt: typeof sessionMeta.updatedAt === 'string' ? sessionMeta.updatedAt : session.updatedAt,
+  };
+
+  return areSessionSnapshotsEqual(session, nextSession) ? session : nextSession;
+}
+
 function buildPaneViewModel({
   activeSession,
   appState,
@@ -12612,19 +13198,22 @@ function buildPaneViewModel({
   const sessionCacheKey = createSessionCacheKey(pane.workspaceId, pane.sessionId);
   const workspace = workspaceById?.get(pane.workspaceId) || appState.workspaces.find((entry) => entry.id === pane.workspaceId) || null;
   const sessionMeta = sessionMetaByKey?.get(sessionCacheKey) || workspace?.sessions.find((entry) => entry.id === pane.sessionId) || null;
-  const session = resolvePaneSessionSnapshot(pane, activeSession, sessionViewCache);
+  const session = reconcilePaneSessionSnapshotWithMeta(
+    resolvePaneSessionSnapshot(pane, activeSession, sessionViewCache),
+    sessionMeta,
+  );
   const pendingTurn = getPendingTurnForPane(pane, pendingPaneTurns, session);
   const pendingApprovals = Array.isArray(session?.pendingApprovals)
     ? session.pendingApprovals.filter(Boolean)
     : [];
   const isPaneSending = Array.isArray(sendingPaneIds) && sendingPaneIds.includes(pane.id);
-  const hasPendingApprovals = pendingApprovals.length > 0;
-  const sessionRunning = Boolean(
-    session?.isRunning
-    || sessionMeta?.isRunning
-    || session?.status === 'running'
-    || sessionMeta?.status === 'running'
-  );
+  const pendingApprovalCount = Number.isFinite(sessionMeta?.pendingApprovalCount)
+    ? Math.max(0, Number(sessionMeta.pendingApprovalCount) || 0)
+    : pendingApprovals.length;
+  const hasPendingApprovals = pendingApprovalCount > 0;
+  const sessionRunning = sessionMeta
+    ? Boolean(sessionMeta.isRunning || sessionMeta.status === 'running')
+    : Boolean(session?.isRunning || session?.status === 'running');
   const isRunning = Boolean(pendingTurn || sessionRunning);
   const renderableMessages = includeRenderableMessages
     ? getRenderableMessages(
@@ -12670,6 +13259,7 @@ function buildPaneViewModel({
     isOnlyPane: paneCount <= 1,
     isOutputInProgress,
     isSending: Boolean(isPaneSending || pendingTurn),
+    pendingApprovalCount,
     displayMessages,
     renderableMessages,
     session,
@@ -12993,6 +13583,27 @@ function areStandalonePaneAppStatesEquivalent(left, right, paneParams) {
   );
 }
 
+function shouldBufferStandalonePaneLightweightState(current, next, paneParams) {
+  if (!current || !next || typeof current !== 'object' || typeof next !== 'object') {
+    return false;
+  }
+
+  const currentPaneDescriptor = resolveStandalonePaneDescriptor(current?.paneLayout, paneParams);
+  const nextPaneDescriptor = resolveStandalonePaneDescriptor(next?.paneLayout, paneParams);
+  const currentPaneRuntimeMeta = resolveStandalonePaneRuntimeMeta(current?.paneLayout, paneParams?.paneId, paneParams);
+  const nextPaneRuntimeMeta = resolveStandalonePaneRuntimeMeta(next?.paneLayout, paneParams?.paneId, paneParams);
+
+  return (
+    (current.selectedWorkspaceId || '') === (next.selectedWorkspaceId || '')
+    && (current.selectedSessionId || '') === (next.selectedSessionId || '')
+    && (currentPaneDescriptor.workspaceId || '') === (nextPaneDescriptor.workspaceId || '')
+    && (currentPaneDescriptor.sessionId || '') === (nextPaneDescriptor.sessionId || '')
+    && currentPaneRuntimeMeta.isSelected === nextPaneRuntimeMeta.isSelected
+    && currentPaneRuntimeMeta.paneCount === nextPaneRuntimeMeta.paneCount
+    && currentPaneRuntimeMeta.paneNumber === nextPaneRuntimeMeta.paneNumber
+  );
+}
+
 function mergeIncomingAppState(current, next) {
   if (!next || typeof next !== 'object') {
     return current;
@@ -13002,9 +13613,21 @@ function mergeIncomingAppState(current, next) {
     return next;
   }
 
+  const nextSelectedWorkspaceId = typeof next.selectedWorkspaceId === 'string' ? next.selectedWorkspaceId : '';
+  const nextSelectedSessionId = typeof next.selectedSessionId === 'string' ? next.selectedSessionId : '';
+  const shouldRetainCurrentActiveSession = (
+    !next.activeSession
+    && current.activeSession
+    && current.activeSession.workspaceId === nextSelectedWorkspaceId
+    && current.activeSession.id === nextSelectedSessionId
+  );
+  const mergedActiveSession = shouldRetainCurrentActiveSession
+    ? current.activeSession
+    : mergeSessionSnapshot(current.activeSession, next.activeSession);
+
   const merged = {
     ...next,
-    activeSession: mergeSessionSnapshot(current.activeSession, next.activeSession),
+    activeSession: mergedActiveSession,
     appInfo: areComparableValuesEqual(current.appInfo, next.appInfo)
       ? current.appInfo
       : next.appInfo,
@@ -13182,6 +13805,7 @@ function areSerializedSessionMetaEqual(left, right) {
     && (left?.id || '') === (right?.id || '')
     && Boolean(left?.isRunning) === Boolean(right?.isRunning)
     && Number(left?.messageCount || 0) === Number(right?.messageCount || 0)
+    && Number(left?.pendingApprovalCount || 0) === Number(right?.pendingApprovalCount || 0)
     && (left?.permissionMode || '') === (right?.permissionMode || '')
     && (left?.preview || '') === (right?.preview || '')
     && (left?.provider || '') === (right?.provider || '')

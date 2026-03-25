@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('claudeDesktop', {
   setCodeEditor: (payload) => ipcRenderer.invoke('desktop:set-code-editor', payload),
   setExpandedWorkspaces: (workspaceIds) => ipcRenderer.invoke('desktop:set-expanded-workspaces', workspaceIds),
   setNetworkProxy: (payload) => ipcRenderer.invoke('desktop:set-network-proxy', payload),
+  setPaneFocus: (payload) => ipcRenderer.invoke('desktop:set-pane-focus', payload),
   setPaneLayout: (paneLayout) => ipcRenderer.invoke('desktop:set-pane-layout', paneLayout),
   selectSession: (payload) => ipcRenderer.invoke('desktop:select-session', payload),
   selectWorkspace: (workspaceId) => ipcRenderer.invoke('desktop:select-workspace', workspaceId),

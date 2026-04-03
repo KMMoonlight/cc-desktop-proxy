@@ -26,6 +26,10 @@ CC Desktop Proxy 不是一个云端代理服务，而是一个运行在你本机
 - 双 Provider 会话
   在同一个应用里使用 `Claude` 和 `Codex`。每个会话都可以在真正开始对话前切换 provider，并分别维护模型、模式和推理强度。
 
+  当前运行层实现：
+  `Claude` 通过官方 `@anthropic-ai/claude-agent-sdk` transport 接入，复用本地 Claude Code 可执行文件、会话持久化和权限回调；
+  `Codex` 通过 `codex app-server` 的 JSON-RPC transport 接入，用 app-server 事件驱动线程、turn、工具活动与审批。
+
   ![Provider switching](example_img/provider_change.png)
 - 多工作区、多分屏
   支持添加多个本地仓库，在一个窗口中拆分多个 conversation pane，并通过快捷键快速聚焦、关闭或新建 pane。
@@ -64,6 +68,9 @@ CC Desktop Proxy 不是一个云端代理服务，而是一个运行在你本机
 - Tailwind CSS
 - Radix UI
 - 本地 CLI 子进程编排（`claude` / `codex`）
+- 统一 provider transport 抽象
+  `Claude`: Agent SDK
+  `Codex`: `app-server` JSON-RPC
 
 ### 快速开始
 

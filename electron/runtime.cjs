@@ -6,6 +6,10 @@ const os = require('os');
 const path = require('path');
 const tls = require('tls');
 const { fileURLToPath } = require('url');
+const {
+  createClaudeAgentSdkTransport,
+  createCodexAppServerTransport,
+} = require('./provider-transports.cjs');
 
 const {
   app,
@@ -1795,30 +1799,6 @@ class ClaudeDesktopRuntime {
     const codexTurn = provider === 'codex'
       ? buildCodexTurnRequest(session, providerPrompt)
       : { prompt: providerPrompt, targetPlanModeActive: null };
-
-    const args = provider === 'codex'
-      ? buildCodexExecArgs({
-        attachments,
-        developerInstructions: providerSystemPrompt,
-        sandboxMode: resolveCodexSandboxMode(session.permissionMode, options.codexSandboxMode),
-        extraAttachmentDirs,
-        model: session.model,
-        prompt: codexTurn.prompt,
-        reasoningEffort: session.reasoningEffort,
-        sessionId: session.claudeSessionId,
-      })
-      : buildClaudeExecArgs({
-        extraAttachmentDirs,
-        model: session.model,
-        permissionMode: session.permissionMode,
-        sessionId: session.claudeSessionId,
-        systemPrompt: providerSystemPrompt,
-      });
-
-    const proc = spawn(executablePath, args, {
-      cwd: workspace.path,
-      env: cliEnv,
-    });
     const codexSandboxMode = provider === 'codex'
       ? resolveCodexSandboxMode(session.permissionMode, options.codexSandboxMode)
       : '';
@@ -1834,7 +1814,6 @@ class ClaudeDesktopRuntime {
       session.title = createSessionTitleFromPrompt(displayPrompt || formatAttachmentTitle(attachments));
     }
 
-    runState.process = proc;
     runState.responseStartIndex = session.messages.length;
     runState.codexApprovalPayload = shouldQueueCodexWriteApproval(session)
       ? {
@@ -1850,47 +1829,37 @@ class ClaudeDesktopRuntime {
     this.touchWorkspace(workspace, now);
     this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
     this.scheduleStateEmit(webContents);
-
-    let buffer = '';
-
-    proc.stdout.on('data', (chunk) => {
+    const handleTransportEvent = (event) => {
       if (runState.runToken !== runToken) {
         return;
       }
 
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        this.processLine(webContents, runState, line);
-      }
-    });
-
-    proc.stderr.on('data', (chunk) => {
-      if (runState.runToken !== runToken) {
+      const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
+      if (!sessionRef) {
         return;
       }
 
-      const text = stripAnsi(chunk.toString());
-      if (!text.trim()) {
+      if (normalizeSessionProvider(runState.provider || sessionRef.session.provider) === 'codex') {
+        this.handleCodexEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
+      } else {
+        this.handleClaudeEvent(webContents, sessionRef.workspace, sessionRef.session, runState, event);
+      }
+
+      this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+      this.scheduleStateEmit(webContents);
+    };
+
+    const handleTransportStderr = (text) => {
+      if (runState.runToken !== runToken || !text.trim()) {
         return;
       }
 
       runState.stderrBuffer = truncateText(`${runState.stderrBuffer}${text}`, STDERR_BUFFER_LIMIT);
-    });
+    };
 
-    if (provider !== 'codex') {
-      proc.stdin.on('error', () => {});
-    }
-
-    proc.on('close', (code) => {
+    const handleTransportClose = (code) => {
       if (runState.runToken !== runToken) {
         return;
-      }
-
-      if (buffer.trim()) {
-        this.processLine(webContents, runState, buffer);
       }
 
       const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
@@ -1960,9 +1929,9 @@ class ClaudeDesktopRuntime {
 
       this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
       this.emitState(webContents, { sessionScoped: true });
-    });
+    };
 
-    proc.on('error', (error) => {
+    const handleTransportError = (error) => {
       if (runState.runToken !== runToken) {
         return;
       }
@@ -1994,11 +1963,79 @@ class ClaudeDesktopRuntime {
 
       this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
       this.emitState(webContents, { sessionScoped: true });
-    });
+    };
 
-    if (provider !== 'codex') {
-      writeJsonLine(proc.stdin, createStreamJsonUserMessage(providerPrompt, session.claudeSessionId, providerLabel));
-    }
+    const handleCodexServerRequest = (request) => {
+      if (runState.runToken !== runToken) {
+        return;
+      }
+
+      const sessionRef = this.findSessionByIds(runState.workspaceId, runState.sessionId);
+      if (!sessionRef) {
+        return;
+      }
+
+      this.handleCodexAppServerRequest(
+        webContents,
+        sessionRef.workspace,
+        sessionRef.session,
+        runState,
+        request,
+      );
+      this.scheduleSave(RUN_STATE_SAVE_DEBOUNCE_MS);
+      this.scheduleStateEmit(webContents);
+    };
+
+    const transport = provider === 'codex'
+      ? createCodexAppServerTransport({
+        clientInfo: {
+          name: 'cc-desktop-proxy',
+          version: typeof app?.getVersion === 'function' ? app.getVersion() : '0.0.0',
+        },
+        cwd: workspace.path,
+        env: cliEnv,
+        executablePath,
+        onClose: handleTransportClose,
+        onError: handleTransportError,
+        onEvent: handleTransportEvent,
+        onServerRequest: handleCodexServerRequest,
+        onStderr: handleTransportStderr,
+        threadParams: buildCodexAppServerThreadParams({
+          developerInstructions: providerSystemPrompt,
+          extraAttachmentDirs,
+          model: session.model,
+          sandboxMode: codexSandboxMode,
+          sessionId: session.claudeSessionId,
+          workspacePath: workspace.path,
+        }),
+        turnParams: buildCodexAppServerTurnParams({
+          attachments,
+          extraAttachmentDirs,
+          prompt: codexTurn.prompt,
+          reasoningEffort: session.reasoningEffort,
+          sandboxMode: codexSandboxMode,
+          threadId: session.claudeSessionId,
+          workspacePath: workspace.path,
+        }),
+      })
+      : createClaudeAgentSdkTransport({
+        cwd: workspace.path,
+        env: cliEnv,
+        executablePath,
+        extraAttachmentDirs,
+        model: session.model,
+        onClose: handleTransportClose,
+        onError: handleTransportError,
+        onEvent: handleTransportEvent,
+        onStderr: handleTransportStderr,
+        permissionMode: normalizeSessionPermissionMode(session.permissionMode),
+        prompt: providerPrompt,
+        sessionId: session.claudeSessionId,
+        systemPrompt: providerSystemPrompt,
+      });
+
+    runState.transport = transport;
+    runState.process = transport.process;
 
     return { ok: true };
   }
@@ -2094,10 +2131,9 @@ class ClaudeDesktopRuntime {
       }
     }
 
-    writeJsonLine(
-      runState.process.stdin,
-      createApprovalControlResponse(pendingApproval, decision === 'allow_always' ? 'allow' : decision),
-    );
+    if (runState.transport?.respondToApproval) {
+      runState.transport.respondToApproval(pendingApproval, decision);
+    }
 
     runState.pendingApprovalRequests.delete(requestId);
     this.emitState(webContents, { sessionScoped: true });
@@ -2125,7 +2161,11 @@ class ClaudeDesktopRuntime {
       this.touchWorkspace(sessionRef.workspace, sessionRef.session.updatedAt);
     }
 
-    runState.process.kill('SIGTERM');
+    if (runState.transport?.stop) {
+      runState.transport.stop();
+    } else {
+      runState.process.kill('SIGTERM');
+    }
     this.resetRunState(runState);
     this.deleteRunState(webContents.id, sessionRef?.workspace.id, sessionRef?.session.id);
 
@@ -2156,7 +2196,11 @@ class ClaudeDesktopRuntime {
           sessionRef.session.status = 'idle';
         }
 
-        runState.process.kill('SIGTERM');
+        if (runState.transport?.stop) {
+          runState.transport.stop();
+        } else {
+          runState.process.kill('SIGTERM');
+        }
       }
 
       this.resetRunState(runState);
@@ -2259,7 +2303,9 @@ class ClaudeDesktopRuntime {
       session.updatedAt = now;
       this.touchWorkspace(workspace, now);
       runState.pendingApprovalRequests.clear();
-      closeClaudeInput(runState.process);
+      if (runState.transport?.closeInput) {
+        runState.transport.closeInput();
+      }
 
       if (event.is_error) {
         this.appendEventMessage(workspace, session, {
@@ -2321,6 +2367,12 @@ class ClaudeDesktopRuntime {
     }
 
     if (event.type === 'error') {
+      if (event.willRetry) {
+        session.updatedAt = now;
+        this.touchWorkspace(workspace, now);
+        return;
+      }
+
       runState.resultIsError = true;
       session.status = 'error';
       session.updatedAt = now;
@@ -2367,6 +2419,125 @@ class ClaudeDesktopRuntime {
     if (event.type === 'item.completed') {
       this.handleCodexItemCompleted(workspace, session, runState, event.item);
     }
+  }
+
+  handleCodexAppServerRequest(webContents, workspace, session, runState, request) {
+    const method = typeof request?.method === 'string' ? request.method.trim() : '';
+    const requestId = typeof request?.requestId === 'string' ? request.requestId.trim() : '';
+    if (!method || !requestId) {
+      return;
+    }
+
+    const params = request.params && typeof request.params === 'object' ? request.params : {};
+    const now = new Date().toISOString();
+    let pendingApproval = null;
+
+    if (method === 'item/commandExecution/requestApproval') {
+      const toolUse = runState.toolUses.get(params.itemId) || describeCodexItem({
+        aggregatedOutput: '',
+        command: typeof params.command === 'string' ? params.command : '',
+        exitCode: null,
+        id: typeof params.itemId === 'string' ? params.itemId : '',
+        status: 'inProgress',
+        type: 'commandExecution',
+      });
+
+      pendingApproval = {
+        availableDecisions: Array.isArray(params.availableDecisions) ? params.availableDecisions : [],
+        category: 'command',
+        createdAt: now,
+        description: typeof params.reason === 'string' ? params.reason : '',
+        detail: typeof toolUse?.detail === 'string' && toolUse.detail
+          ? toolUse.detail
+          : truncateText(params.command || '', 220),
+        input: {
+          approvalId: typeof params.approvalId === 'string' ? params.approvalId : '',
+          cmd: typeof params.command === 'string' ? params.command : '',
+          command: typeof params.command === 'string' ? params.command : '',
+          cwd: typeof params.cwd === 'string' ? params.cwd : '',
+          itemId: typeof params.itemId === 'string' ? params.itemId : '',
+          threadId: typeof params.threadId === 'string' ? params.threadId : '',
+          turnId: typeof params.turnId === 'string' ? params.turnId : '',
+        },
+        protocolMethod: method,
+        requestId,
+        title: '',
+        toolName: 'commandExecution',
+        toolUseId: typeof params.itemId === 'string' ? params.itemId : '',
+      };
+    }
+
+    if (method === 'item/fileChange/requestApproval') {
+      const toolUse = runState.toolUses.get(params.itemId) || null;
+      const grantRoot = normalizeApprovalBlockedPath(typeof params.grantRoot === 'string' ? params.grantRoot : '');
+      const filePath = normalizeApprovalBlockedPath(
+        toolUse?.toolMeta?.filePath
+        || toolUse?.filePath
+        || grantRoot,
+      );
+
+      pendingApproval = grantRoot
+        ? {
+          approvalKind: 'codex_permission',
+          availableDecisions: ['accept', 'acceptForSession', 'decline'],
+          blockedPath: grantRoot,
+          category: 'generic',
+          createdAt: now,
+          description: typeof params.reason === 'string' ? params.reason : '',
+          detail: typeof toolUse?.detail === 'string' && toolUse.detail ? toolUse.detail : grantRoot,
+          input: {
+            approvalKind: 'codex_permission',
+            grantRoot,
+            itemId: typeof params.itemId === 'string' ? params.itemId : '',
+            path: grantRoot,
+            sandboxMode: 'workspace-write',
+            threadId: typeof params.threadId === 'string' ? params.threadId : '',
+            turnId: typeof params.turnId === 'string' ? params.turnId : '',
+            workspacePath: grantRoot,
+          },
+          protocolMethod: method,
+          requestId,
+          sandboxMode: 'workspace-write',
+          title: '',
+          toolName: getCodexPermissionToolName('workspace-write'),
+          toolUseId: typeof params.itemId === 'string' ? params.itemId : '',
+        }
+        : {
+          availableDecisions: ['accept', 'acceptForSession', 'decline'],
+          blockedPath: filePath,
+          category: 'edit',
+          createdAt: now,
+          description: typeof params.reason === 'string' ? params.reason : '',
+          detail: typeof toolUse?.detail === 'string' && toolUse.detail ? toolUse.detail : filePath,
+          filePath,
+          input: {
+            file_path: filePath,
+            itemId: typeof params.itemId === 'string' ? params.itemId : '',
+            path: filePath,
+            threadId: typeof params.threadId === 'string' ? params.threadId : '',
+            turnId: typeof params.turnId === 'string' ? params.turnId : '',
+          },
+          protocolMethod: method,
+          requestId,
+          title: '',
+          toolName: 'fileChange',
+          toolUseId: typeof params.itemId === 'string' ? params.itemId : '',
+        };
+    }
+
+    if (!pendingApproval) {
+      return;
+    }
+
+    if (workspaceHasMatchingApprovalRule(workspace, pendingApproval)) {
+      runState.transport?.respondToApproval(pendingApproval, 'allow');
+      return;
+    }
+
+    runState.pendingApprovalRequests.set(requestId, pendingApproval);
+    session.updatedAt = now;
+    this.touchWorkspace(workspace, now);
+    this.emitState(webContents);
   }
 
   handleCodexItemStarted(workspace, session, runState, item) {
@@ -2621,10 +2792,7 @@ class ClaudeDesktopRuntime {
     };
 
     if (workspaceHasMatchingApprovalRule(workspace, pendingApproval)) {
-      writeJsonLine(
-        runState.process.stdin,
-        createApprovalControlResponse(pendingApproval, 'allow'),
-      );
+      runState.transport?.respondToApproval(pendingApproval, 'allow');
       return;
     }
 
@@ -2884,6 +3052,7 @@ class ClaudeDesktopRuntime {
     runState.currentAssistantText = '';
     runState.hasStreamedAssistantText = false;
     runState.process = null;
+    runState.transport = null;
     runState.provider = DEFAULT_PROVIDER;
     runState.responseStartIndex = 0;
     runState.runToken = null;
@@ -4247,6 +4416,7 @@ function prepareRunStateForPendingApproval(runState, approval) {
   runState.currentAssistantText = '';
   runState.hasStreamedAssistantText = false;
   runState.process = null;
+  runState.transport = null;
   runState.runToken = null;
   runState.stderrBuffer = '';
   runState.targetCodexPlanModeActive = null;
@@ -4297,6 +4467,7 @@ function resetRunStateForExecution(runState, provider, workspaceId, sessionId) {
   runState.currentAssistantText = '';
   runState.hasStreamedAssistantText = false;
   runState.process = null;
+  runState.transport = null;
   runState.provider = provider;
   runState.runToken = null;
   runState.responseStartIndex = 0;
@@ -5050,6 +5221,7 @@ function createRunState(workspaceId = null, sessionId = null) {
     hasStreamedAssistantText: false,
     pendingApprovalRequests: new Map(),
     process: null,
+    transport: null,
     provider: DEFAULT_PROVIDER,
     responseStartIndex: 0,
     resultIsError: false,
@@ -5719,117 +5891,112 @@ function buildPromptWithAttachments(prompt, attachments) {
   return sections.join('\n\n').trim();
 }
 
-function buildClaudeExecArgs({ extraAttachmentDirs, model, permissionMode, sessionId, systemPrompt }) {
-  const args = [
-    '-p',
-    '--input-format',
-    'stream-json',
-    '--output-format',
-    'stream-json',
-    '--include-partial-messages',
-    '--replay-user-messages',
-    '--permission-prompt-tool',
-    'stdio',
-    '--verbose',
-  ];
+function buildCodexAppServerThreadParams({
+  developerInstructions,
+  model,
+  sandboxMode,
+  sessionId,
+  workspacePath,
+}) {
+  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode) || 'read-only';
+  const normalizedDeveloperInstructions = normalizeProviderSystemPrompt(developerInstructions);
+  const sharedParams = {
+    approvalPolicy: getCodexApprovalPolicyForSandboxMode(normalizedSandboxMode),
+    cwd: workspacePath,
+    developerInstructions: normalizedDeveloperInstructions || null,
+    experimentalRawEvents: false,
+    model: model || null,
+    persistExtendedHistory: true,
+    sandbox: normalizedSandboxMode,
+  };
 
-  if (Array.isArray(extraAttachmentDirs) && extraAttachmentDirs.length > 0) {
-    args.push('--add-dir', ...extraAttachmentDirs);
-  }
-
-  if (model) {
-    args.push('--model', model);
-  }
-
-  const normalizedSystemPrompt = normalizeProviderSystemPrompt(systemPrompt);
-  if (normalizedSystemPrompt) {
-    args.push('--append-system-prompt', normalizedSystemPrompt);
-  }
-
-  args.push('--permission-mode', normalizeSessionPermissionMode(permissionMode));
-
-  if (sessionId) {
-    args.push('--resume', sessionId);
-  }
-
-  return args;
+  return sessionId
+    ? {
+      resumeParams: {
+        ...sharedParams,
+        threadId: sessionId,
+      },
+      threadId: sessionId,
+    }
+    : {
+      startParams: sharedParams,
+      threadId: '',
+    };
 }
 
-function buildCodexExecArgs({
+function buildCodexAppServerTurnParams({
   attachments,
-  developerInstructions,
   extraAttachmentDirs,
-  model,
   prompt,
   reasoningEffort,
   sandboxMode,
-  sessionId,
+  threadId,
+  workspacePath,
 }) {
-  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode);
-  const approvalPolicy = getCodexApprovalPolicyForSandboxMode(normalizedSandboxMode);
-  const rootOptions = [];
-  if (approvalPolicy) {
-    rootOptions.push('-a', approvalPolicy);
-  }
-  if (normalizedSandboxMode) {
-    rootOptions.push('-s', normalizedSandboxMode);
-  }
-
-  const options = ['--json', '--skip-git-repo-check'];
-  if (model) {
-    options.push('--model', model);
-  }
-
-  const normalizedDeveloperInstructions = normalizeProviderSystemPrompt(developerInstructions);
-  if (normalizedDeveloperInstructions) {
-    options.push('-c', `developer_instructions=${encodeTomlString(normalizedDeveloperInstructions)}`);
-  }
-
   const normalizedReasoningEffort = normalizeSessionReasoningEffort(reasoningEffort);
-  if (normalizedReasoningEffort) {
-    options.push(
-      '-c',
-      `model_reasoning_effort="${normalizedReasoningEffort}"`,
-      '-c',
-      `plan_mode_reasoning_effort="${normalizedReasoningEffort}"`,
-    );
-  }
 
-  if (!sessionId && Array.isArray(extraAttachmentDirs) && extraAttachmentDirs.length > 0) {
-    options.push('--add-dir', ...extraAttachmentDirs);
-  }
+  return {
+    cwd: workspacePath,
+    ...(normalizedReasoningEffort ? { effort: normalizedReasoningEffort } : {}),
+    input: buildCodexAppServerUserInput(prompt, attachments),
+    sandboxPolicy: buildCodexAppServerSandboxPolicy(
+      sandboxMode,
+      workspacePath,
+      extraAttachmentDirs,
+    ),
+    threadId: threadId || '',
+  };
+}
 
-  const imageAttachments = Array.isArray(attachments)
-    ? attachments.filter((attachment) => attachment?.kind === 'image' && attachment.path)
-    : [];
-  if (imageAttachments.length > 0) {
-    for (const attachment of imageAttachments) {
-      options.push('-i', attachment.path);
+function buildCodexAppServerUserInput(prompt, attachments) {
+  const inputs = [];
+  const normalizedAttachments = Array.isArray(attachments) ? attachments : [];
+
+  for (const attachment of normalizedAttachments) {
+    if (attachment?.kind !== 'image' || !attachment.path) {
+      continue;
     }
+
+    inputs.push({
+      path: attachment.path,
+      type: 'localImage',
+    });
   }
 
-  if (sessionId) {
-    return [
-      ...rootOptions,
-      'exec',
-      'resume',
-      ...options,
-      // `--image` is greedy in `codex exec`; without an explicit option terminator
-      // the trailing session/prompt arguments can be parsed as more image paths.
-      '--',
-      sessionId,
-      prompt,
-    ];
+  inputs.push({
+    text: typeof prompt === 'string' ? prompt : '',
+    text_elements: [],
+    type: 'text',
+  });
+
+  return inputs;
+}
+
+function buildCodexAppServerSandboxPolicy(sandboxMode, workspacePath, extraAttachmentDirs = []) {
+  const normalizedSandboxMode = normalizeCodexSandboxMode(sandboxMode) || 'read-only';
+
+  if (normalizedSandboxMode === 'danger-full-access') {
+    return {
+      type: 'dangerFullAccess',
+    };
   }
 
-  return [
-    ...rootOptions,
-    'exec',
-    ...options,
-    // Keep the prompt positional separate from any preceding `--image` values.
-    '--',
-    prompt,
-  ];
+  if (normalizedSandboxMode === 'workspace-write') {
+    return {
+      excludeSlashTmp: false,
+      excludeTmpdirEnvVar: false,
+      networkAccess: false,
+      readOnlyAccess: { type: 'fullAccess' },
+      type: 'workspaceWrite',
+      writableRoots: Array.from(new Set([workspacePath, ...extraAttachmentDirs].filter(Boolean))),
+    };
+  }
+
+  return {
+    access: { type: 'fullAccess' },
+    networkAccess: false,
+    type: 'readOnly',
+  };
 }
 
 function buildCodexTurnRequest(session, prompt) {
@@ -5863,66 +6030,6 @@ function buildCodexApprovedPrompt(prompt, sandboxMode) {
     ? 'System note: Permission escalation has already been approved for this request. Continue directly with the task and do not re-check whether elevated permissions are available unless an operation still fails.'
     : 'System note: Workspace write permission has already been approved for this request. Continue directly with the task and do not re-check whether the workspace is writable unless a write still fails.';
   return `${note}\n\n${normalizedPrompt}`;
-}
-
-function createStreamJsonUserMessage(prompt, sessionId, providerLabel = 'Claude') {
-  return {
-    message: {
-      content: prompt,
-      role: 'user',
-    },
-    parent_tool_use_id: null,
-    session_id: typeof sessionId === 'string' ? sessionId : '',
-    type: 'user',
-  };
-}
-
-function createApprovalControlResponse(approval, decision) {
-  const toolUseId = typeof approval?.toolUseId === 'string' && approval.toolUseId
-    ? approval.toolUseId
-    : undefined;
-
-  const response = decision === 'allow'
-    ? {
-      behavior: 'allow',
-      ...(toolUseId ? { toolUseID: toolUseId } : {}),
-      updatedInput: approval?.input && typeof approval.input === 'object' ? approval.input : {},
-    }
-    : {
-      behavior: 'deny',
-      message: 'User denied approval.',
-      ...(toolUseId ? { toolUseID: toolUseId } : {}),
-    };
-
-  return {
-    response: {
-      request_id: approval?.requestId || '',
-      response,
-      subtype: 'success',
-    },
-    type: 'control_response',
-  };
-}
-
-function writeJsonLine(stream, payload) {
-  if (!stream || stream.destroyed || typeof stream.write !== 'function' || stream.writableEnded) {
-    throw new Error('输入流已关闭。');
-  }
-
-  stream.write(`${JSON.stringify(payload)}\n`);
-}
-
-function closeClaudeInput(proc) {
-  const input = proc?.stdin;
-  if (!input || input.destroyed || input.writableEnded || typeof input.end !== 'function') {
-    return;
-  }
-
-  try {
-    input.end();
-  } catch {
-    // Ignore teardown races when Claude exits on its own.
-  }
 }
 
 function finalizeRunningToolMessages(session, finalStatus = 'stopped') {
@@ -6443,6 +6550,7 @@ function formatProcessFailure(providerLabel, code, stderrBuffer) {
 function formatCodexTurnFailure(event, stderrBuffer) {
   const parts = [
     event?.error?.message,
+    event?.error?.additionalDetails,
     event?.message,
     stderrBuffer,
   ].filter(Boolean);
@@ -6464,7 +6572,13 @@ function extractCodexAssistantText(payload) {
   }
 
   const item = payload.item && typeof payload.item === 'object' ? payload.item : payload;
-  if (item.type === 'assistant_message' || item.type === 'agent_message' || item.type === 'message') {
+  if (
+    item.type === 'assistant_message'
+    || item.type === 'agent_message'
+    || item.type === 'message'
+    || item.type === 'assistantMessage'
+    || item.type === 'agentMessage'
+  ) {
     if (typeof item.text === 'string' && item.text.trim()) {
       return item.text;
     }
@@ -6498,13 +6612,23 @@ function describeCodexItem(item) {
   }
 
   const type = typeof item.type === 'string' ? item.type.trim() : '';
-  if (!type || type === 'assistant_message' || type === 'agent_message' || type === 'message') {
+  if (
+    !type
+    || type === 'assistant_message'
+    || type === 'agent_message'
+    || type === 'message'
+    || type === 'assistantMessage'
+    || type === 'agentMessage'
+    || type === 'userMessage'
+  ) {
     return null;
   }
 
-  if (type === 'command_execution') {
+  if (type === 'command_execution' || type === 'commandExecution') {
     const command = truncateText(item.command || item.cmd || 'Run command', 220);
-    const output = truncateText(item.aggregated_output || item.output || '', STDERR_BUFFER_LIMIT);
+    const output = truncateText(item.aggregated_output || item.aggregatedOutput || item.output || '', STDERR_BUFFER_LIMIT);
+    const exitCode = Number.isFinite(item.exit_code) ? item.exit_code : item.exitCode;
+    const rawStatus = typeof item.status === 'string' ? item.status : '';
     return {
       category: 'command',
       commandSource: 'tool',
@@ -6513,18 +6637,34 @@ function describeCodexItem(item) {
       detail: command,
       errorTitle: '命令执行失败',
       kind: 'command',
-      name: 'command_execution',
+      name: type,
       runningTitle: '正在执行命令',
-      status: Number.isFinite(item.exit_code) && item.exit_code !== 0 ? 'error' : 'completed',
-      toolUseId: item.call_id || item.id || '',
+      status: rawStatus === 'failed' || rawStatus === 'declined'
+        ? 'error'
+        : (
+          rawStatus === 'inProgress'
+            ? 'running'
+            : (
+              Number.isFinite(exitCode) && exitCode !== 0
+                ? 'error'
+                : 'completed'
+            )
+        ),
+      toolUseId: item.call_id || item.callId || item.id || '',
     };
   }
 
-  if (type === 'mcp_tool_call') {
+  if (type === 'mcp_tool_call' || type === 'mcpToolCall') {
     const server = typeof item.server === 'string' ? item.server.trim() : '';
     const tool = typeof item.tool === 'string' ? item.tool.trim() : '';
     const detail = [server, tool].filter(Boolean).join(' · ') || 'MCP tool';
-    const resultText = truncateText(item.result || item.output || '', STDERR_BUFFER_LIMIT);
+    const resultText = truncateText(
+      item.result
+      || item.output
+      || stringifyValue(item.result?.structuredContent || item.result?.content || item.error || ''),
+      STDERR_BUFFER_LIMIT,
+    );
+    const rawStatus = typeof item.status === 'string' ? item.status : '';
     return {
       category: 'mcp',
       completedDetail: resultText ? `${detail}\n\n${resultText}` : detail,
@@ -6532,17 +6672,28 @@ function describeCodexItem(item) {
       detail,
       errorTitle: 'MCP 调用失败',
       kind: 'mcp',
-      name: 'mcp_tool_call',
+      name: type,
       runningTitle: '正在调用 MCP',
-      status: item.error ? 'error' : 'completed',
-      toolUseId: item.call_id || item.id || '',
+      status: item.error || rawStatus === 'failed'
+        ? 'error'
+        : (rawStatus === 'inProgress' ? 'running' : 'completed'),
+      toolUseId: item.call_id || item.callId || item.id || '',
     };
   }
 
-  if (type === 'file_change') {
-    const filePath = typeof item.path === 'string' ? item.path.trim() : '';
-    const changeKind = typeof item.change_type === 'string' ? item.change_type.trim() : '';
-    const detail = [changeKind, filePath].filter(Boolean).join(' · ') || 'Updated file';
+  if (type === 'file_change' || type === 'fileChange') {
+    const changes = Array.isArray(item.changes) ? item.changes.filter(Boolean) : [];
+    const firstChange = changes[0] || null;
+    const filePath = typeof item.path === 'string'
+      ? item.path.trim()
+      : (typeof firstChange?.path === 'string' ? firstChange.path.trim() : '');
+    const changeKind = typeof item.change_type === 'string'
+      ? item.change_type.trim()
+      : (typeof firstChange?.kind === 'string' ? firstChange.kind.trim() : '');
+    const detail = changes.length > 1
+      ? `${[changeKind, filePath].filter(Boolean).join(' · ') || 'Updated file'} +${changes.length - 1} more`
+      : ([changeKind, filePath].filter(Boolean).join(' · ') || 'Updated file');
+    const rawStatus = typeof item.status === 'string' ? item.status : '';
     return {
       category: 'edit',
       completedDetail: detail,
@@ -6550,15 +6701,17 @@ function describeCodexItem(item) {
       detail,
       errorTitle: '文件更新失败',
       kind: 'edit',
-      name: 'file_change',
+      name: type,
       runningTitle: '正在更新文件',
-      status: 'completed',
+      status: rawStatus === 'failed' || rawStatus === 'declined'
+        ? 'error'
+        : (rawStatus === 'inProgress' ? 'running' : 'completed'),
       toolMeta: createEditToolMetaFromCodexItem(item),
-      toolUseId: item.call_id || item.id || filePath,
+      toolUseId: item.call_id || item.callId || item.id || filePath,
     };
   }
 
-  if (type === 'web_search') {
+  if (type === 'web_search' || type === 'webSearch') {
     const query = truncateText(item.query || item.prompt || 'Web search', 220);
     return {
       category: 'fetch',
@@ -6567,14 +6720,14 @@ function describeCodexItem(item) {
       detail: query,
       errorTitle: '检索失败',
       kind: 'status',
-      name: 'web_search',
+      name: type,
       runningTitle: '正在检索',
       status: 'completed',
-      toolUseId: item.call_id || item.id || query,
+      toolUseId: item.call_id || item.callId || item.id || query,
     };
   }
 
-  if (type === 'reasoning') {
+  if (type === 'reasoning' || type === 'plan' || type === 'contextCompaction') {
     return null;
   }
 
@@ -6594,7 +6747,13 @@ function describeCodexItem(item) {
 }
 
 function createEditToolMetaFromCodexItem(item) {
-  const filePath = typeof item?.path === 'string' ? item.path.trim() : '';
+  const filePath = typeof item?.path === 'string'
+    ? item.path.trim()
+    : (
+      Array.isArray(item?.changes) && typeof item.changes[0]?.path === 'string'
+        ? item.changes[0].path.trim()
+        : ''
+    );
   if (!filePath) {
     return null;
   }

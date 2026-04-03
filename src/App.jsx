@@ -1339,12 +1339,32 @@ export function StandalonePaneApp({ desktopClient }) {
       return;
     }
 
+    // Capture the committed state at event-arrival time.
+    // With startTransition, appStateRef.current is NOT updated until after the
+    // transition commits (via the useEffect that syncs appState → ref). This means
+    // a subsequent event's commit() closure would compare nextState against the
+    // already-updated ref and incorrectly treat them as equivalent — causing the
+    // earlier event's state to be silently dropped (e.g. when refocusing a pane,
+    // the state event with the full session arrives before the pending
+    // setAppState(null) has committed; the comparison then skips the session).
+    const committedAtArrival = appStateRef.current;
+
     const commit = () => {
-      setAppState((current) => (
-        areStandalonePaneAppStatesEquivalent(current, nextState, paneParams)
-          ? current
-          : mergeIncomingAppState(current, nextState)
-      ));
+      setAppState((current) => {
+        // Use the state that was committed when this event arrived, not the
+        // current ref (which may reflect a later event that started first).
+        // If the 'current' state (the one being applied in React's queue) is already
+        // equivalent to nextState, or if the 'committedAtArrival' (the one visible
+        // when the IPC event arrived) is already equivalent to nextState, then we
+        // can safely skip this update.
+        if (
+          areStandalonePaneAppStatesEquivalent(current, nextState, paneParams)
+          || areStandalonePaneAppStatesEquivalent(committedAtArrival, nextState, paneParams)
+        ) {
+          return current;
+        }
+        return mergeIncomingAppState(current, nextState);
+      });
     };
 
     if (useTransition) {
@@ -13577,10 +13597,32 @@ function areStandalonePaneAppStatesEquivalent(left, right, paneParams) {
       getSessionMetaFromAppState(right, rightPaneDescriptor.workspaceId, rightPaneDescriptor.sessionId),
     )
     && areSessionSnapshotsEqual(
-      getRelevantActiveSessionForPane(left, leftPaneDescriptor),
-      getRelevantActiveSessionForPane(right, rightPaneDescriptor),
+      getSessionSnapshotFromAppState(left, leftPaneDescriptor.workspaceId, leftPaneDescriptor.sessionId),
+      getSessionSnapshotFromAppState(right, rightPaneDescriptor.workspaceId, rightPaneDescriptor.sessionId),
     )
   );
+}
+
+function getSessionSnapshotFromAppState(state, workspaceId, sessionId) {
+  if (!workspaceId || !sessionId) {
+    return null;
+  }
+
+  const workspace = getWorkspaceFromAppState(state, workspaceId);
+  const session = workspace?.sessions?.find((s) => s.id === sessionId);
+  if (!session) {
+    return null;
+  }
+
+  // If the session is also the globally active one, it might have more up-to-date
+  // messages or status than the one in the workspaces list (if they haven't been
+  // merged yet in this specific state object).
+  const activeSession = state?.activeSession;
+  if (activeSession?.workspaceId === workspaceId && activeSession?.id === sessionId) {
+    return activeSession;
+  }
+
+  return session;
 }
 
 function shouldBufferStandalonePaneLightweightState(current, next, paneParams) {

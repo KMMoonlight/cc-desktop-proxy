@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-04-04 (最新)
+
+### electron/provider-transports.cjs
+
+- 新增统一 provider transport 层
+- 新增 `Claude Agent SDK` transport，基于 `@anthropic-ai/claude-agent-sdk` 处理流式事件、会话恢复、权限审批与中断
+- 新增 `Codex app-server` transport，基于 JSON-RPC 处理 `initialize`、`thread/start|resume`、`turn/start|interrupt`、server request 与通知流
+
+### electron/runtime.cjs
+
+- `Codex` 运行链路从 `codex exec --json` 切换为 `codex app-server --listen stdio://`
+- `Claude` 运行链路从 CLI `stream-json` 切换为 `Claude Agent SDK`，审批 UI 继续复用现有 `control_request` / approval 卡片模型
+- `startSessionRun` 重构为按 provider 创建 transport，而不是直接在 runtime 内部解析子进程 stdout
+- 新增 `handleCodexAppServerRequest`，把 app-server 的命令审批 / 文件变更审批转换为现有审批卡片模型
+- `respondToApproval`、`stopRun`、窗口销毁流程改为优先走 transport 能力，兼容 `Codex app-server` 与 `Claude Agent SDK`
+- 扩展 Codex item 解析：同时支持旧 `exec --json` 的 snake_case 事件和 app-server 的 camelCase item 结构
+- 修复 app-server 可重试错误处理：`willRetry` 的流错误不再立刻把会话标记为失败
+
+### README.md
+
+- 补充 provider transport 说明：`Claude` 使用 Agent SDK，`Codex` 使用 `app-server` JSON-RPC
+
+---
+
 ## 2026-03-23（当前工作区变更汇总）
 
 ### 分屏架构重构 / 性能优化
@@ -97,8 +121,6 @@
 - 新增 `scripts/build-mac-icon.mjs`，基于 `qlmanage`、`sips`、`iconutil` 从 `build/icon.svg` 生成 `icon.png` 和 `icon.icns`
 - 新增 `scripts/release-mac.mjs`、`.env.release.example`、`build_release_info.md`，用于校验签名 / 公证环境、说明打包流程和维护发布所需变量
 - 新增 `build/` 下的图标与 entitlements 资源，并在 `.gitignore` 中补充忽略 `release/`、`build/generated/` 和 `.env.release.local`
-
----
 
 ## 2026-03-19 (最新)
 

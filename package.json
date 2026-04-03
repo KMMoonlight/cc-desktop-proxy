@@ -1,6 +1,6 @@
 {
   "name": "cli_proxy",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "productName": "CC Desktop Proxy",
   "main": "electron/main.cjs",
   "scripts": {
@@ -21,6 +21,7 @@
   "license": "ISC",
   "description": "Desktop wrapper for Claude Code with multi-pane conversation workflows.",
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.91",
     "@radix-ui/react-scroll-area": "^1.2.10",
     "@radix-ui/react-slot": "^1.2.4",
     "class-variance-authority": "^0.7.1",
